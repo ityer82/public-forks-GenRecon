@@ -5,10 +5,53 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "genrecon"
 version = "0.1"
+requires-python = ">=3.10"
+dependencies = [
+    "easydict>=1.13",
+    "flash-attn==2.7.3",
+    "gradio==6.0.1",
+    "imageio>=2.37.4",
+    "imageio-ffmpeg>=0.6.0",
+    "kornia>=0.8.2",
+    "lpips>=0.1.4",
+    "matplotlib>=3.10.9",
+    "ninja>=1.13.0",
+    "nvdiffrast",
+    "nvdiffrec-render",
+    "o-voxel",
+    "open3d>=0.19.0",
+    "opencv-python-headless>=5.0.0.93",
+    "pandas>=2.3.3",
+    "pillow-simd>=9.5.0.post2",
+    "psutil>=7.2.2",
+    "tensorboard>=2.21.0",
+    "timm>=1.0.28",
+    "torch==2.7.1",
+    "torchvision==0.22.1",
+    "tqdm>=4.66.5",
+    "transformers==4.57.3",
+    "trimesh>=5.0.0",
+    "utils3d",
+    "zstandard>=0.25.0",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["genrecon*", "inference*"]
+
+[[tool.uv.index]]
+url = "https://download.pytorch.org/whl/cu128"
+
+[tool.uv.sources]
+utils3d = { git = "https://github.com/EasternJournalist/utils3d.git", rev = "9a4eb15e4021b67b12c460c7057d642626897ec8" }
+o-voxel = { workspace = true, editable = true }
+nvdiffrec-render = { git = "https://github.com/JeffreyXiang/nvdiffrec.git", rev = "renderutils" }
+nvdiffrast = { git = "https://github.com/NVlabs/nvdiffrast.git", rev = "v0.4.0" }
+
+[tool.uv.workspace]
+members = [
+    "o-voxel",
+]
 
 [tool.black]
 line-length = 120
