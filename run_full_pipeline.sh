@@ -1,17 +1,20 @@
 #!/usr/bin/env bash
-# End-to-end pipeline: VGGT-Omega pose/depth prediction -> GenRecon reconstruction -> GLB bake.
+# End-to-end pipeline: VGGT-Omega pose/depth prediction -> [optional COB-GS 3D segmentation] -> GenRecon reconstruction -> GLB bake.
 #
 # Usage:
-#   ./run_full_pipeline.sh <image_folder> <scene_name> [--simplify_threshold N] [--texture_size N] [--num_imgs_per_scene N] [--skip-frames N] [--run_glb]
+#   ./run_full_pipeline.sh <image_folder> <scene_name> [--simplify_threshold N] [--texture_size N] [--num_imgs_per_scene N] [--skip-frames N] [--align-to-gravity] [--rotate-horizontal-deg N] [--classes a,b,c] [--run_glb]
 #
 # Example:
 #   ./run_full_pipeline.sh /home/gabis/Work/GitHub/COB-GS/dataset/food2/images food2_vggt
 #   ./run_full_pipeline.sh /home/gabis/Work/GitHub/COB-GS/dataset/food2/images food2_vggt --run_glb
+#   ./run_full_pipeline.sh /home/gabis/Work/GitHub/COB-GS/dataset/food2/images food2_vggt --align-to-gravity --rotate-horizontal-deg 90
+#   ./run_full_pipeline.sh /home/gabis/Work/GitHub/COB-GS/dataset/food2/images food2_vggt --classes "person,chair,bag"
 
 set -euo pipefail
 
 VGGT_OMEGA_DIR="/home/gabis/Work/GitHub/vggt-omega"
 GENRECON_DIR="/home/gabis/Work/GitHub/public-forks-GenRecon"
+COBGS_DIR="/home/gabis/Work/GitHub/COB-GS"
 VGGT_CHECKPOINT="${VGGT_OMEGA_DIR}/vggt_omega_1b_512.pt"
 
 SIMPLIFY_THRESHOLD=250000
@@ -20,9 +23,12 @@ NUM_IMGS_PER_SCENE=32
 VGGT_EXPORT_TIMEOUT=1800
 RUN_GLB=0
 SKIP_FRAMES=-1
+ALIGN_TO_GRAVITY=0
+ROTATE_HORIZONTAL_DEG=0.0
+CLASSES=""
 
 if [[ $# -lt 2 ]]; then
-    echo "Usage: $0 <image_folder> <scene_name> [--simplify_threshold N] [--texture_size N] [--num_imgs_per_scene N] [--skip-frames N] [--run_glb]" >&2
+    echo "Usage: $0 <image_folder> <scene_name> [--simplify_threshold N] [--texture_size N] [--num_imgs_per_scene N] [--skip-frames N] [--align-to-gravity] [--rotate-horizontal-deg N] [--classes a,b,c] [--run_glb]" >&2
     exit 1
 fi
 
@@ -36,6 +42,9 @@ while [[ $# -gt 0 ]]; do
         --texture_size) TEXTURE_SIZE="$2"; shift 2 ;;
         --num_imgs_per_scene) NUM_IMGS_PER_SCENE="$2"; shift 2 ;;
         --skip-frames) SKIP_FRAMES="$2"; shift 2 ;;
+        --align-to-gravity) ALIGN_TO_GRAVITY=1; shift 1 ;;
+        --rotate-horizontal-deg) ROTATE_HORIZONTAL_DEG="$2"; shift 2 ;;
+        --classes) CLASSES="$2"; shift 2 ;;
         --run_glb) RUN_GLB=1; shift 1 ;;
         *) echo "Unknown argument: $1" >&2; exit 1 ;;
     esac
@@ -48,6 +57,7 @@ fi
 
 RUN_DIR="${GENRECON_DIR}/runs/${SCENE_NAME}"
 EXPORT_DIR="${RUN_DIR}/vggt_export"
+SEG_DIR="${RUN_DIR}/segmentation"
 SCENE_DIR="${RUN_DIR}/scene"
 OUTPUT_DIR="${RUN_DIR}/output"
 
@@ -62,12 +72,21 @@ if [[ "$SKIP_FRAMES" -ne -1 ]]; then
     VGGT_SKIP_FRAMES_ARGS=(--skip-frames "$SKIP_FRAMES")
 fi
 
+VGGT_GRAVITY_ARGS=()
+if [[ "$ALIGN_TO_GRAVITY" -eq 1 ]]; then
+    VGGT_GRAVITY_ARGS+=(--align-to-gravity)
+fi
+if [[ "$ROTATE_HORIZONTAL_DEG" != "0.0" && "$ROTATE_HORIZONTAL_DEG" != "0" ]]; then
+    VGGT_GRAVITY_ARGS+=(--rotate-horizontal-deg "$ROTATE_HORIZONTAL_DEG")
+fi
+
 (
     cd "$VGGT_OMEGA_DIR"
     uv run python -u demo_rerun.py "$IMAGE_FOLDER" \
         --checkpoint "$VGGT_CHECKPOINT" \
         --export-for-3dgs "$EXPORT_DIR" \
-        "${VGGT_SKIP_FRAMES_ARGS[@]}"
+        "${VGGT_SKIP_FRAMES_ARGS[@]}" \
+        "${VGGT_GRAVITY_ARGS[@]}"
 ) > "$VGGT_LOG" 2>&1 &
 VGGT_PID=$!
 
@@ -103,11 +122,62 @@ if [[ ! -f "${EXPORT_DIR}/sparse/0/cameras.txt" ]]; then
     exit 1
 fi
 
+# ── Stage 1.5 (optional): COB-GS 3D segmentation ──
+# When --classes is set, only the background reaches GenRecon: foreground
+# points are dropped from the sparse point cloud (chunk layout may shift as
+# a result, since GenRecon derives chunk placement from points3D.txt) and
+# foreground pixels are masked out of every RGB frame.
+if [[ -n "$CLASSES" ]]; then
+    echo "[run_full_pipeline] Stage 1.5: COB-GS segmentation (classes: ${CLASSES})"
+    SEG_LOG="${OUTPUT_DIR}/segmentation.log"
+
+    # grounded_sam2_stable_tracking.py hardcodes its input image path per
+    # --dataset_type (ignoring --dataset_root), so the export must also live
+    # at this fixed location relative to COBGS_DIR.
+    COBGS_SCENE_DATASET_DIR="${COBGS_DIR}/dataset/${SCENE_NAME}"
+    mkdir -p "$COBGS_SCENE_DATASET_DIR"
+    ln -sfn "${EXPORT_DIR}/images" "${COBGS_SCENE_DATASET_DIR}/images"
+    mkdir -p "${COBGS_SCENE_DATASET_DIR}/sparse"
+    ln -sfn "${EXPORT_DIR}/sparse/0" "${COBGS_SCENE_DATASET_DIR}/sparse/0"
+
+    (
+        cd "$COBGS_DIR"
+        uv run python -u main_light.py --scene "$SCENE_NAME" --text "$SCENE_NAME" \
+            --classes "$CLASSES" --dataset_root dataset --dataset_type tum_rgbd \
+            --output_root "${OUTPUT_DIR}/segmentation_raw" --resolution -1 --skip_visualize
+    ) > "$SEG_LOG" 2>&1
+
+    COBGS_MASK_DIR="${OUTPUT_DIR}/segmentation_raw/${SCENE_NAME}/masks/${SCENE_NAME}"
+    if [[ ! -f "${COBGS_MASK_DIR}/labels.json" ]]; then
+        echo "[run_full_pipeline] Expected COB-GS labels.json not found at ${COBGS_MASK_DIR}/labels.json" >&2
+        exit 1
+    fi
+
+    echo "[run_full_pipeline] Stage 1.5: applying segmentation masks -> ${SEG_DIR}"
+    mkdir -p "${SEG_DIR}/masked_rgb" "${SEG_DIR}/filtered_colmap"
+    ln -sfn "${EXPORT_DIR}/sparse/0/cameras.txt" "${SEG_DIR}/filtered_colmap/cameras.txt"
+    ln -sfn "${EXPORT_DIR}/sparse/0/images.txt" "${SEG_DIR}/filtered_colmap/images.txt"
+
+    cd "$GENRECON_DIR"
+    uv run python -u scripts/apply_segmentation_mask.py \
+        --images_dir "${EXPORT_DIR}/images" \
+        --masks_root "$COBGS_MASK_DIR" \
+        --background_ply "${COBGS_MASK_DIR}/ply_pointcloud/background.ply" \
+        --out_rgb_dir "${SEG_DIR}/masked_rgb" \
+        --out_points3d "${SEG_DIR}/filtered_colmap/points3D.txt" \
+        >> "$SEG_LOG" 2>&1
+fi
+
 # ── Stage 2: stage GenRecon scene dir ──
 echo "[run_full_pipeline] Stage 2: staging ${SCENE_DIR}"
 mkdir -p "$SCENE_DIR"
-ln -sfn "${EXPORT_DIR}/images" "${SCENE_DIR}/rgb"
-ln -sfn "${EXPORT_DIR}/sparse/0" "${SCENE_DIR}/colmap"
+if [[ -n "$CLASSES" ]]; then
+    ln -sfn "${SEG_DIR}/masked_rgb" "${SCENE_DIR}/rgb"
+    ln -sfn "${SEG_DIR}/filtered_colmap" "${SCENE_DIR}/colmap"
+else
+    ln -sfn "${EXPORT_DIR}/images" "${SCENE_DIR}/rgb"
+    ln -sfn "${EXPORT_DIR}/sparse/0" "${SCENE_DIR}/colmap"
+fi
 
 # ── Stage 3: GenRecon reconstruction + GLB bake (exp2 settings) ──
 cd "$GENRECON_DIR"
