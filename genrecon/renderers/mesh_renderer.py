@@ -104,27 +104,29 @@ class MeshRenderer:
         antialias = self.rendering_options["antialias"]
         clamp_barycentric_coords = self.rendering_options["clamp_barycentric_coords"]
 
+        # `resolution` may be a single int (square, historical behavior) or a
+        # (height, width) tuple for non-square cameras (e.g. real photos).
+        res_h, res_w = (resolution, resolution) if isinstance(resolution, int) else resolution
+
         if mesh.vertices.shape[0] == 0 or mesh.faces.shape[0] == 0:
             ret_dict = edict()
             for type in return_types:
                 if type == "mask":
-                    ret_dict[type] = torch.zeros((resolution, resolution), dtype=torch.float32, device=self.device)
+                    ret_dict[type] = torch.zeros((res_h, res_w), dtype=torch.float32, device=self.device)
                 elif type == "depth":
-                    ret_dict[type] = torch.zeros((resolution, resolution), dtype=torch.float32, device=self.device)
+                    ret_dict[type] = torch.zeros((res_h, res_w), dtype=torch.float32, device=self.device)
                 elif type == "normal":
-                    ret_dict[type] = torch.full(
-                        (3, resolution, resolution), 0.5, dtype=torch.float32, device=self.device
-                    )
+                    ret_dict[type] = torch.full((3, res_h, res_w), 0.5, dtype=torch.float32, device=self.device)
                 elif type == "coord":
-                    ret_dict[type] = torch.zeros((3, resolution, resolution), dtype=torch.float32, device=self.device)
+                    ret_dict[type] = torch.zeros((3, res_h, res_w), dtype=torch.float32, device=self.device)
                 elif type == "attr":
                     if isinstance(mesh, MeshWithVoxel):
                         ret_dict[type] = torch.zeros(
-                            (mesh.attrs.shape[-1], resolution, resolution), dtype=torch.float32, device=self.device
+                            (mesh.attrs.shape[-1], res_h, res_w), dtype=torch.float32, device=self.device
                         )
                     else:
                         ret_dict[type] = torch.zeros(
-                            (mesh.vertex_attrs.shape[-1], resolution, resolution),
+                            (mesh.vertex_attrs.shape[-1], res_h, res_w),
                             dtype=torch.float32,
                             device=self.device,
                         )
@@ -156,7 +158,7 @@ class MeshRenderer:
 
         out_dict = edict()
         if chunk_size is None:
-            rast, rast_db = dr.rasterize(self.glctx, vertices_clip, faces, (resolution * ssaa, resolution * ssaa))
+            rast, rast_db = dr.rasterize(self.glctx, vertices_clip, faces, (res_h * ssaa, res_w * ssaa))
             if clamp_barycentric_coords:
                 rast[..., :2] = torch.clamp(rast[..., :2], 0, 1)
                 rast[..., :2] /= torch.where(
@@ -204,7 +206,7 @@ class MeshRenderer:
                             xyz,
                             mode="trilinear",
                         )
-                        img = img.reshape(1, resolution * ssaa, resolution * ssaa, mesh.attrs.shape[-1]) * mask
+                        img = img.reshape(1, res_h * ssaa, res_w * ssaa, mesh.attrs.shape[-1]) * mask
                     elif isinstance(mesh, MeshWithPbrMaterial):
                         tri_id = rast[0, :, :, -1:]
                         mask = tri_id > 0
@@ -226,16 +228,16 @@ class MeshRenderer:
                         mid = mesh.material_ids[(tri_id - 1).long()]
                         imgs = {
                             "base_color": torch.zeros(
-                                (resolution * ssaa, resolution * ssaa, 3), dtype=torch.float32, device=self.device
+                                (res_h * ssaa, res_w * ssaa, 3), dtype=torch.float32, device=self.device
                             ),
                             "metallic": torch.zeros(
-                                (resolution * ssaa, resolution * ssaa, 1), dtype=torch.float32, device=self.device
+                                (res_h * ssaa, res_w * ssaa, 1), dtype=torch.float32, device=self.device
                             ),
                             "roughness": torch.zeros(
-                                (resolution * ssaa, resolution * ssaa, 1), dtype=torch.float32, device=self.device
+                                (res_h * ssaa, res_w * ssaa, 1), dtype=torch.float32, device=self.device
                             ),
                             "alpha": torch.zeros(
-                                (resolution * ssaa, resolution * ssaa, 1), dtype=torch.float32, device=self.device
+                                (res_h * ssaa, res_w * ssaa, 1), dtype=torch.float32, device=self.device
                             ),
                         }
                         for id, mat in enumerate(mesh.materials):
@@ -530,7 +532,7 @@ class MeshRenderer:
             if ssaa > 1:
                 img = F.interpolate(
                     img.permute(0, 3, 1, 2),
-                    (resolution, resolution),
+                    (res_h, res_w),
                     mode="bilinear",
                     align_corners=False,
                     antialias=True,

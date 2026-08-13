@@ -57,9 +57,9 @@ fi
 
 RUN_DIR="${GENRECON_DIR}/runs/${SCENE_NAME}"
 EXPORT_DIR="${RUN_DIR}/vggt_export"
-SEG_DIR="${RUN_DIR}/segmentation"
-SCENE_DIR="${RUN_DIR}/scene"
-OUTPUT_DIR="${RUN_DIR}/output"
+SEG_DIR="${RUN_DIR}/vggt_export_after_segmentation"
+SCENE_DIR="${RUN_DIR}/genrecon_input"
+OUTPUT_DIR="${RUN_DIR}/genrecon_output"
 
 mkdir -p "$EXPORT_DIR" "$OUTPUT_DIR"
 
@@ -162,7 +162,7 @@ if [[ -n "$CLASSES" ]]; then
     uv run python -u scripts/apply_segmentation_mask.py \
         --images_dir "${EXPORT_DIR}/images" \
         --masks_root "$COBGS_MASK_DIR" \
-        --background_ply "${COBGS_MASK_DIR}/ply_pointcloud/background.ply" \
+        --background_ply "${COBGS_MASK_DIR}/background/point_cloud/background.ply" \
         --out_rgb_dir "${SEG_DIR}/masked_rgb" \
         --out_points3d "${SEG_DIR}/filtered_colmap/points3D.txt" \
         >> "$SEG_LOG" 2>&1
@@ -190,6 +190,16 @@ uv run python -u reconstruct_scene.py --mode Iphone --path "$SCENE_DIR" --output
     --tex_ckpt checkpoints/texture_slat/ckpts/texture_slat.pt \
     --num_imgs_per_scene "$NUM_IMGS_PER_SCENE" --colmap_subdir colmap \
     > "${OUTPUT_DIR}/reconstruct.log" 2>&1
+
+# ── Stage 3.5: reprojection validation ──
+echo "[run_full_pipeline] Stage 3.5: render_reprojection_validation.py"
+uv run python -u scripts/render_reprojection_validation.py \
+    --mesh_ply "${OUTPUT_DIR}/mesh.ply" \
+    --colmap_dir "${SCENE_DIR}/colmap" \
+    --images_dir "${SCENE_DIR}/rgb" \
+    --out_synth_dir "${OUTPUT_DIR}/synth_views" \
+    --out_compare_dir "${OUTPUT_DIR}/compare_views" \
+    > "${OUTPUT_DIR}/reprojection_validation.log" 2>&1
 
 if [[ "$RUN_GLB" -eq 1 ]]; then
     echo "[run_full_pipeline] Stage 4: chunked_to_glb.py (simplify_threshold=${SIMPLIFY_THRESHOLD}, texture_size=${TEXTURE_SIZE})"
