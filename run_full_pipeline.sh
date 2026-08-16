@@ -2,13 +2,14 @@
 # End-to-end pipeline: VGGT-Omega pose/depth prediction -> [optional COB-GS 3D segmentation] -> GenRecon reconstruction -> GLB bake.
 #
 # Usage:
-#   ./run_full_pipeline.sh <image_folder> <scene_name> [--simplify_threshold N] [--texture_size N] [--num_imgs_per_scene N] [--skip-frames N] [--align-to-gravity] [--rotate-horizontal-deg N] [--classes a,b,c] [--run_glb]
+#   ./run_full_pipeline.sh <image_folder> <scene_name> [--simplify_threshold N] [--texture_size N] [--num_imgs_per_scene N] [--skip-frames N] [--align-to-gravity] [--rotate-horizontal-deg N] [--classes a,b,c] [--run_glb] [--run_trellis2]
 #
 # Example:
 #   ./run_full_pipeline.sh /home/gabis/Work/GitHub/COB-GS/dataset/food2/images food2_vggt
 #   ./run_full_pipeline.sh /home/gabis/Work/GitHub/COB-GS/dataset/food2/images food2_vggt --run_glb
 #   ./run_full_pipeline.sh /home/gabis/Work/GitHub/COB-GS/dataset/food2/images food2_vggt --align-to-gravity --rotate-horizontal-deg 90
 #   ./run_full_pipeline.sh /home/gabis/Work/GitHub/COB-GS/dataset/food2/images food2_vggt --classes "person,chair,bag"
+#   ./run_full_pipeline.sh /home/gabis/Work/GitHub/COB-GS/dataset/food2/images food2_vggt --classes "person,chair,bag" --run_trellis2
 
 set -euo pipefail
 
@@ -16,6 +17,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GENRECON_DIR="$SCRIPT_DIR"
 VGGT_OMEGA_DIR="$(cd "$GENRECON_DIR/../vggt-omega" && pwd)"
 COBGS_DIR="$(cd "$GENRECON_DIR/../COB-GS" && pwd)"
+TRELLIS2_DIR="$(cd "$GENRECON_DIR/../trellis2" && pwd)"
 VGGT_CHECKPOINT="${VGGT_OMEGA_DIR}/vggt_omega_1b_512.pt"
 
 SIMPLIFY_THRESHOLD=250000
@@ -23,13 +25,14 @@ TEXTURE_SIZE=2048
 NUM_IMGS_PER_SCENE=32
 VGGT_EXPORT_TIMEOUT=1800
 RUN_GLB=0
+RUN_TRELLIS2=0
 SKIP_FRAMES=-1
 ALIGN_TO_GRAVITY=0
 ROTATE_HORIZONTAL_DEG=0.0
 CLASSES=""
 
 if [[ $# -lt 2 ]]; then
-    echo "Usage: $0 <image_folder> <scene_name> [--simplify_threshold N] [--texture_size N] [--num_imgs_per_scene N] [--skip-frames N] [--align-to-gravity] [--rotate-horizontal-deg N] [--classes a,b,c] [--run_glb]" >&2
+    echo "Usage: $0 <image_folder> <scene_name> [--simplify_threshold N] [--texture_size N] [--num_imgs_per_scene N] [--skip-frames N] [--align-to-gravity] [--rotate-horizontal-deg N] [--classes a,b,c] [--run_glb] [--run_trellis2]" >&2
     exit 1
 fi
 
@@ -47,6 +50,7 @@ while [[ $# -gt 0 ]]; do
         --rotate-horizontal-deg) ROTATE_HORIZONTAL_DEG="$2"; shift 2 ;;
         --classes) CLASSES="$2"; shift 2 ;;
         --run_glb) RUN_GLB=1; shift 1 ;;
+        --run_trellis2) RUN_TRELLIS2=1; shift 1 ;;
         *) echo "Unknown argument: $1" >&2; exit 1 ;;
     esac
 done
@@ -209,6 +213,26 @@ if [[ -n "$CLASSES" ]]; then
         --masks_root "$COBGS_MASK_DIR" \
         >> "$SEG_LOG" 2>&1
     stage_end
+
+    # ── Stage 1.7 (optional): TRELLIS.2 3D reconstruction per class ──
+    if [[ "$RUN_TRELLIS2" -eq 1 ]]; then
+        stage_start "Stage 1.7: TRELLIS.2 reconstruction -> ${RUN_DIR}/trellis2_meshes"
+        TRELLIS2_INPUT_DIR="${RUN_DIR}/trellis2_input"
+        TRELLIS2_OUTPUT_DIR="${RUN_DIR}/trellis2_meshes"
+        uv run python -u scripts/stage_trellis2_inputs.py \
+            --masks_root "$COBGS_MASK_DIR" \
+            --out_dir "$TRELLIS2_INPUT_DIR" \
+            >> "$SEG_LOG" 2>&1
+
+        (
+            cd "$TRELLIS2_DIR"
+            uv run --no-sync generate.py \
+                --input "$TRELLIS2_INPUT_DIR" \
+                --output-dir "$TRELLIS2_OUTPUT_DIR" \
+                --resolution 512 --no-preview
+        ) >> "$SEG_LOG" 2>&1
+        stage_end
+    fi
 fi
 
 # ── Stage 2: stage GenRecon scene dir ──
