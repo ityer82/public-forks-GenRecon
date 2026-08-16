@@ -15,11 +15,11 @@ from __future__ import annotations
 
 import argparse
 import time
-import traceback
 from pathlib import Path
 
 import torch
 
+from genrecon.utils.logger import logger
 from inference.chunked_glb import chunked_to_glb
 
 
@@ -108,14 +108,14 @@ def main() -> None:
     to_glb_inputs = load_pt(Path(args.inputs))
     chunk_inputs = load_pt(Path(args.chunk_inputs))
 
-    print(
+    logger.info(
         f"Loaded {args.inputs}: "
         f"vertices {tuple(to_glb_inputs['vertices'].shape)}, "
         f"faces {tuple(to_glb_inputs['faces'].shape)}, "
         f"attr_volume {tuple(to_glb_inputs['attr_volume'].shape)}, "
         f"coords {tuple(to_glb_inputs['coords'].shape)}"
     )
-    print(
+    logger.info(
         f"Loaded {args.chunk_inputs}: "
         f"{len(chunk_inputs['chunk_indices'])} chunks, "
         f"chunk_size_world={chunk_inputs['chunk_size_world']:.4f}"
@@ -155,21 +155,20 @@ def main() -> None:
             verbose=True,
         )
     except Exception:
-        print("[chunked_to_glb] FAILED:")
-        traceback.print_exc()
+        logger.exception("FAILED:")
         return
 
     elapsed = time.perf_counter() - t0
     if args.dump_geometry_plys:
-        print(f"\n[chunked_to_glb] dump-geometry mode: PLYs written to {out_dir}")
+        logger.info(f"dump-geometry mode: PLYs written to {out_dir}")
     else:
         out_file = out_dir / "scene.glb"
-        print(f"\n[chunked_to_glb] writing {out_file} ...")
+        logger.info(f"writing {out_file} ...")
         scene.export(str(out_file))
-    print(f"[chunked_to_glb] total time: {elapsed:.1f}s")
+    logger.info(f"total time: {elapsed:.1f}s")
     if torch.cuda.is_available():
         peak_gb = torch.cuda.max_memory_allocated() / (1024**3)
-        print(f"[chunked_to_glb] VRAM peak: {peak_gb:.2f} GB")
+        logger.info(f"VRAM peak: {peak_gb:.2f} GB")
 
 
 if __name__ == "__main__":

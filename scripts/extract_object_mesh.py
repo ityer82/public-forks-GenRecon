@@ -20,12 +20,13 @@ Usage:
 """
 import argparse
 import shutil
-import sys
 from pathlib import Path
 
 import numpy as np
 from plyfile import PlyData, PlyElement
 from scipy.spatial import ConvexHull, QhullError
+
+from genrecon.utils.logger import logger
 
 
 def load_object_points(object_ply: Path) -> np.ndarray:
@@ -132,7 +133,7 @@ def main():
     args = parser.parse_args()
 
     def skip(reason: str) -> None:
-        print(f"Skipping {args.object_ply}: {reason}", file=sys.stderr)
+        logger.warning(f"Skipping {args.object_ply}: {reason}")
         if args.remainder_out_ply is not None and args.remainder_out_ply != args.mesh_ply:
             args.remainder_out_ply.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(args.mesh_ply, args.remainder_out_ply)
@@ -158,11 +159,11 @@ def main():
         return
 
     write_cropped_ply(args.out_ply, object_vertex, object_faces)
-    print(f"Wrote {args.out_ply}: {len(object_vertex)} vertices, {len(object_faces)} faces.")
+    logger.info(f"Wrote {args.out_ply}: {len(object_vertex)} vertices, {len(object_faces)} faces.")
 
     if args.remainder_out_ply is not None:
         write_cropped_ply(args.remainder_out_ply, remainder_vertex, remainder_faces)
-        print(
+        logger.info(
             f"Wrote {args.remainder_out_ply}: {len(remainder_vertex)} vertices, "
             f"{len(remainder_faces)} faces."
         )

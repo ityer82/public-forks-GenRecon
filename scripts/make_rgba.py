@@ -15,6 +15,8 @@ import sys
 import numpy as np
 from PIL import Image
 
+from genrecon.utils.logger import logger
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -62,7 +64,7 @@ def load_mask_array(mask: Image.Image) -> np.ndarray:
     else:
         channel = "using luminance"
         array = np.array(mask.convert("L"))
-    print(f"[load] mask ({mask.width}x{mask.height}, mode={mask.mode}) -> {channel}")
+    logger.info(f"mask ({mask.width}x{mask.height}, mode={mask.mode}) -> {channel}")
     return array
 
 
@@ -93,20 +95,19 @@ def composite_rgba(
             mask_array = np.array(
                 Image.fromarray(mask_array).resize(image.size, Image.Resampling.LANCZOS)
             )
-            print(f"[resize] mask -> {image.size}")
+            logger.info(f"resized mask -> {image.size}")
         else:
             image = image.resize(mask.size, Image.Resampling.LANCZOS)
-            print(f"[resize] image -> {mask.size}")
+            logger.info(f"resized image -> {mask.size}")
 
     if threshold is not None:
         mask_array = np.where(mask_array >= threshold, 255, 0).astype(np.uint8)
 
     if mask_array.min() == mask_array.max():
-        print(
-            f"[warn] mask is uniform (all values == {mask_array.min()}); this defeats compositing -- "
+        logger.warning(
+            f"mask is uniform (all values == {mask_array.min()}); this defeats compositing -- "
             "TRELLIS.2 treats an all-255 alpha channel as 'no mask' and will run its own background "
-            "removal, while an all-0 alpha channel produces a fully transparent, unusable image.",
-            file=sys.stderr,
+            "removal, while an all-0 alpha channel produces a fully transparent, unusable image."
         )
 
     rgba_array = np.dstack([np.array(image), mask_array])
@@ -117,15 +118,15 @@ def main():
     args = parse_args()
 
     if not os.path.isfile(args.image):
-        print(f"No such file: {args.image}", file=sys.stderr)
+        logger.error(f"No such file: {args.image}")
         sys.exit(1)
     if not os.path.isfile(args.mask):
-        print(f"No such file: {args.mask}", file=sys.stderr)
+        logger.error(f"No such file: {args.mask}")
         sys.exit(1)
 
     try:
         image = Image.open(args.image).convert("RGB")
-        print(f"[load] image {args.image} ({image.width}x{image.height})")
+        logger.info(f"image {args.image} ({image.width}x{image.height})")
 
         mask = Image.open(args.mask)
 
@@ -137,9 +138,9 @@ def main():
         if output_dir:
             os.makedirs(output_dir, exist_ok=True)
         result.save(args.output)
-        print(f"[write] {args.output} ({result.width}x{result.height}, RGBA)")
+        logger.info(f"wrote {args.output} ({result.width}x{result.height}, RGBA)")
     except Exception as e:
-        print(str(e), file=sys.stderr)
+        logger.error(str(e))
         sys.exit(1)
 
 

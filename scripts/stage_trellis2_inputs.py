@@ -14,8 +14,9 @@ Usage:
 """
 import argparse
 import json
-import sys
 from pathlib import Path
+
+from genrecon.utils.logger import logger
 
 
 def stage_trellis2_inputs(masks_root: Path, out_dir: Path) -> None:
@@ -26,17 +27,17 @@ def stage_trellis2_inputs(masks_root: Path, out_dir: Path) -> None:
         mask_rgba_dir = masks_root / dirname / "mask_rgba"
         candidates = sorted(mask_rgba_dir.glob("*.png"))
         if not candidates:
-            print(f"[stage_trellis2_inputs] {label}: no RGBA mask found under {mask_rgba_dir}, skipping", file=sys.stderr)
+            logger.warning(f"{label}: no RGBA mask found under {mask_rgba_dir}, skipping")
             continue
         if len(candidates) > 1:
             candidates.sort(key=lambda p: p.stat().st_mtime)
-            print(f"[stage_trellis2_inputs] {label}: {len(candidates)} RGBA masks found under {mask_rgba_dir}, using most recent", file=sys.stderr)
+            logger.warning(f"{label}: {len(candidates)} RGBA masks found under {mask_rgba_dir}, using most recent")
         source = candidates[-1].resolve()
 
         dest = out_dir / f"{label}.png"
         dest.unlink(missing_ok=True)
         dest.symlink_to(source)
-        print(f"[stage_trellis2_inputs] {label}: {dest} -> {source}")
+        logger.info(f"{label}: {dest} -> {source}")
 
 
 def main():

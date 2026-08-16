@@ -17,7 +17,6 @@ Usage:
 """
 import argparse
 import json
-import sys
 from pathlib import Path
 
 import numpy as np
@@ -25,6 +24,7 @@ from PIL import Image
 
 from apply_segmentation_mask import resolve_mask_path
 from make_rgba import composite_rgba
+from genrecon.utils.logger import logger
 
 
 def best_frame_for_class(mask_dir: Path) -> tuple[str, float] | None:
@@ -50,13 +50,13 @@ def export_rgba_masks(images_dir: Path, masks_root: Path) -> None:
         mask_dir = class_dir / "mask_bin"
         best = best_frame_for_class(mask_dir)
         if best is None:
-            print(f"[export_rgba_masks] {label}: no mask frames found under {mask_dir}, skipping", file=sys.stderr)
+            logger.warning(f"{label}: no mask frames found under {mask_dir}, skipping")
             continue
         frame_stem, ratio = best
 
         image_path = resolve_mask_path(images_dir, frame_stem)
         if image_path is None:
-            print(f"[export_rgba_masks] {label}: source image for frame '{frame_stem}' not found under {images_dir}, skipping", file=sys.stderr)
+            logger.warning(f"{label}: source image for frame '{frame_stem}' not found under {images_dir}, skipping")
             continue
         mask_path = resolve_mask_path(mask_dir, frame_stem)
 
@@ -68,7 +68,7 @@ def export_rgba_masks(images_dir: Path, masks_root: Path) -> None:
         out_dir.mkdir(parents=True, exist_ok=True)
         out_path = out_dir / f"{frame_stem}.png"
         rgba.save(out_path)
-        print(f"[export_rgba_masks] {label}: selected frame '{frame_stem}' (coverage {ratio:.1%}) -> {out_path}")
+        logger.info(f"{label}: selected frame '{frame_stem}' (coverage {ratio:.1%}) -> {out_path}")
 
 
 def main():

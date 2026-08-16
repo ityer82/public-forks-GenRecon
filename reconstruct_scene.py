@@ -27,6 +27,7 @@ import torch
 from PIL import Image
 
 from genrecon.pipelines.full_scene_images_to_3d import FullSceneImagesTo3DPipeline
+from genrecon.utils.logger import logger
 from inference.get_chunks import (
     IphoneChunker,
     SageGtChunker,
@@ -117,7 +118,7 @@ def _save_plys(
     ``m_c2o[chunk_idx]`` for the world save).
     """
     save_mesh_to_original(out_path / "mesh.ply", scene_mesh, mesh_transform)
-    print(label)
+    logger.info(label)
     for coords, chunk_idx in zip(coords_list, chunk_indices):
         save_coords_to_original(
             out_path / f"coords_{chunk_idx:03d}.ply", coords, coords_resolution, coords_transform(chunk_idx)
@@ -143,7 +144,7 @@ def _save_to_glb_inputs(
     gx, gy, gz = (int(v) for v in scene_mesh.voxel_shape[2:])
     gx_p, gy_p, gz_p = (_next_halving_friendly(v) for v in (gx, gy, gz))
     if (gx_p, gy_p, gz_p) != (gx, gy, gz):
-        print(f"[chunked] padding grid ({gx}, {gy}, {gz}) → ({gx_p}, {gy_p}, {gz_p}) for remesh halving constraint")
+        logger.info(f"padding grid ({gx}, {gy}, {gz}) → ({gx_p}, {gy_p}, {gz_p}) for remesh halving constraint")
     aabb = [
         list(origin),
         [origin[i] + (gx_p, gy_p, gz_p)[i] * voxel_size for i in range(3)],
@@ -158,7 +159,7 @@ def _save_to_glb_inputs(
         "voxel_size": voxel_size,
     }
     torch.save(to_glb_inputs, out_path / "to_glb_inputs.pt")
-    print(f"[chunked] saved {label}to_glb_inputs to {out_path / 'to_glb_inputs.pt'}")
+    logger.info(f"saved {label}to_glb_inputs to {out_path / 'to_glb_inputs.pt'}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -366,7 +367,7 @@ def main() -> None:
         rel_t = [torch.zeros(3, dtype=torch.float32)]
         with (out_path / "crop_transform.json").open("w", encoding="utf-8") as f:
             json.dump(crop, f, indent=2)
-        print(f"[validation_crop] using crops/{scene_id}.json[chunks][{args.validation_crop_idx}]")
+        logger.info(f"using crops/{scene_id}.json[chunks][{args.validation_crop_idx}]")
     else:
         _, m_o2c, m_c2o, rel_t = chunker_cls(**chunker_kwargs).get_chunks(scene_path, out_path)
     selecter_kwargs: dict = {}
@@ -446,7 +447,7 @@ def main() -> None:
             "M_chunk_to_original": m_c2o[0].detach().cpu(),
         }
         torch.save(chunk_inputs, out_path / "chunk_inputs.pt")
-        print(f"[chunked] saved chunk metadata to {out_path / 'chunk_inputs.pt'}")
+        logger.info(f"saved chunk metadata to {out_path / 'chunk_inputs.pt'}")
     else:
         # Joint frame = chunker's chunk-0 local frame, so m_c2o[0] lifts it to world.
         chunk_size = m_c2o[0][0, 0].item()
@@ -478,7 +479,7 @@ def main() -> None:
             "chunk_indices": list(sel.chunk_indices),
         }
         torch.save(chunk_inputs, out_path / "chunk_inputs.pt")
-        print(f"[chunked] saved chunk metadata to {out_path / 'chunk_inputs.pt'}")
+        logger.info(f"saved chunk metadata to {out_path / 'chunk_inputs.pt'}")
 
 
 if __name__ == "__main__":

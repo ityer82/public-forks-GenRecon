@@ -36,6 +36,8 @@ from pathlib import Path
 
 import numpy as np
 
+from genrecon.utils.logger import logger
+
 
 def qvec2rotmat(qw: float, qx: float, qy: float, qz: float) -> np.ndarray:
     return np.array(
@@ -185,20 +187,20 @@ def main() -> None:
     ref_poses = parse_images_txt(ref_dir / "images.txt")
     s, R_fit, t_fit, rmse, n_common = fit_transform(src_poses, ref_poses)
 
-    print(f"[apply_umeyama_transform] matched {n_common} common frame(s)")
-    print(f"[apply_umeyama_transform] fitted scale s      = {s:.6f}")
-    print(f"[apply_umeyama_transform] fitted rotation R    =\n{R_fit}")
-    print(f"[apply_umeyama_transform] det(R)               = {np.linalg.det(R_fit):.6f}")
-    print(f"[apply_umeyama_transform] fitted translation t = {t_fit}")
-    print(f"[apply_umeyama_transform] full-7-DOF camera-center RMSE = {rmse:.4f} m")
+    logger.info(f"matched {n_common} common frame(s)")
+    logger.info(f"fitted scale s      = {s:.6f}")
+    logger.info(f"fitted rotation R    =\n{R_fit}")
+    logger.info(f"det(R)               = {np.linalg.det(R_fit):.6f}")
+    logger.info(f"fitted translation t = {t_fit}")
+    logger.info(f"full-7-DOF camera-center RMSE = {rmse:.4f} m")
 
     if args.apply_mode == "scale_only":
         R_apply, t_apply = np.eye(3), np.zeros(3)
-        print("[apply_umeyama_transform] apply_mode=scale_only: applying scale alone (R=I, t=0)")
+        logger.info("apply_mode=scale_only: applying scale alone (R=I, t=0)")
     elif args.apply_mode == "scale_translation":
         R_apply, t_apply = np.eye(3), t_fit
-        print("[apply_umeyama_transform] apply_mode=scale_translation: applying fitted scale + "
-              "fitted translation, rotation forced to I (t not re-fit)")
+        logger.info("apply_mode=scale_translation: applying fitted scale + "
+                    "fitted translation, rotation forced to I (t not re-fit)")
     else:
         R_apply, t_apply = R_fit, t_fit
 
@@ -206,7 +208,7 @@ def main() -> None:
     transform_images_txt(src_dir / "images.txt", out_dir / "images.txt", s, R_apply, t_apply)
     transform_points3d_txt(src_dir / "points3D.txt", out_dir / "points3D.txt", s, R_apply, t_apply)
 
-    print(f"[apply_umeyama_transform] wrote transformed COLMAP dataset to {out_dir}")
+    logger.info(f"wrote transformed COLMAP dataset to {out_dir}")
 
 
 if __name__ == "__main__":

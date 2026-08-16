@@ -30,6 +30,7 @@ from PIL import Image
 
 from genrecon.renderers.mesh_renderer import MeshRenderer
 from genrecon.representations.mesh import Mesh
+from genrecon.utils.logger import logger
 
 _SEPARATOR_WIDTH_PX = 4
 
@@ -162,13 +163,13 @@ def main() -> None:
     renderer = MeshRenderer(rendering_options={"near": near, "far": far, "ssaa": args.ssaa}, device=device)
 
     cameras = parse_colmap_cameras(args.colmap_dir)
-    print(f"[render_reprojection_validation] {len(cameras)} camera(s) found in {args.colmap_dir}")
+    logger.info(f"{len(cameras)} camera(s) found in {args.colmap_dir}")
 
     n_rendered, n_missing = 0, 0
     for cam in cameras:
         image_path = args.images_dir / cam["name"]
         if not image_path.is_file():
-            print(f"[render_reprojection_validation] skipping {cam['name']}: no matching original image")
+            logger.warning(f"skipping {cam['name']}: no matching original image")
             n_missing += 1
             continue
 
@@ -179,8 +180,8 @@ def main() -> None:
         Image.fromarray(make_side_by_side(original, synth)).save(args.out_compare_dir / cam["name"])
         n_rendered += 1
 
-    print(
-        f"[render_reprojection_validation] rendered {n_rendered} view(s) -> {args.out_synth_dir} "
+    logger.info(
+        f"rendered {n_rendered} view(s) -> {args.out_synth_dir} "
         f"and {args.out_compare_dir} ({n_missing} skipped for missing originals)"
     )
 
