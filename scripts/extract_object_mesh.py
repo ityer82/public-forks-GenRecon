@@ -133,7 +133,7 @@ def main():
 
     def skip(reason: str) -> None:
         print(f"Skipping {args.object_ply}: {reason}", file=sys.stderr)
-        if args.remainder_out_ply is not None:
+        if args.remainder_out_ply is not None and args.remainder_out_ply != args.mesh_ply:
             args.remainder_out_ply.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(args.mesh_ply, args.remainder_out_ply)
 

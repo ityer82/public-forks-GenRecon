@@ -12,9 +12,10 @@
 
 set -euo pipefail
 
-VGGT_OMEGA_DIR="/home/gabis/Work/GitHub/vggt-omega"
-GENRECON_DIR="/home/gabis/Work/GitHub/public-forks-GenRecon"
-COBGS_DIR="/home/gabis/Work/GitHub/COB-GS"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GENRECON_DIR="$SCRIPT_DIR"
+VGGT_OMEGA_DIR="$(cd "$GENRECON_DIR/../vggt-omega" && pwd)"
+COBGS_DIR="$(cd "$GENRECON_DIR/../COB-GS" && pwd)"
 VGGT_CHECKPOINT="${VGGT_OMEGA_DIR}/vggt_omega_1b_512.pt"
 
 SIMPLIFY_THRESHOLD=250000
@@ -195,6 +196,18 @@ if [[ -n "$CLASSES" ]]; then
         --background_ply "${COBGS_MASK_DIR}/background/point_cloud/background.ply" \
         --out_rgb_dir "${SEG_DIR}/masked_rgb" \
         --out_points3d "${SEG_DIR}/filtered_colmap/points3D.txt" \
+        >> "$SEG_LOG" 2>&1
+    stage_end
+
+    # ── Stage 1.6: RGBA best-view mask export ──
+    # For each class, picks the frame where the object covers the largest
+    # fraction of the image (most detail) and composites an RGBA image from
+    # it, for use by image-conditioned generators (e.g. TRELLIS.2 generate.py).
+    stage_start "Stage 1.6: RGBA mask export -> ${SEG_DIR}/rgba_masks"
+    uv run python -u scripts/export_rgba_masks.py \
+        --images_dir "${EXPORT_DIR}/images" \
+        --masks_root "$COBGS_MASK_DIR" \
+        --out_dir "${SEG_DIR}/rgba_masks" \
         >> "$SEG_LOG" 2>&1
     stage_end
 fi
