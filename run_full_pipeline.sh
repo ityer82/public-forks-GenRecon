@@ -63,8 +63,32 @@ OUTPUT_DIR="${RUN_DIR}/genrecon_output"
 
 mkdir -p "$EXPORT_DIR" "$OUTPUT_DIR"
 
+# ── timestamp / elapsed-time helpers ──
+log() {
+    echo "[run_full_pipeline] [$(date '+%Y-%m-%d %H:%M:%S')] $*"
+}
+
+stage_start() {
+    STAGE_NAME="$1"
+    STAGE_T0=$(date +%s)
+    log "${STAGE_NAME}"
+}
+
+stage_end() {
+    local elapsed=$(( $(date +%s) - STAGE_T0 ))
+    log "${STAGE_NAME} done (elapsed $(format_duration "$elapsed"))"
+}
+
+format_duration() {
+    local s=$1
+    printf '%dm%02ds' $((s / 60)) $((s % 60))
+}
+
+PIPELINE_T0=$(date +%s)
+log "Pipeline started for scene '${SCENE_NAME}'"
+
 # ── Stage 1: VGGT-Omega pose/depth prediction + COLMAP-text export ──
-echo "[run_full_pipeline] Stage 1: VGGT-Omega export -> ${EXPORT_DIR}"
+stage_start "Stage 1: VGGT-Omega export -> ${EXPORT_DIR}"
 VGGT_LOG="${OUTPUT_DIR}/vggt_export.log"
 
 VGGT_SKIP_FRAMES_ARGS=()
@@ -97,30 +121,31 @@ VGGT_PID=$!
 # immediately instead of waiting for it — the viewer keeps running independently for
 # later inspection, but no longer blocks stages 2/3. vggt_export.log still captures its
 # output if you want to check on it separately.
-elapsed=0
+wait_elapsed=0
 while true; do
     if grep -q "Exported COLMAP dataset to" "$VGGT_LOG" 2>/dev/null; then
-        echo "[run_full_pipeline] VGGT-Omega export confirmed, detaching viewer process (PID ${VGGT_PID}) and continuing."
+        log "VGGT-Omega export confirmed, detaching viewer process (PID ${VGGT_PID}) and continuing."
         disown "$VGGT_PID" 2>/dev/null || true
         break
     fi
     if ! kill -0 "$VGGT_PID" 2>/dev/null; then
-        echo "[run_full_pipeline] VGGT-Omega process exited before export completed. See $VGGT_LOG" >&2
+        log "VGGT-Omega process exited before export completed. See $VGGT_LOG" >&2
         exit 1
     fi
-    if (( elapsed >= VGGT_EXPORT_TIMEOUT )); then
-        echo "[run_full_pipeline] Timed out waiting for VGGT-Omega export after ${VGGT_EXPORT_TIMEOUT}s." >&2
+    if (( wait_elapsed >= VGGT_EXPORT_TIMEOUT )); then
+        log "Timed out waiting for VGGT-Omega export after ${VGGT_EXPORT_TIMEOUT}s." >&2
         kill "$VGGT_PID" 2>/dev/null || true
         exit 1
     fi
     sleep 2
-    elapsed=$((elapsed + 2))
+    wait_elapsed=$((wait_elapsed + 2))
 done
 
 if [[ ! -f "${EXPORT_DIR}/sparse/0/cameras.txt" ]]; then
-    echo "[run_full_pipeline] Expected COLMAP export not found at ${EXPORT_DIR}/sparse/0/cameras.txt" >&2
+    log "Expected COLMAP export not found at ${EXPORT_DIR}/sparse/0/cameras.txt" >&2
     exit 1
 fi
+stage_end
 
 # ── Stage 1.5 (optional): COB-GS 3D segmentation ──
 # When --classes is set, only the background reaches GenRecon: foreground
@@ -128,7 +153,7 @@ fi
 # a result, since GenRecon derives chunk placement from points3D.txt) and
 # foreground pixels are masked out of every RGB frame.
 if [[ -n "$CLASSES" ]]; then
-    echo "[run_full_pipeline] Stage 1.5: COB-GS segmentation (classes: ${CLASSES})"
+    stage_start "Stage 1.5: COB-GS segmentation (classes: ${CLASSES})"
     SEG_LOG="${OUTPUT_DIR}/segmentation.log"
 
     # grounded_sam2_stable_tracking.py hardcodes its input image path per
@@ -140,20 +165,25 @@ if [[ -n "$CLASSES" ]]; then
     mkdir -p "${COBGS_SCENE_DATASET_DIR}/sparse"
     ln -sfn "${EXPORT_DIR}/sparse/0" "${COBGS_SCENE_DATASET_DIR}/sparse/0"
 
+    # --output_root is already scene-specific (it's under runs/<scene>/), and --text
+    # is only ever a directory label here (--classes is always set, so it never
+    # feeds the detection caption) -- so both --flat_output and a fixed --text
+    # avoid redundantly repeating the scene name in the output path.
     (
         cd "$COBGS_DIR"
-        uv run python -u main_light.py --scene "$SCENE_NAME" --text "$SCENE_NAME" \
+        uv run python -u main_light.py --scene "$SCENE_NAME" --text "classes" \
             --classes "$CLASSES" --dataset_root dataset --dataset_type tum_rgbd \
-            --output_root "${OUTPUT_DIR}/segmentation_raw" --resolution -1 --skip_visualize
+            --output_root "${OUTPUT_DIR}/segmentation_raw" --resolution -1 --skip_visualize \
+            --flat_output
     ) > "$SEG_LOG" 2>&1
 
-    COBGS_MASK_DIR="${OUTPUT_DIR}/segmentation_raw/${SCENE_NAME}/masks/${SCENE_NAME}"
+    COBGS_MASK_DIR="${OUTPUT_DIR}/segmentation_raw/masks/classes"
     if [[ ! -f "${COBGS_MASK_DIR}/labels.json" ]]; then
-        echo "[run_full_pipeline] Expected COB-GS labels.json not found at ${COBGS_MASK_DIR}/labels.json" >&2
+        log "Expected COB-GS labels.json not found at ${COBGS_MASK_DIR}/labels.json" >&2
         exit 1
     fi
 
-    echo "[run_full_pipeline] Stage 1.5: applying segmentation masks -> ${SEG_DIR}"
+    log "Stage 1.5: applying segmentation masks -> ${SEG_DIR}"
     mkdir -p "${SEG_DIR}/masked_rgb" "${SEG_DIR}/filtered_colmap"
     ln -sfn "${EXPORT_DIR}/sparse/0/cameras.txt" "${SEG_DIR}/filtered_colmap/cameras.txt"
     ln -sfn "${EXPORT_DIR}/sparse/0/images.txt" "${SEG_DIR}/filtered_colmap/images.txt"
@@ -166,10 +196,11 @@ if [[ -n "$CLASSES" ]]; then
         --out_rgb_dir "${SEG_DIR}/masked_rgb" \
         --out_points3d "${SEG_DIR}/filtered_colmap/points3D.txt" \
         >> "$SEG_LOG" 2>&1
+    stage_end
 fi
 
 # ── Stage 2: stage GenRecon scene dir ──
-echo "[run_full_pipeline] Stage 2: staging ${SCENE_DIR}"
+stage_start "Stage 2: staging ${SCENE_DIR}"
 mkdir -p "$SCENE_DIR"
 if [[ -n "$CLASSES" ]]; then
     ln -sfn "${SEG_DIR}/masked_rgb" "${SCENE_DIR}/rgb"
@@ -178,21 +209,23 @@ else
     ln -sfn "${EXPORT_DIR}/images" "${SCENE_DIR}/rgb"
     ln -sfn "${EXPORT_DIR}/sparse/0" "${SCENE_DIR}/colmap"
 fi
+stage_end
 
 # ── Stage 3: GenRecon reconstruction + GLB bake (exp2 settings) ──
 cd "$GENRECON_DIR"
 export MPLBACKEND=Agg
 
-echo "[run_full_pipeline] Stage 3: reconstruct_scene.py"
+stage_start "Stage 3: reconstruct_scene.py"
 uv run python -u reconstruct_scene.py --mode Iphone --path "$SCENE_DIR" --output_path "$OUTPUT_DIR" \
     --ss_ckpt checkpoints/sparse_structure/ckpts/sparse_structure.pt \
     --shape_ckpt checkpoints/shape_slat/ckpts/shape_slat.pt \
     --tex_ckpt checkpoints/texture_slat/ckpts/texture_slat.pt \
     --num_imgs_per_scene "$NUM_IMGS_PER_SCENE" --colmap_subdir colmap \
     > "${OUTPUT_DIR}/reconstruct.log" 2>&1
+stage_end
 
 # ── Stage 3.5: reprojection validation ──
-echo "[run_full_pipeline] Stage 3.5: render_reprojection_validation.py"
+stage_start "Stage 3.5: render_reprojection_validation.py"
 uv run python -u scripts/render_reprojection_validation.py \
     --mesh_ply "${OUTPUT_DIR}/mesh.ply" \
     --colmap_dir "${SCENE_DIR}/colmap" \
@@ -200,9 +233,54 @@ uv run python -u scripts/render_reprojection_validation.py \
     --out_synth_dir "${OUTPUT_DIR}/synth_views" \
     --out_compare_dir "${OUTPUT_DIR}/compare_views" \
     > "${OUTPUT_DIR}/reprojection_validation.log" 2>&1
+stage_end
+
+# ── Stage 3.6: collect shapes (reconstructed mesh + per-class point clouds) ──
+stage_start "Stage 3.6: collecting shapes -> ${OUTPUT_DIR}/shapes"
+SHAPES_DIR="${OUTPUT_DIR}/shapes"
+mkdir -p "$SHAPES_DIR"
+mv "${OUTPUT_DIR}/mesh.ply" "${SHAPES_DIR}/mesh.ply"
+if [[ -n "$CLASSES" ]]; then
+    find "$COBGS_MASK_DIR" -mindepth 3 -maxdepth 3 -name "*.ply" -exec cp {} "$SHAPES_DIR/" \;
+fi
+stage_end
+
+# ── Stage 3.7 (optional): per-object mesh extraction (cascading convex hull crop) ──
+# Crops each class's object out of the scene mesh in turn, using its point
+# cloud (shapes/<label>.ply) as a spatial reference -- both are already in
+# the same world frame as mesh.ply, so no alignment step is needed. Each
+# class is cropped out of what's left of the mesh after the previous class
+# (rather than independently from the original), so the final remainder --
+# saved as background_mesh.ply -- is exactly mesh.ply with every class's
+# object removed. background.ply (COB-GS's separately-sampled leftover-point
+# cloud) is not used as a crop input here; it's still copied into shapes/ by
+# stage 3.6 for reference.
+if [[ -n "$CLASSES" ]]; then
+    stage_start "Stage 3.7: cascading per-object mesh extraction -> ${SHAPES_DIR}"
+    CURRENT_MESH="${SHAPES_DIR}/mesh.ply"
+    REMAINDER_PLY="${SHAPES_DIR}/_remainder.ply"
+    CROPPED_ANY=0
+    for obj_ply in "$SHAPES_DIR"/*.ply; do
+        obj_name="$(basename "$obj_ply")"
+        [[ "$obj_name" == "mesh.ply" || "$obj_name" == "background.ply" ]] && continue
+        label="${obj_name%.ply}"
+        uv run python -u scripts/extract_object_mesh.py \
+            --mesh_ply "$CURRENT_MESH" \
+            --object_ply "$obj_ply" \
+            --out_ply "${SHAPES_DIR}/${label}_mesh.ply" \
+            --remainder_out_ply "$REMAINDER_PLY" \
+            >> "${OUTPUT_DIR}/reconstruct.log" 2>&1
+        CURRENT_MESH="$REMAINDER_PLY"
+        CROPPED_ANY=1
+    done
+    if [[ "$CROPPED_ANY" -eq 1 ]]; then
+        mv "$REMAINDER_PLY" "${SHAPES_DIR}/background_mesh.ply"
+    fi
+    stage_end
+fi
 
 if [[ "$RUN_GLB" -eq 1 ]]; then
-    echo "[run_full_pipeline] Stage 4: chunked_to_glb.py (simplify_threshold=${SIMPLIFY_THRESHOLD}, texture_size=${TEXTURE_SIZE})"
+    stage_start "Stage 4: chunked_to_glb.py (simplify_threshold=${SIMPLIFY_THRESHOLD}, texture_size=${TEXTURE_SIZE})"
     uv run python -u chunked_to_glb.py \
         --inputs "${OUTPUT_DIR}/to_glb_inputs.pt" \
         --chunk_inputs "${OUTPUT_DIR}/chunk_inputs.pt" \
@@ -210,9 +288,13 @@ if [[ "$RUN_GLB" -eq 1 ]]; then
         --simplify_threshold "$SIMPLIFY_THRESHOLD" \
         --texture_size "$TEXTURE_SIZE" \
         > "${OUTPUT_DIR}/glb.log" 2>&1
+    stage_end
 
-    echo "[run_full_pipeline] Done: ${OUTPUT_DIR}/scene.glb"
+    log "Done: ${OUTPUT_DIR}/scene.glb"
 else
-    echo "[run_full_pipeline] --run_glb not set, skipping GLB bake."
-    echo "[run_full_pipeline] Done: ${OUTPUT_DIR}/mesh.ply"
+    log "--run_glb not set, skipping GLB bake."
+    log "Done: ${SHAPES_DIR}/mesh.ply"
 fi
+
+PIPELINE_ELAPSED=$(( $(date +%s) - PIPELINE_T0 ))
+log "Pipeline finished for scene '${SCENE_NAME}' (total elapsed $(format_duration "$PIPELINE_ELAPSED"))"
