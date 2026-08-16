@@ -203,11 +203,10 @@ if [[ -n "$CLASSES" ]]; then
     # For each class, picks the frame where the object covers the largest
     # fraction of the image (most detail) and composites an RGBA image from
     # it, for use by image-conditioned generators (e.g. TRELLIS.2 generate.py).
-    stage_start "Stage 1.6: RGBA mask export -> ${SEG_DIR}/rgba_masks"
+    stage_start "Stage 1.6: RGBA mask export -> ${COBGS_MASK_DIR}/<class>/mask_rgba"
     uv run python -u scripts/export_rgba_masks.py \
         --images_dir "${EXPORT_DIR}/images" \
         --masks_root "$COBGS_MASK_DIR" \
-        --out_dir "${SEG_DIR}/rgba_masks" \
         >> "$SEG_LOG" 2>&1
     stage_end
 fi
