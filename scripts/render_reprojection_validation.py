@@ -149,6 +149,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--out_synth_dir", type=Path, required=True)
     parser.add_argument("--out_compare_dir", type=Path, required=True)
     parser.add_argument("--ssaa", type=int, default=2)
+    parser.add_argument(
+        "--chunk_size",
+        type=int,
+        default=5_000_000,
+        help=(
+            "Max faces rasterized per nvdiffrast call. Meshes with tens of millions of "
+            "faces can crash the CUDA rasterizer (Cuda error 700) if rasterized in one "
+            "shot; chunking avoids that. Set to 0 to disable chunking."
+        ),
+    )
     return parser
 
 
@@ -160,7 +170,15 @@ def main() -> None:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     mesh = load_colored_mesh(args.mesh_ply, device)
     near, far = bbox_near_far(mesh)
-    renderer = MeshRenderer(rendering_options={"near": near, "far": far, "ssaa": args.ssaa}, device=device)
+    renderer = MeshRenderer(
+        rendering_options={
+            "near": near,
+            "far": far,
+            "ssaa": args.ssaa,
+            "chunk_size": args.chunk_size or None,
+        },
+        device=device,
+    )
 
     cameras = parse_colmap_cameras(args.colmap_dir)
     logger.info(f"{len(cameras)} camera(s) found in {args.colmap_dir}")

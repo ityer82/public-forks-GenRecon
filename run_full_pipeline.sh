@@ -23,6 +23,25 @@ TRELLIS2_DIR="$(cd "$GENRECON_DIR/../trellis2" && pwd)"
 ISAACSIM_DIR="$(cd "$GENRECON_DIR/../IsaacSim" && pwd)"
 VGGT_CHECKPOINT="${VGGT_OMEGA_DIR}/vggt_omega_1b_512.pt"
 
+# ── CUDA toolkit selection for git-dependency builds (e.g. nvdiffrec-render) ──
+# uv's isolated build env compiles that package's native extension with nvcc,
+# which must match the CUDA version the pinned torch wheel was built for
+# (pyproject.toml's cuXXX index) or the build fails with a version-mismatch
+# error. If CUDA_HOME isn't already set and a matching /usr/local/cuda-X.Y
+# exists, point the build at it; otherwise leave PATH/CUDA_HOME untouched
+# (machine-specific — set CUDA_HOME yourself if this doesn't apply to you).
+if [[ -z "${CUDA_HOME:-}" ]]; then
+    TORCH_CUDA_TAG="$(sed -n 's#.*/cu\([0-9]\+\)".*#\1#p' "${GENRECON_DIR}/pyproject.toml" | head -1)"
+    if [[ -n "$TORCH_CUDA_TAG" ]]; then
+        TORCH_CUDA_VER="${TORCH_CUDA_TAG:0:2}.${TORCH_CUDA_TAG:2}"
+        CANDIDATE="/usr/local/cuda-${TORCH_CUDA_VER}"
+        if [[ -d "$CANDIDATE" ]]; then
+            export CUDA_HOME="$CANDIDATE"
+            export PATH="${CUDA_HOME}/bin:${PATH}"
+        fi
+    fi
+fi
+
 SIMPLIFY_THRESHOLD=250000
 TEXTURE_SIZE=2048
 NUM_IMGS_PER_SCENE=32
@@ -79,11 +98,29 @@ OUTPUT_DIR="${RUN_DIR}/genrecon_output"
 mkdir -p "$EXPORT_DIR" "$OUTPUT_DIR"
 
 PIPELINE_LOG="${RUN_DIR}/pipeline.log"
+PIPELINE_SUMMARY_LOG="${RUN_DIR}/pipeline_summary.log"
+DEBUG_CONFIG_LOG="${RUN_DIR}/debug_config.log"
 export GENRECON_PIPELINE_LOG="$PIPELINE_LOG"
 
 # ── timestamp / elapsed-time helpers ──
 log() {
-    echo "[run_full_pipeline] [$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$PIPELINE_LOG"
+    echo "[run_full_pipeline] [$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$PIPELINE_LOG" "$PIPELINE_SUMMARY_LOG"
+}
+
+# Appends a VS Code debugpy launch.json config entry (program/cwd/args as
+# actually invoked for this run) to debug_config.log, so a stage can be
+# re-run under the debugger on the exact same data by pasting the entry
+# into the target repo's .vscode/launch.json "configurations" array.
+log_debug_config() {
+    local name="$1" program="$2" cwd="$3"
+    shift 3
+    python3 "${GENRECON_DIR}/scripts/append_debug_launch_config.py" \
+        --log "$DEBUG_CONFIG_LOG" \
+        --name "$name" \
+        --program "$program" \
+        --cwd "$cwd" \
+        --python "\${workspaceFolder}/.venv/bin/python" \
+        -- "$@"
 }
 
 stage_start() {
@@ -100,6 +137,24 @@ stage_end() {
 format_duration() {
     local s=$1
     printf '%dm%02ds' $((s / 60)) $((s % 60))
+}
+
+declare -A LOG_LINE_OFFSET
+
+# Appends whatever's been newly written to $1 since the last call for that
+# file into pipeline.log. Needed because external subprocesses (COB-GS,
+# VGGT-Omega, TRELLIS2, IsaacSim) don't log through the shared loguru logger,
+# so their per-stage log files (segmentation.log, reconstruct.log, ...) would
+# otherwise never make it into the unified pipeline.log.
+mirror_log() {
+    local log_file="$1"
+    local prev="${LOG_LINE_OFFSET[$log_file]:-0}"
+    local total
+    total=$(wc -l < "$log_file" 2>/dev/null || echo 0)
+    if (( total > prev )); then
+        tail -n "+$((prev + 1))" "$log_file" >> "$PIPELINE_LOG"
+    fi
+    LOG_LINE_OFFSET[$log_file]=$total
 }
 
 PIPELINE_T0=$(date +%s)
@@ -123,6 +178,10 @@ if [[ "$START_FROM_STAGE" -le 0 ]]; then
         VGGT_GRAVITY_ARGS+=(--rotate-horizontal-deg "$ROTATE_HORIZONTAL_DEG")
     fi
 
+    log_debug_config "stage0_vggt_export" "${VGGT_OMEGA_DIR}/demo_rerun.py" "$VGGT_OMEGA_DIR" \
+        "$IMAGE_FOLDER" --checkpoint "$VGGT_CHECKPOINT" --export-for-3dgs "$EXPORT_DIR" \
+        "${VGGT_SKIP_FRAMES_ARGS[@]}" "${VGGT_GRAVITY_ARGS[@]}"
+
     (
         cd "$VGGT_OMEGA_DIR"
         uv run python -u demo_rerun.py "$IMAGE_FOLDER" \
@@ -144,16 +203,19 @@ if [[ "$START_FROM_STAGE" -le 0 ]]; then
     while true; do
         if grep -q "Exported COLMAP dataset to" "$VGGT_LOG" 2>/dev/null; then
             log "VGGT-Omega export confirmed, detaching viewer process (PID ${VGGT_PID}) and continuing."
+            mirror_log "$VGGT_LOG"
             disown "$VGGT_PID" 2>/dev/null || true
             break
         fi
         if ! kill -0 "$VGGT_PID" 2>/dev/null; then
             log "VGGT-Omega process exited before export completed. See $VGGT_LOG" >&2
+            mirror_log "$VGGT_LOG"
             exit 1
         fi
         if (( wait_elapsed >= VGGT_EXPORT_TIMEOUT )); then
             log "Timed out waiting for VGGT-Omega export after ${VGGT_EXPORT_TIMEOUT}s." >&2
             kill "$VGGT_PID" 2>/dev/null || true
+            mirror_log "$VGGT_LOG"
             exit 1
         fi
         sleep 2
@@ -194,6 +256,12 @@ if [[ -n "$CLASSES" ]]; then
         # is only ever a directory label here (--classes is always set, so it never
         # feeds the detection caption) -- so both --flat_output and a fixed --text
         # avoid redundantly repeating the scene name in the output path.
+        log_debug_config "stage1_cobgs_segmentation" "${COBGS_DIR}/main_light.py" "$COBGS_DIR" \
+            --scene "$SCENE_NAME" --text "classes" \
+            --classes "$CLASSES" --dataset_root dataset --dataset_type tum_rgbd \
+            --output_root "${OUTPUT_DIR}/segmentation_raw" --resolution -1 --skip_visualize \
+            --flat_output
+
         (
             cd "$COBGS_DIR"
             uv run python -u main_light.py --scene "$SCENE_NAME" --text "classes" \
@@ -201,6 +269,7 @@ if [[ -n "$CLASSES" ]]; then
                 --output_root "${OUTPUT_DIR}/segmentation_raw" --resolution -1 --skip_visualize \
                 --flat_output
         ) > "$SEG_LOG" 2>&1
+        mirror_log "$SEG_LOG"
 
         if [[ ! -f "${COBGS_MASK_DIR}/labels.json" ]]; then
             log "Expected COB-GS labels.json not found at ${COBGS_MASK_DIR}/labels.json" >&2
@@ -213,6 +282,12 @@ if [[ -n "$CLASSES" ]]; then
         ln -sfn "${EXPORT_DIR}/sparse/0/images.txt" "${SEG_DIR}/filtered_colmap/images.txt"
 
         cd "$GENRECON_DIR"
+        log_debug_config "stage1_apply_segmentation_mask" "${GENRECON_DIR}/scripts/apply_segmentation_mask.py" "$GENRECON_DIR" \
+            --images_dir "${EXPORT_DIR}/images" \
+            --masks_root "$COBGS_MASK_DIR" \
+            --background_ply "${COBGS_MASK_DIR}/background/point_cloud/background.ply" \
+            --out_rgb_dir "${SEG_DIR}/masked_rgb" \
+            --out_points3d "${SEG_DIR}/filtered_colmap/points3D.txt"
         uv run python -u scripts/apply_segmentation_mask.py \
             --images_dir "${EXPORT_DIR}/images" \
             --masks_root "$COBGS_MASK_DIR" \
@@ -220,6 +295,7 @@ if [[ -n "$CLASSES" ]]; then
             --out_rgb_dir "${SEG_DIR}/masked_rgb" \
             --out_points3d "${SEG_DIR}/filtered_colmap/points3D.txt" \
             >> "$SEG_LOG" 2>&1
+        mirror_log "$SEG_LOG"
         stage_end
     else
         log "Stage 1: skipped (--start-from-stage ${START_FROM_STAGE}), assuming existing segmentation at ${SEG_DIR}"
@@ -231,10 +307,14 @@ if [[ -n "$CLASSES" ]]; then
     # it, for use by image-conditioned generators (e.g. TRELLIS.2 generate.py).
     if [[ "$START_FROM_STAGE" -le 2 ]]; then
         stage_start "Stage 2: RGBA mask export -> ${COBGS_MASK_DIR}/<class>/mask_rgba"
+        log_debug_config "stage2_export_rgba_masks" "${GENRECON_DIR}/scripts/export_rgba_masks.py" "$GENRECON_DIR" \
+            --images_dir "${EXPORT_DIR}/images" \
+            --masks_root "$COBGS_MASK_DIR"
         uv run python -u scripts/export_rgba_masks.py \
             --images_dir "${EXPORT_DIR}/images" \
             --masks_root "$COBGS_MASK_DIR" \
             >> "$SEG_LOG" 2>&1
+        mirror_log "$SEG_LOG"
         stage_end
     else
         log "Stage 2: skipped (--start-from-stage ${START_FROM_STAGE})"
@@ -245,11 +325,18 @@ if [[ -n "$CLASSES" ]]; then
         stage_start "Stage 3: TRELLIS.2 reconstruction -> ${RUN_DIR}/trellis2_meshes"
         TRELLIS2_INPUT_DIR="${RUN_DIR}/trellis2_input"
         TRELLIS2_OUTPUT_DIR="${RUN_DIR}/trellis2_meshes"
+        log_debug_config "stage3_stage_trellis2_inputs" "${GENRECON_DIR}/scripts/stage_trellis2_inputs.py" "$GENRECON_DIR" \
+            --masks_root "$COBGS_MASK_DIR" \
+            --out_dir "$TRELLIS2_INPUT_DIR"
         uv run python -u scripts/stage_trellis2_inputs.py \
             --masks_root "$COBGS_MASK_DIR" \
             --out_dir "$TRELLIS2_INPUT_DIR" \
             >> "$SEG_LOG" 2>&1
 
+        log_debug_config "stage3_trellis2_generate" "${TRELLIS2_DIR}/generate.py" "$TRELLIS2_DIR" \
+            --input "$TRELLIS2_INPUT_DIR" \
+            --output-dir "$TRELLIS2_OUTPUT_DIR" \
+            --resolution 512 --no-preview
         (
             cd "$TRELLIS2_DIR"
             uv run --no-sync generate.py \
@@ -257,6 +344,7 @@ if [[ -n "$CLASSES" ]]; then
                 --output-dir "$TRELLIS2_OUTPUT_DIR" \
                 --resolution 512 --no-preview
         ) >> "$SEG_LOG" 2>&1
+        mirror_log "$SEG_LOG"
         stage_end
     fi
 fi
@@ -283,12 +371,19 @@ export MPLBACKEND=Agg
 
 if [[ "$START_FROM_STAGE" -le 5 ]]; then
     stage_start "Stage 5: reconstruct_scene.py"
+    log_debug_config "stage5_reconstruct_scene" "${GENRECON_DIR}/reconstruct_scene.py" "$GENRECON_DIR" \
+        --mode Iphone --path "$SCENE_DIR" --output_path "$OUTPUT_DIR" \
+        --ss_ckpt checkpoints/sparse_structure/ckpts/sparse_structure.pt \
+        --shape_ckpt checkpoints/shape_slat/ckpts/shape_slat.pt \
+        --tex_ckpt checkpoints/texture_slat/ckpts/texture_slat.pt \
+        --num_imgs_per_scene "$NUM_IMGS_PER_SCENE" --colmap_subdir colmap
     uv run python -u reconstruct_scene.py --mode Iphone --path "$SCENE_DIR" --output_path "$OUTPUT_DIR" \
         --ss_ckpt checkpoints/sparse_structure/ckpts/sparse_structure.pt \
         --shape_ckpt checkpoints/shape_slat/ckpts/shape_slat.pt \
         --tex_ckpt checkpoints/texture_slat/ckpts/texture_slat.pt \
         --num_imgs_per_scene "$NUM_IMGS_PER_SCENE" --colmap_subdir colmap \
         > "${OUTPUT_DIR}/reconstruct.log" 2>&1
+    mirror_log "${OUTPUT_DIR}/reconstruct.log"
     stage_end
 else
     log "Stage 5: skipped (--start-from-stage ${START_FROM_STAGE})"
@@ -297,6 +392,12 @@ fi
 # ── Stage 6: reprojection validation ──
 if [[ "$START_FROM_STAGE" -le 6 ]]; then
     stage_start "Stage 6: render_reprojection_validation.py"
+    log_debug_config "stage6_render_reprojection_validation" "${GENRECON_DIR}/scripts/render_reprojection_validation.py" "$GENRECON_DIR" \
+        --mesh_ply "${OUTPUT_DIR}/mesh.ply" \
+        --colmap_dir "${SCENE_DIR}/colmap" \
+        --images_dir "${SCENE_DIR}/rgb" \
+        --out_synth_dir "${OUTPUT_DIR}/synth_views" \
+        --out_compare_dir "${OUTPUT_DIR}/compare_views"
     uv run python -u scripts/render_reprojection_validation.py \
         --mesh_ply "${OUTPUT_DIR}/mesh.ply" \
         --colmap_dir "${SCENE_DIR}/colmap" \
@@ -304,6 +405,7 @@ if [[ "$START_FROM_STAGE" -le 6 ]]; then
         --out_synth_dir "${OUTPUT_DIR}/synth_views" \
         --out_compare_dir "${OUTPUT_DIR}/compare_views" \
         > "${OUTPUT_DIR}/reprojection_validation.log" 2>&1
+    mirror_log "${OUTPUT_DIR}/reprojection_validation.log"
     stage_end
 else
     log "Stage 6: skipped (--start-from-stage ${START_FROM_STAGE})"
@@ -342,6 +444,11 @@ if [[ -n "$CLASSES" && "$START_FROM_STAGE" -le 8 ]]; then
         obj_name="$(basename "$obj_ply")"
         [[ "$obj_name" == "mesh.ply" || "$obj_name" == "background.ply" ]] && continue
         label="${obj_name%.ply}"
+        log_debug_config "stage8_extract_object_mesh_${label}" "${GENRECON_DIR}/scripts/extract_object_mesh.py" "$GENRECON_DIR" \
+            --mesh_ply "$CURRENT_MESH" \
+            --object_ply "$obj_ply" \
+            --out_ply "${SHAPES_DIR}/${label}_mesh.ply" \
+            --remainder_out_ply "$REMAINDER_PLY"
         uv run python -u scripts/extract_object_mesh.py \
             --mesh_ply "$CURRENT_MESH" \
             --object_ply "$obj_ply" \
@@ -354,6 +461,7 @@ if [[ -n "$CLASSES" && "$START_FROM_STAGE" -le 8 ]]; then
     if [[ "$CROPPED_ANY" -eq 1 ]]; then
         mv "$REMAINDER_PLY" "${SHAPES_DIR}/background_mesh.ply"
     fi
+    mirror_log "${OUTPUT_DIR}/reconstruct.log"
     stage_end
 fi
 
@@ -363,10 +471,14 @@ fi
 if [[ "$RUN_USD" -eq 1 ]]; then
     if [[ "$START_FROM_STAGE" -le 9 ]]; then
         stage_start "Stage 9: mesh_to_glb.py -> ${SHAPES_DIR}/glb"
+        log_debug_config "stage9_mesh_to_glb" "${GENRECON_DIR}/scripts/mesh_to_glb.py" "$GENRECON_DIR" \
+            --shapes_dir "$SHAPES_DIR" \
+            --out_dir "${SHAPES_DIR}/glb"
         uv run python -u scripts/mesh_to_glb.py \
             --shapes_dir "$SHAPES_DIR" \
             --out_dir "${SHAPES_DIR}/glb" \
             > "${OUTPUT_DIR}/mesh_to_glb.log" 2>&1
+        mirror_log "${OUTPUT_DIR}/mesh_to_glb.log"
         stage_end
     else
         log "Stage 9: skipped (--start-from-stage ${START_FROM_STAGE})"
@@ -374,12 +486,16 @@ if [[ "$RUN_USD" -eq 1 ]]; then
 
     if [[ "$START_FROM_STAGE" -le 10 ]]; then
         stage_start "Stage 10: convert_asset.py (collision_approximation=${COLLISION_APPROXIMATION}) -> ${SHAPES_DIR}/glb/<label>/asset.usd"
+        log_debug_config "stage10_convert_asset" "${ISAACSIM_DIR}/convert_asset.py" "$ISAACSIM_DIR" \
+            --input "${SHAPES_DIR}/glb" \
+            --collision-approximation "$COLLISION_APPROXIMATION"
         (
             cd "$ISAACSIM_DIR"
             uv run convert_asset.py \
                 --input "${SHAPES_DIR}/glb" \
                 --collision-approximation "$COLLISION_APPROXIMATION"
         ) > "${OUTPUT_DIR}/convert_asset.log" 2>&1
+        mirror_log "${OUTPUT_DIR}/convert_asset.log"
         stage_end
     else
         log "Stage 10: skipped (--start-from-stage ${START_FROM_STAGE})"
@@ -388,6 +504,12 @@ fi
 
 if [[ "$RUN_GLB" -eq 1 && "$START_FROM_STAGE" -le 11 ]]; then
     stage_start "Stage 11: chunked_to_glb.py (simplify_threshold=${SIMPLIFY_THRESHOLD}, texture_size=${TEXTURE_SIZE})"
+    log_debug_config "stage11_chunked_to_glb" "${GENRECON_DIR}/chunked_to_glb.py" "$GENRECON_DIR" \
+        --inputs "${OUTPUT_DIR}/to_glb_inputs.pt" \
+        --chunk_inputs "${OUTPUT_DIR}/chunk_inputs.pt" \
+        --output_dir "$OUTPUT_DIR" \
+        --simplify_threshold "$SIMPLIFY_THRESHOLD" \
+        --texture_size "$TEXTURE_SIZE"
     uv run python -u chunked_to_glb.py \
         --inputs "${OUTPUT_DIR}/to_glb_inputs.pt" \
         --chunk_inputs "${OUTPUT_DIR}/chunk_inputs.pt" \
@@ -395,6 +517,7 @@ if [[ "$RUN_GLB" -eq 1 && "$START_FROM_STAGE" -le 11 ]]; then
         --simplify_threshold "$SIMPLIFY_THRESHOLD" \
         --texture_size "$TEXTURE_SIZE" \
         > "${OUTPUT_DIR}/glb.log" 2>&1
+    mirror_log "${OUTPUT_DIR}/glb.log"
     stage_end
 
     log "Done: ${OUTPUT_DIR}/scene.glb"

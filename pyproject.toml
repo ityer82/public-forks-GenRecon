@@ -54,5 +54,8 @@ members = [
     "o-voxel",
 ]
 
+[tool.uv.extra-build-dependencies]
+nvdiffrec-render = ["torch"]
+
 [tool.black]
 line-length = 120

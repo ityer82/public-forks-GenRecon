@@ -345,12 +345,12 @@ class MeshRenderer:
                 out_dict[type] = img
         else:
             z_buffer = torch.full(
-                (1, resolution * ssaa, resolution * ssaa), torch.inf, device=self.device, dtype=torch.float32
+                (1, res_h * ssaa, res_w * ssaa), torch.inf, device=self.device, dtype=torch.float32
             )
             for i in range(0, faces.shape[0], chunk_size):
                 faces_chunk = faces[i : i + chunk_size]
                 rast, rast_db = dr.rasterize(
-                    self.glctx, vertices_clip, faces_chunk, (resolution * ssaa, resolution * ssaa)
+                    self.glctx, vertices_clip, faces_chunk, (res_h * ssaa, res_w * ssaa)
                 )
                 z_filter = torch.logical_and(rast[..., 3] != 0, rast[..., 2] < z_buffer)
                 z_buffer[z_filter] = rast[z_filter][..., 2]
@@ -388,7 +388,7 @@ class MeshRenderer:
                                 xyz,
                                 mode="trilinear",
                             )
-                            img = img.reshape(1, resolution * ssaa, resolution * ssaa, mesh.attrs.shape[-1]) * mask
+                            img = img.reshape(1, res_h * ssaa, res_w * ssaa, mesh.attrs.shape[-1]) * mask
                         elif isinstance(mesh, MeshWithPbrMaterial):
                             tri_id = rast[0, :, :, -1:]
                             mask = tri_id > 0
@@ -410,16 +410,16 @@ class MeshRenderer:
                             mid = mesh.material_ids[(tri_id - 1).long()]
                             imgs = {
                                 "base_color": torch.zeros(
-                                    (resolution * ssaa, resolution * ssaa, 3), dtype=torch.float32, device=self.device
+                                    (res_h * ssaa, res_w * ssaa, 3), dtype=torch.float32, device=self.device
                                 ),
                                 "metallic": torch.zeros(
-                                    (resolution * ssaa, resolution * ssaa, 1), dtype=torch.float32, device=self.device
+                                    (res_h * ssaa, res_w * ssaa, 1), dtype=torch.float32, device=self.device
                                 ),
                                 "roughness": torch.zeros(
-                                    (resolution * ssaa, resolution * ssaa, 1), dtype=torch.float32, device=self.device
+                                    (res_h * ssaa, res_w * ssaa, 1), dtype=torch.float32, device=self.device
                                 ),
                                 "alpha": torch.zeros(
-                                    (resolution * ssaa, resolution * ssaa, 1), dtype=torch.float32, device=self.device
+                                    (res_h * ssaa, res_w * ssaa, 1), dtype=torch.float32, device=self.device
                                 ),
                             }
                             for id, mat in enumerate(mesh.materials):
