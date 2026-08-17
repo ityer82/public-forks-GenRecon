@@ -2,7 +2,7 @@
 # End-to-end pipeline: VGGT-Omega pose/depth prediction -> [optional COB-GS 3D segmentation] -> GenRecon reconstruction -> GLB bake.
 #
 # Usage:
-#   ./run_full_pipeline.sh <image_folder> <scene_name> [--simplify_threshold N] [--texture_size N] [--num_imgs_per_scene N] [--skip-frames N] [--no-align-to-gravity] [--rotate-horizontal-deg N] [--classes a,b,c] [--run_glb] [--run_trellis2] [--run_usd] [--collision_approximation convexDecomposition|convexHull|boundingCube] [--start-from-stage N]
+#   ./run_full_pipeline.sh <image_folder> <scene_name> [--simplify_threshold N] [--texture_size N] [--num_imgs_per_scene N] [--skip-frames N] [--no-align-to-gravity] [--rotate-horizontal-deg N] [--classes a,b,c] [--run_glb] [--run_trellis2] [--run_usd] [--collision_approximation convexDecomposition|convexHull|boundingCube] [--start-from-stage N] [--max_chunks_per_group N] [--max_inflated_voxels N] [--depth_conf_thres N] [--depth_edge_rtol N]
 #
 # Note: gravity alignment is ON by default; pass --no-align-to-gravity to disable it.
 #
@@ -55,9 +55,13 @@ ALIGN_TO_GRAVITY=1
 ROTATE_HORIZONTAL_DEG=0.0
 CLASSES=""
 START_FROM_STAGE=0
+MAX_CHUNKS_PER_GROUP=""
+MAX_INFLATED_VOXELS=""
+DEPTH_CONF_THRES=50.0
+DEPTH_EDGE_RTOL=0.03
 
 if [[ $# -lt 2 ]]; then
-    echo "Usage: $0 <image_folder> <scene_name> [--simplify_threshold N] [--texture_size N] [--num_imgs_per_scene N] [--skip-frames N] [--no-align-to-gravity] [--rotate-horizontal-deg N] [--classes a,b,c] [--run_glb] [--run_trellis2] [--run_usd] [--collision_approximation convexDecomposition|convexHull|boundingCube] [--start-from-stage N]" >&2
+    echo "Usage: $0 <image_folder> <scene_name> [--simplify_threshold N] [--texture_size N] [--num_imgs_per_scene N] [--skip-frames N] [--no-align-to-gravity] [--rotate-horizontal-deg N] [--classes a,b,c] [--run_glb] [--run_trellis2] [--run_usd] [--collision_approximation convexDecomposition|convexHull|boundingCube] [--start-from-stage N] [--max_chunks_per_group N] [--max_inflated_voxels N] [--depth_conf_thres N] [--depth_edge_rtol N]" >&2
     exit 1
 fi
 
@@ -80,6 +84,10 @@ while [[ $# -gt 0 ]]; do
         --run_usd) RUN_USD=1; shift 1 ;;
         --collision_approximation) COLLISION_APPROXIMATION="$2"; shift 2 ;;
         --start-from-stage) START_FROM_STAGE="$2"; shift 2 ;;
+        --max_chunks_per_group) MAX_CHUNKS_PER_GROUP="$2"; shift 2 ;;
+        --max_inflated_voxels) MAX_INFLATED_VOXELS="$2"; shift 2 ;;
+        --depth_conf_thres) DEPTH_CONF_THRES="$2"; shift 2 ;;
+        --depth_edge_rtol) DEPTH_EDGE_RTOL="$2"; shift 2 ;;
         *) echo "Unknown argument: $1" >&2; exit 1 ;;
     esac
 done
@@ -260,14 +268,16 @@ if [[ -n "$CLASSES" ]]; then
             --scene "$SCENE_NAME" --text "classes" \
             --classes "$CLASSES" --dataset_root dataset --dataset_type tum_rgbd \
             --output_root "${OUTPUT_DIR}/segmentation_raw" --resolution -1 --skip_visualize \
-            --flat_output
+            --flat_output --depth_dir "${EXPORT_DIR}/depth" \
+            --depth_conf_thres "$DEPTH_CONF_THRES" --depth_edge_rtol "$DEPTH_EDGE_RTOL"
 
         (
             cd "$COBGS_DIR"
             uv run python -u main_light.py --scene "$SCENE_NAME" --text "classes" \
                 --classes "$CLASSES" --dataset_root dataset --dataset_type tum_rgbd \
                 --output_root "${OUTPUT_DIR}/segmentation_raw" --resolution -1 --skip_visualize \
-                --flat_output
+                --flat_output --depth_dir "${EXPORT_DIR}/depth" \
+                --depth_conf_thres "$DEPTH_CONF_THRES" --depth_edge_rtol "$DEPTH_EDGE_RTOL"
         ) > "$SEG_LOG" 2>&1
         mirror_log "$SEG_LOG"
 
@@ -371,17 +381,28 @@ export MPLBACKEND=Agg
 
 if [[ "$START_FROM_STAGE" -le 5 ]]; then
     stage_start "Stage 5: reconstruct_scene.py"
+
+    RECON_VRAM_ARGS=()
+    if [[ -n "$MAX_CHUNKS_PER_GROUP" ]]; then
+        RECON_VRAM_ARGS+=(--max_chunks_per_group "$MAX_CHUNKS_PER_GROUP")
+    fi
+    if [[ -n "$MAX_INFLATED_VOXELS" ]]; then
+        RECON_VRAM_ARGS+=(--max_inflated_voxels "$MAX_INFLATED_VOXELS")
+    fi
+
     log_debug_config "stage5_reconstruct_scene" "${GENRECON_DIR}/reconstruct_scene.py" "$GENRECON_DIR" \
         --mode Iphone --path "$SCENE_DIR" --output_path "$OUTPUT_DIR" \
         --ss_ckpt checkpoints/sparse_structure/ckpts/sparse_structure.pt \
         --shape_ckpt checkpoints/shape_slat/ckpts/shape_slat.pt \
         --tex_ckpt checkpoints/texture_slat/ckpts/texture_slat.pt \
-        --num_imgs_per_scene "$NUM_IMGS_PER_SCENE" --colmap_subdir colmap
+        --num_imgs_per_scene "$NUM_IMGS_PER_SCENE" --colmap_subdir colmap \
+        "${RECON_VRAM_ARGS[@]}"
     uv run python -u reconstruct_scene.py --mode Iphone --path "$SCENE_DIR" --output_path "$OUTPUT_DIR" \
         --ss_ckpt checkpoints/sparse_structure/ckpts/sparse_structure.pt \
         --shape_ckpt checkpoints/shape_slat/ckpts/shape_slat.pt \
         --tex_ckpt checkpoints/texture_slat/ckpts/texture_slat.pt \
         --num_imgs_per_scene "$NUM_IMGS_PER_SCENE" --colmap_subdir colmap \
+        "${RECON_VRAM_ARGS[@]}" \
         > "${OUTPUT_DIR}/reconstruct.log" 2>&1
     mirror_log "${OUTPUT_DIR}/reconstruct.log"
     stage_end

@@ -291,6 +291,26 @@ def build_parser() -> argparse.ArgumentParser:
         "Pure performance knob, no numerical effect. Drop to 2048/1024 when "
         "running with very many views (e.g. all-frames iPhone captures).",
     )
+    parser.add_argument(
+        "--max_chunks_per_group",
+        type=int,
+        default=None,
+        help="Force chunked joint decode (shape + tex) by capping chunks per "
+        "decode group. Normally only enabled by default for --pipeline 1024 "
+        "(cap 10); set this explicitly to enable it for 512 too and avoid "
+        "OOMs on scenes with many chunks. Lower = less peak VRAM, more "
+        "decode passes.",
+    )
+    parser.add_argument(
+        "--max_inflated_voxels",
+        type=int,
+        default=None,
+        help="Force chunked joint decode by capping voxels-in-view per decode "
+        "group (the direct memory governor; ~100_000 uses ~43 GB peak, see "
+        "full_scene_images_to_3d.py). Normally only enabled by default for "
+        "--pipeline 1024; set this explicitly to enable it for 512 too. "
+        "Lower = less peak VRAM, more decode passes.",
+    )
     return parser
 
 
@@ -328,6 +348,10 @@ def main() -> None:
     )
     if args.proj_batch_voxels is not None:
         pipeline.proj_batch_voxels = args.proj_batch_voxels
+    if args.max_chunks_per_group is not None:
+        pipeline.max_chunks_per_group_override = args.max_chunks_per_group
+    if args.max_inflated_voxels is not None:
+        pipeline.max_inflated_voxels_override = args.max_inflated_voxels
     pipeline.to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
 
     chunker_cls, selecter_cls, transforms_json = MODES[args.mode]

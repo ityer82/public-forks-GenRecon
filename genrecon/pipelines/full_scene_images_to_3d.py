@@ -39,6 +39,14 @@ class FullSceneImagesTo3DPipeline(ImagesTo3DPipeline):
     # numerically. Shrink if you still OOM at higher `num_imgs_per_scene`.
     proj_batch_voxels = 8192
 
+    # Chunked joint decode (see `run`, "── Decode ──") defaults to on only for
+    # the 1024 pipeline; 512 decodes all chunks merged in a single pass, which
+    # OOMs on large scenes (many chunks) even on a 32 GB card. Set either of
+    # these (e.g. via reconstruct_scene.py --max_chunks_per_group /
+    # --max_inflated_voxels) to force chunked decode on for 512 too.
+    max_chunks_per_group_override: Optional[int] = None
+    max_inflated_voxels_override: Optional[int] = None
+
     # ─────────────────────────────────────────────────────────────────────
     # Global-grid geometry helpers
     # ─────────────────────────────────────────────────────────────────────
@@ -612,8 +620,12 @@ class FullSceneImagesTo3DPipeline(ImagesTo3DPipeline):
         # an 80 GB card; in=164K → 63 GB peak with no headroom for the next
         # group. 100K leaves ~35 GB headroom for cumulative state + safety.
         # max_chunks_per_group is a soft secondary bound for very sparse scenes.
-        max_chunks_per_group = 10 if pipeline_type == "1024" else None
-        max_inflated_voxels = 100_000 if pipeline_type == "1024" else None
+        max_chunks_per_group = self.max_chunks_per_group_override
+        if max_chunks_per_group is None and pipeline_type == "1024":
+            max_chunks_per_group = 10
+        max_inflated_voxels = self.max_inflated_voxels_override
+        if max_inflated_voxels is None and pipeline_type == "1024":
+            max_inflated_voxels = 100_000
         torch.cuda.empty_cache()
         with _vram_peak(f"joint_decode_shape ({num_chunks} chunks, res={res})"):
             scene_mesh, aabb, grid_size_fine, decode_ctx, joint_meta = self.joint_decode_shape_slats(
