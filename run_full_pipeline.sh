@@ -531,13 +531,13 @@ if [[ "$RUN_USD" -eq 1 ]]; then
         log_debug_config "stage11_compose_isaac_scene" "${ISAACSIM_DIR}/compose_isaac_scene.py" "$ISAACSIM_DIR" \
             --input "${SHAPES_DIR}/glb" \
             --output "${SHAPES_DIR}/glb/scene.usda" \
-            --background-label background_mesh
+            --background-label background
         (
             cd "$ISAACSIM_DIR"
             uv run compose_isaac_scene.py \
                 --input "${SHAPES_DIR}/glb" \
                 --output "${SHAPES_DIR}/glb/scene.usda" \
-                --background-label background_mesh
+                --background-label background
         ) > "${OUTPUT_DIR}/compose_isaac_scene.log" 2>&1
         mirror_log "${OUTPUT_DIR}/compose_isaac_scene.log"
         stage_end
