@@ -486,7 +486,7 @@ if [[ -n "$CLASSES" && "$START_FROM_STAGE" -le 8 ]]; then
     stage_end
 fi
 
-# ── Stage 9/10 (optional): per-object mesh -> GLB -> physics-ready USD ──
+# ── Stage 9/10/11 (optional): per-object mesh -> GLB -> physics-ready USD -> composed scene ──
 # Only the *_mesh.ply crops from Stage 8 are converted (never the whole-scene
 # mesh.ply, and never the plain per-class point clouds like chair.ply/background.ply).
 if [[ "$RUN_USD" -eq 1 ]]; then
@@ -521,11 +521,30 @@ if [[ "$RUN_USD" -eq 1 ]]; then
     else
         log "Stage 10: skipped (--start-from-stage ${START_FROM_STAGE})"
     fi
+
+    if [[ "$START_FROM_STAGE" -le 11 ]]; then
+        stage_start "Stage 11: compose_isaac_scene.py -> ${SHAPES_DIR}/glb/scene.usda"
+        log_debug_config "stage11_compose_isaac_scene" "${ISAACSIM_DIR}/compose_isaac_scene.py" "$ISAACSIM_DIR" \
+            --input "${SHAPES_DIR}/glb" \
+            --output "${SHAPES_DIR}/glb/scene.usda" \
+            --background-label background_mesh
+        (
+            cd "$ISAACSIM_DIR"
+            uv run compose_isaac_scene.py \
+                --input "${SHAPES_DIR}/glb" \
+                --output "${SHAPES_DIR}/glb/scene.usda" \
+                --background-label background_mesh
+        ) > "${OUTPUT_DIR}/compose_isaac_scene.log" 2>&1
+        mirror_log "${OUTPUT_DIR}/compose_isaac_scene.log"
+        stage_end
+    else
+        log "Stage 11: skipped (--start-from-stage ${START_FROM_STAGE})"
+    fi
 fi
 
-if [[ "$RUN_GLB" -eq 1 && "$START_FROM_STAGE" -le 11 ]]; then
-    stage_start "Stage 11: chunked_to_glb.py (simplify_threshold=${SIMPLIFY_THRESHOLD}, texture_size=${TEXTURE_SIZE})"
-    log_debug_config "stage11_chunked_to_glb" "${GENRECON_DIR}/chunked_to_glb.py" "$GENRECON_DIR" \
+if [[ "$RUN_GLB" -eq 1 && "$START_FROM_STAGE" -le 12 ]]; then
+    stage_start "Stage 12: chunked_to_glb.py (simplify_threshold=${SIMPLIFY_THRESHOLD}, texture_size=${TEXTURE_SIZE})"
+    log_debug_config "stage12_chunked_to_glb" "${GENRECON_DIR}/chunked_to_glb.py" "$GENRECON_DIR" \
         --inputs "${OUTPUT_DIR}/to_glb_inputs.pt" \
         --chunk_inputs "${OUTPUT_DIR}/chunk_inputs.pt" \
         --output_dir "$OUTPUT_DIR" \
@@ -543,7 +562,7 @@ if [[ "$RUN_GLB" -eq 1 && "$START_FROM_STAGE" -le 11 ]]; then
 
     log "Done: ${OUTPUT_DIR}/scene.glb"
 elif [[ "$RUN_GLB" -eq 1 ]]; then
-    log "Stage 11: skipped (--start-from-stage ${START_FROM_STAGE})"
+    log "Stage 12: skipped (--start-from-stage ${START_FROM_STAGE})"
     log "Done: ${SHAPES_DIR}/mesh.ply"
 else
     log "--run_glb not set, skipping GLB bake."
