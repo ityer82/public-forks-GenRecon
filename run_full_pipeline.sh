@@ -449,39 +449,35 @@ fi
 # ── Stage 8 (optional): per-object mesh extraction (cascading convex hull crop) ──
 # Crops each class's object out of the scene mesh in turn, using its point
 # cloud (shapes/<label>.ply) as a spatial reference -- both are already in
-# the same world frame as mesh.ply, so no alignment step is needed. Each
-# class is cropped out of what's left of the mesh after the previous class
-# (rather than independently from the original), so the final remainder --
-# saved as background_mesh.ply -- is exactly mesh.ply with every class's
+# the same world frame as mesh.ply, so no alignment step is needed. mesh.ply
+# itself is left untouched: background_mesh.ply is seeded as a copy of it
+# up front, and each class is cropped out of background_mesh.ply in place
+# (extract_object_mesh.py fully reads --mesh_ply before writing
+# --remainder_out_ply, so reading and overwriting the same path is safe), so
+# the final background_mesh.ply is exactly mesh.ply with every class's
 # object removed. background.ply (COB-GS's separately-sampled leftover-point
 # cloud) is not used as a crop input here; it's still copied into shapes/ by
 # stage 7 for reference.
 if [[ -n "$CLASSES" && "$START_FROM_STAGE" -le 8 ]]; then
     stage_start "Stage 8: cascading per-object mesh extraction -> ${SHAPES_DIR}"
-    CURRENT_MESH="${SHAPES_DIR}/mesh.ply"
-    REMAINDER_PLY="${SHAPES_DIR}/_remainder.ply"
-    CROPPED_ANY=0
+    BACKGROUND_MESH="${SHAPES_DIR}/background_mesh.ply"
+    cp "${SHAPES_DIR}/mesh.ply" "$BACKGROUND_MESH"
     for obj_ply in "$SHAPES_DIR"/*.ply; do
         obj_name="$(basename "$obj_ply")"
-        [[ "$obj_name" == "mesh.ply" || "$obj_name" == "background.ply" ]] && continue
+        [[ "$obj_name" == "mesh.ply" || "$obj_name" == "background.ply" || "$obj_name" == "background_mesh.ply" ]] && continue
         label="${obj_name%.ply}"
         log_debug_config "stage8_extract_object_mesh_${label}" "${GENRECON_DIR}/scripts/extract_object_mesh.py" "$GENRECON_DIR" \
-            --mesh_ply "$CURRENT_MESH" \
+            --mesh_ply "$BACKGROUND_MESH" \
             --object_ply "$obj_ply" \
             --out_ply "${SHAPES_DIR}/${label}_mesh.ply" \
-            --remainder_out_ply "$REMAINDER_PLY"
+            --remainder_out_ply "$BACKGROUND_MESH"
         uv run python -u scripts/extract_object_mesh.py \
-            --mesh_ply "$CURRENT_MESH" \
+            --mesh_ply "$BACKGROUND_MESH" \
             --object_ply "$obj_ply" \
             --out_ply "${SHAPES_DIR}/${label}_mesh.ply" \
-            --remainder_out_ply "$REMAINDER_PLY" \
+            --remainder_out_ply "$BACKGROUND_MESH" \
             >> "${OUTPUT_DIR}/reconstruct.log" 2>&1
-        CURRENT_MESH="$REMAINDER_PLY"
-        CROPPED_ANY=1
     done
-    if [[ "$CROPPED_ANY" -eq 1 ]]; then
-        mv "$REMAINDER_PLY" "${SHAPES_DIR}/background_mesh.ply"
-    fi
     mirror_log "${OUTPUT_DIR}/reconstruct.log"
     stage_end
 fi
