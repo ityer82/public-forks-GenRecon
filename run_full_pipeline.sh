@@ -457,7 +457,11 @@ fi
 # the final background_mesh.ply is exactly mesh.ply with every class's
 # object removed. background.ply (COB-GS's separately-sampled leftover-point
 # cloud) is not used as a crop input here; it's still copied into shapes/ by
-# stage 7 for reference.
+# stage 7 for reference. --colmap_dir/--masks_dir feed extract_object_mesh.py's
+# stage-2 padding search, which tightens the crop by reprojecting the padded
+# hull into each camera view and comparing it against that class's real
+# per-frame segmentation mask (COBGS_MASK_DIR/<label>/mask_bin), instead of
+# using a single fixed --hull_padding.
 if [[ -n "$CLASSES" && "$START_FROM_STAGE" -le 8 ]]; then
     stage_start "Stage 8: cascading per-object mesh extraction -> ${SHAPES_DIR}"
     BACKGROUND_MESH="${SHAPES_DIR}/background_mesh.ply"
@@ -470,12 +474,16 @@ if [[ -n "$CLASSES" && "$START_FROM_STAGE" -le 8 ]]; then
             --mesh_ply "$BACKGROUND_MESH" \
             --object_ply "$obj_ply" \
             --out_ply "${SHAPES_DIR}/${label}_mesh.ply" \
-            --remainder_out_ply "$BACKGROUND_MESH"
+            --remainder_out_ply "$BACKGROUND_MESH" \
+            --colmap_dir "${SCENE_DIR}/colmap" \
+            --masks_dir "${COBGS_MASK_DIR}/${label}/mask_bin"
         uv run python -u scripts/extract_object_mesh.py \
             --mesh_ply "$BACKGROUND_MESH" \
             --object_ply "$obj_ply" \
             --out_ply "${SHAPES_DIR}/${label}_mesh.ply" \
             --remainder_out_ply "$BACKGROUND_MESH" \
+            --colmap_dir "${SCENE_DIR}/colmap" \
+            --masks_dir "${COBGS_MASK_DIR}/${label}/mask_bin" \
             >> "${OUTPUT_DIR}/reconstruct.log" 2>&1
     done
     mirror_log "${OUTPUT_DIR}/reconstruct.log"
