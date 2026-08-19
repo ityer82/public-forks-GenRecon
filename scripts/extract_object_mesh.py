@@ -20,6 +20,15 @@ more than --max_overshoot on average. This catches hulls that bleed into
 background/environment geometry beyond what the true object silhouette
 supports.
 
+The object crop (--out_ply) and the remainder (--remainder_out_ply) use two
+separate hulls, not one: --out_ply keeps faces fully inside the (possibly
+tightened) object padding, while --remainder_out_ply drops any face with
+even one vertex inside the looser --remainder_padding (default: the same
+generous value as --hull_padding). A single shared hull would force a choice
+between a tight object crop that leaves a rim of the object's own boundary
+faces behind in the background, or a hull loose enough to fully clear the
+background that then bleeds environment geometry into the object crop.
+
 Usage:
     uv run python scripts/extract_object_mesh.py \
         --mesh_ply runs/<scene>/genrecon_output/shapes/mesh.ply \
@@ -189,24 +198,16 @@ def compact_mesh(vertex: np.ndarray, faces: np.ndarray) -> tuple[np.ndarray, np.
     return new_vertex, new_faces
 
 
-def crop_mesh(
-    mesh_ply: Path, equations: np.ndarray, bbox_min: np.ndarray, bbox_max: np.ndarray
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    ply = PlyData.read(mesh_ply)
-    vertex = ply["vertex"]
-    face = ply["face"]
-
-    verts_xyz = np.stack([vertex["x"], vertex["y"], vertex["z"]], axis=1).astype(np.float64)
-
+def _inside_mask(equations: np.ndarray, bbox_min: np.ndarray, bbox_max: np.ndarray, verts_xyz: np.ndarray) -> np.ndarray:
     # The scene mesh can have millions of vertices while the object's hull is
     # tiny in comparison -- a full equations @ verts.T matmul against every
     # vertex is wastefully O(facets * total_verts). Cheaply cull to the
-    # object's padded bounding box first, then only run the (still exact)
-    # hull containment test against that much smaller candidate set.
+    # padded bounding box first, then only run the (still exact) hull
+    # containment test against that much smaller candidate set.
     in_bbox = np.all((verts_xyz >= bbox_min) & (verts_xyz <= bbox_max), axis=1)
     candidate_ids = np.nonzero(in_bbox)[0]
 
-    inside = np.zeros(len(vertex), dtype=bool)
+    inside = np.zeros(len(verts_xyz), dtype=bool)
     if len(candidate_ids) > 0:
         candidates = verts_xyz[candidate_ids]
         # A noisy/oversized object point cloud (e.g. a loose segmentation that
@@ -220,16 +221,45 @@ def crop_mesh(
             chunk = candidates[start : start + chunk_size]
             chunk_inside = np.all(equations[:, :3] @ chunk.T + equations[:, 3:4] <= 0.0, axis=0)
             inside[candidate_ids[start : start + chunk_size][chunk_inside]] = True
+    return inside
+
+
+def crop_mesh(
+    mesh_ply: Path,
+    object_equations: np.ndarray,
+    remainder_equations: np.ndarray,
+    bbox_min: np.ndarray,
+    bbox_max: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Split `mesh_ply`'s faces into an object crop and a remainder, using two
+    separate hulls (`object_equations` tight, `remainder_equations` >= it in
+    coverage). A single shared hull would force a choice between a tight
+    object crop that leaves a rim of the object's own boundary faces behind
+    in the remainder (straddling faces have >=1 vertex outside a tight hull,
+    so they're excluded from "object" -- but with only one hull, "outside"
+    also means "kept in remainder"), or a loose-enough hull to fully clear
+    the remainder that then bleeds background into the object crop. Using
+    `remainder_equations` for the remainder side removes anything with *any*
+    vertex inside it, independent of what's kept as the object; faces caught
+    in between (excluded from the tight object hull, but not fully outside
+    the looser remainder hull) are dropped from both -- a thin gap rather
+    than a leftover rim in either mesh.
+    """
+    ply = PlyData.read(mesh_ply)
+    vertex = ply["vertex"]
+    face = ply["face"]
+    logger.info(f"Cropping {mesh_ply}: {len(vertex.data)} vertices, {len(face.data)} faces before this crop.")
+
+    verts_xyz = np.stack([vertex["x"], vertex["y"], vertex["z"]], axis=1).astype(np.float64)
+    inside_object = _inside_mask(object_equations, bbox_min, bbox_max, verts_xyz)
+    inside_remainder = _inside_mask(remainder_equations, bbox_min, bbox_max, verts_xyz)
 
     faces = np.stack(face["vertex_indices"])
-    # A face belongs to the object only if all 3 vertices are inside the
-    # padded hull; every other face (fully outside, or straddling the hull
-    # boundary) is remainder. This makes object/remainder an exact partition
-    # of the input mesh's faces -- no gaps, no duplicated coverage.
-    keep_face = inside[faces].all(axis=1)
+    keep_face_object = inside_object[faces].all(axis=1)
+    keep_face_remainder = ~inside_remainder[faces].any(axis=1)
 
-    object_vertex, object_faces = compact_mesh(vertex.data, faces[keep_face])
-    remainder_vertex, remainder_faces = compact_mesh(vertex.data, faces[~keep_face])
+    object_vertex, object_faces = compact_mesh(vertex.data, faces[keep_face_object])
+    remainder_vertex, remainder_faces = compact_mesh(vertex.data, faces[keep_face_remainder])
     return object_vertex, object_faces, remainder_vertex, remainder_faces
 
 
@@ -293,6 +323,17 @@ def main():
         "--search_iters", type=int, default=8,
         help="Stage-2 padding search: number of bisection iterations.",
     )
+    parser.add_argument(
+        "--remainder_padding", type=float, default=None,
+        help="Padding used to decide what's removed from --remainder_out_ply (any mesh face "
+        "with >=1 vertex inside this padded hull is dropped from the remainder), independent "
+        "of the (possibly much tighter, stage-2-searched) padding used to build --out_ply. "
+        "Must be >= the object padding, or a rim of the object's own boundary faces would be "
+        "excluded from --out_ply yet still counted as 'outside' and left behind in the "
+        "remainder. Defaults to --hull_padding (the search's generous upper bound, or the "
+        "fixed value when stage 2 is off -- in the latter case this exactly matches the "
+        "object padding, reproducing the old single-hull behavior).",
+    )
     args = parser.parse_args()
 
     def skip(reason: str) -> None:
@@ -317,19 +358,31 @@ def main():
                     f"(searched [{args.hull_padding_min}, {args.hull_padding}])")
 
     try:
-        equations = padded_hull_equations(points, hull_padding)
+        object_equations = padded_hull_equations(points, hull_padding)
     except QhullError as e:
         skip(f"convex hull construction failed ({e}).")
         return
 
+    remainder_padding = args.remainder_padding if args.remainder_padding is not None else args.hull_padding
+    remainder_padding = max(remainder_padding, hull_padding)
+    try:
+        remainder_equations = padded_hull_equations(points, remainder_padding)
+    except QhullError as e:
+        logger.warning(
+            f"{args.object_ply}: remainder-padding hull construction failed ({e}); "
+            "falling back to the object hull for the remainder cut too."
+        )
+        remainder_equations = object_equations
+        remainder_padding = hull_padding
+
     # The bbox is a conservative pre-filter for the exact half-space test below,
-    # so it must never shrink past the original points' bbox even if hull_padding
-    # is negative (the padded/shrunk hull is still guaranteed to lie within it).
-    bbox_margin = max(hull_padding, 0.0)
+    # so it must never shrink past the original points' bbox, and must cover
+    # the larger (remainder) hull to stay a safe superset for both tests.
+    bbox_margin = max(remainder_padding, 0.0)
     bbox_min = points.min(axis=0) - bbox_margin
     bbox_max = points.max(axis=0) + bbox_margin
     object_vertex, object_faces, remainder_vertex, remainder_faces = crop_mesh(
-        args.mesh_ply, equations, bbox_min, bbox_max
+        args.mesh_ply, object_equations, remainder_equations, bbox_min, bbox_max
     )
     if len(object_faces) == 0:
         skip("no mesh faces fell inside the padded hull.")
