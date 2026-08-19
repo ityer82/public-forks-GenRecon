@@ -23,11 +23,15 @@ supports.
 The object crop (--out_ply) and the remainder (--remainder_out_ply) use two
 separate hulls, not one: --out_ply keeps faces fully inside the (possibly
 tightened) object padding, while --remainder_out_ply drops any face with
-even one vertex inside the looser --remainder_padding (default: the same
-generous value as --hull_padding). A single shared hull would force a choice
-between a tight object crop that leaves a rim of the object's own boundary
-faces behind in the background, or a hull loose enough to fully clear the
-background that then bleeds environment geometry into the object crop.
+even one vertex inside the looser --remainder_padding (default: the object
+padding plus a small --remainder_margin, not the raw --hull_padding upper
+bound -- when stage 2 tightens the object padding a lot, e.g. down near 0,
+using the un-tightened --hull_padding for the remainder too would carve a
+disconnected halo several times the object's own size out of whatever it's
+sitting on). A single shared hull would force a choice between a tight
+object crop that leaves a rim of the object's own boundary faces behind in
+the background, or a hull loose enough to fully clear the background that
+then bleeds environment geometry into the object crop.
 
 Usage:
     uv run python scripts/extract_object_mesh.py \
@@ -330,9 +334,18 @@ def main():
         "of the (possibly much tighter, stage-2-searched) padding used to build --out_ply. "
         "Must be >= the object padding, or a rim of the object's own boundary faces would be "
         "excluded from --out_ply yet still counted as 'outside' and left behind in the "
-        "remainder. Defaults to --hull_padding (the search's generous upper bound, or the "
-        "fixed value when stage 2 is off -- in the latter case this exactly matches the "
-        "object padding, reproducing the old single-hull behavior).",
+        "remainder. Defaults to the object padding (post-search, if stage 2 ran) plus "
+        "--remainder_margin.",
+    )
+    parser.add_argument(
+        "--remainder_margin", type=float, default=0.005,
+        help="Extra padding added on top of the object padding to form the default "
+        "--remainder_padding (ignored if --remainder_padding is set explicitly). Keeps the "
+        "remainder cut just loose enough to fully clear the object's own boundary faces "
+        "without carving a much larger halo out of whatever the object is resting on -- "
+        "using the un-tightened --hull_padding for this (the old default) could remove a "
+        "region several times the object's size once stage 2 tightens the object padding "
+        "down near 0.",
     )
     args = parser.parse_args()
 
@@ -363,7 +376,9 @@ def main():
         skip(f"convex hull construction failed ({e}).")
         return
 
-    remainder_padding = args.remainder_padding if args.remainder_padding is not None else args.hull_padding
+    remainder_padding = (
+        args.remainder_padding if args.remainder_padding is not None else hull_padding + args.remainder_margin
+    )
     remainder_padding = max(remainder_padding, hull_padding)
     try:
         remainder_equations = padded_hull_equations(points, remainder_padding)
