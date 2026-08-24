@@ -53,8 +53,10 @@ import shutil
 from pathlib import Path
 
 import numpy as np
+import pymeshfix
+import trimesh
 from plyfile import PlyData, PlyElement
-from scipy.spatial import QhullError
+from scipy.spatial import cKDTree, QhullError
 
 from genrecon.utils.colmap_utils import parse_colmap_cameras
 from genrecon.utils.hull import load_object_points, padded_hull_equations, search_hull_padding
@@ -163,6 +165,83 @@ def write_cropped_ply(out_ply: Path, vertex_data: np.ndarray, faces: np.ndarray)
             PlyElement.describe(face_data, "face"),
         ]
     ).write(out_ply)
+
+
+def repair_object_mesh(
+    vertex_data: np.ndarray, faces: np.ndarray, *, min_component_faces: int = 20
+) -> tuple[np.ndarray, np.ndarray]:
+    """Clean up a raw face-membership crop into a single, watertight shell.
+
+    `_crop_side` keeps a face only if all 3 vertices fall inside the padded
+    hull, which shatters the true crop seam into thousands of disconnected
+    noise shards on top of the one real open boundary (e.g. an object's open
+    bottom, where it was cut out of whatever it was resting on). Isaac Sim's
+    convexDecomposition collision cooking is unreliable on that kind of
+    open/fragmented mesh -- it can produce a lopsided decomposition (an
+    asymmetric mass/inertia tensor despite a visually symmetric mesh), which
+    is what makes objects swivel or fall through the floor in simulation.
+
+    A single fan-fill pass over the crop's boundary loops (trimesh's
+    `repair.fill_holes`) isn't enough here in practice: the source scene mesh
+    itself carries perforations beyond the one true crop seam (thousands of
+    small boundary loops, many not even simple closed curves), so it's handed
+    to `pymeshfix` -- a hole-filling/self-intersection-removal repair
+    specifically built for meshes this damaged -- after first dropping
+    sub-`min_component_faces` disconnected noise shards (cheap pre-filter;
+    `pymeshfix` also discards remaining small components on its own via
+    `remove_smallest_components`). This closes holes without convex-hull-
+    filling any concavity (e.g. a bowl's interior stays open), unlike
+    `--collision-approximation convexHull`.
+    """
+    xyz = np.stack([vertex_data["x"], vertex_data["y"], vertex_data["z"]], axis=1).astype(np.float64)
+    has_color = all(name in vertex_data.dtype.names for name in ("red", "green", "blue"))
+    vertex_colors = None
+    if has_color:
+        alpha = (
+            vertex_data["alpha"] if "alpha" in vertex_data.dtype.names
+            else np.full(len(vertex_data), 255, dtype=np.uint8)
+        )
+        vertex_colors = np.stack([vertex_data["red"], vertex_data["green"], vertex_data["blue"], alpha], axis=1)
+
+    mesh = trimesh.Trimesh(vertices=xyz, faces=faces, vertex_colors=vertex_colors, process=False)
+    components = mesh.split(only_watertight=False)
+    if len(components) > 1:
+        big = max(components, key=lambda c: len(c.faces))
+        if len(big.faces) >= min_component_faces:
+            mesh = big
+
+    fixer = pymeshfix.MeshFix(mesh.vertices, mesh.faces)
+    fixer.repair(remove_smallest_components=True)
+    repaired_vertices, repaired_faces = fixer.points, fixer.faces
+
+    repaired = trimesh.Trimesh(vertices=repaired_vertices, faces=repaired_faces, process=False)
+    if not repaired.is_watertight:
+        logger.warning(
+            f"Repaired mesh still not watertight (euler_number={repaired.euler_number}); "
+            "proceeding anyway -- downstream collision cooking (e.g. Isaac Sim "
+            "convexDecomposition) may be unreliable for this object."
+        )
+
+    dtype = [("x", "f4"), ("y", "f4"), ("z", "f4")]
+    if has_color:
+        dtype += [("red", "u1"), ("green", "u1"), ("blue", "u1"), ("alpha", "u1")]
+    new_vertex = np.empty(len(repaired_vertices), dtype=dtype)
+    new_vertex["x"] = repaired_vertices[:, 0]
+    new_vertex["y"] = repaired_vertices[:, 1]
+    new_vertex["z"] = repaired_vertices[:, 2]
+    if has_color:
+        # pymeshfix's repair can add/relocate vertices (hole caps, intersection
+        # fixes), so there's no 1:1 mapping back to the original per-vertex
+        # colors -- nearest-neighbor lookup against the pre-repair mesh keeps
+        # colors visually close without needing that mapping.
+        _, nearest = cKDTree(mesh.vertices).query(repaired_vertices)
+        colors = mesh.visual.vertex_colors[nearest]
+        new_vertex["red"] = colors[:, 0]
+        new_vertex["green"] = colors[:, 1]
+        new_vertex["blue"] = colors[:, 2]
+        new_vertex["alpha"] = colors[:, 3]
+
+    return new_vertex, np.asarray(repaired_faces, dtype=np.int64)
 
 
 def main():
@@ -298,6 +377,11 @@ def main():
     if len(object_faces) == 0:
         skip("no mesh faces fell inside the padded hull.")
         return
+
+    try:
+        object_vertex, object_faces = repair_object_mesh(object_vertex, object_faces)
+    except Exception as e:
+        logger.warning(f"{args.object_ply}: mesh repair failed ({e}); writing the unrepaired crop instead.")
 
     write_cropped_ply(args.out_ply, object_vertex, object_faces)
     logger.info(f"Wrote {args.out_ply}: {len(object_vertex)} vertices, {len(object_faces)} faces.")
