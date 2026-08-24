@@ -44,6 +44,98 @@ class BaseChunker:
 
         raise ValueError(f"Cannot place chunks for dim={dim}, chunk_size={chunk_size}")
 
+    def _best_factor_pair(self, n: int, aspect: float) -> tuple[int, int]:
+        """Return (nx, ny) with nx * ny == n, whose ratio nx/ny best matches `aspect`.
+
+        Enumerates all divisor pairs of n (n is always small -- a chunk count) and
+        scores them by log-space distance to `aspect`, so e.g. 2:1 and 1:2 are
+        scored symmetrically.
+        """
+        best: tuple[int, int] | None = None
+        best_score = float("inf")
+        log_aspect = math.log(aspect) if math.isfinite(aspect) and aspect > 0 else float("inf")
+        for nx in range(1, n + 1):
+            if n % nx != 0:
+                continue
+            ny = n // nx
+            score = abs(math.log(nx / ny) - log_aspect) if math.isfinite(log_aspect) else -nx
+            if score < best_score:
+                best, best_score = (nx, ny), score
+        assert best is not None
+        return best
+
+    def _axis_chunk_size(self, dim: float, n: int) -> float:
+        """Minimum chunk_size so n evenly-spaced centers (max stride allowed by
+        self.min_overlap) cover `dim` once padding (self.min_padding) is added.
+
+        Derived from the same identities _axis_centers relies on:
+          (n - 1) * stride + chunk_size == dim_padded
+          dim_padded == dim + 2 * chunk_size * min_padding
+          stride <= chunk_size * (1 - min_overlap)
+        Solving for the smallest chunk_size at stride == max_stride (n == 1 needs
+        no stride/padding: the single chunk just has to be >= dim):
+          chunk_size = dim / (1 + (n - 1) * (1 - min_overlap) - 2 * min_padding)
+        """
+        if n <= 1:
+            return dim
+        denom = 1 + (n - 1) * (1.0 - self.min_overlap) - 2 * self.min_padding
+        if denom <= 0:
+            raise ValueError(f"Cannot size chunks for n={n} centers on dim={dim}: denom={denom} <= 0")
+        return dim / denom
+
+    def _axis_centers_exact(self, dim_padded: float, chunk_size: float, n: int) -> list[float]:
+        """Place exactly n centers symmetrically about the midpoint of [0, dim_padded]."""
+        if n == 1:
+            return [0.5 * dim_padded]
+        stride = (dim_padded - chunk_size) / (n - 1)
+        midpoint = 0.5 * dim_padded
+        start = midpoint - 0.5 * (n - 1) * stride
+        return [start + i * stride for i in range(n)]
+
+    def _define_centers_fixed_count(
+        self,
+        x_min: float,
+        x_max: float,
+        y_min: float,
+        y_max: float,
+        z_floor: float,
+        target_n_chunks: int,
+        out_path: Optional[str | Path] = None,
+    ) -> tuple[float, list[list[float]]]:
+        """Like _define_centers, but solves for the shared cube chunk_size and
+        per-axis (nx, ny) grid that together place exactly target_n_chunks chunks
+        over the x/y footprint, using the default overlap (self.min_overlap).
+
+        z is still a single layer (z_center = z_floor + 0.5 * chunk_size) -- if the
+        resulting chunk_size exceeds the scene's real vertical extent, each chunk is
+        simply empty above/below the content in z, which is expected/intentional.
+
+        Returns (chunk_size, centers): unlike _define_centers, chunk_size isn't
+        known ahead of the call here, so callers need it back for _get_transforms.
+        """
+        width = x_max - x_min
+        length = y_max - y_min
+        aspect = width / length if length > 0 else float("inf")
+        nx, ny = self._best_factor_pair(target_n_chunks, aspect)
+
+        chunk_size = max(self._axis_chunk_size(width, nx), self._axis_chunk_size(length, ny))
+
+        padding = chunk_size * self.min_padding
+        x_min_padded = x_min - padding
+        y_min_padded = y_min - padding
+        width_padded = width + 2 * padding
+        length_padded = length + 2 * padding
+        z_center = z_floor + 0.5 * chunk_size
+
+        xs = [x + x_min_padded for x in self._axis_centers_exact(width_padded, chunk_size, nx)]
+        ys = [y + y_min_padded for y in self._axis_centers_exact(length_padded, chunk_size, ny)]
+        centers = [[x, y, z_center] for y in ys for x in xs]
+
+        if out_path is not None:
+            self._visualize_chunks(centers, chunk_size, x_min, x_max, y_min, y_max, out_path)
+
+        return chunk_size, centers
+
     def _define_centers(
         self,
         x_min: float,
@@ -484,15 +576,24 @@ class ScannetMixin:
         manual_xy = getattr(self, "manual_xy_bounds", None)
         if manual_xy is not None:
             x_min, x_max, y_min, y_max = manual_xy
-        chunk_size = delta_z * self.chunk_size_factor
-        chunk_centers = self._define_centers(x_min, x_max, y_min, y_max, z_floor, chunk_size)
-        red_chunk_centers = self._remove_empty_chunks(
-            chunk_centers,
-            chunk_size,
-            clean_points,
-            out_path,
-            n=getattr(self, "min_points_per_chunk", 500),
-        )
+
+        fix_num_chunks = getattr(self, "fix_num_chunks", None)
+        if fix_num_chunks is not None:
+            chunk_size, red_chunk_centers = self._define_centers_fixed_count(
+                x_min, x_max, y_min, y_max, z_floor, fix_num_chunks, out_path
+            )
+            # No _remove_empty_chunks here: pruning could drop below the exact
+            # count the user asked for.
+        else:
+            chunk_size = delta_z * self.chunk_size_factor
+            chunk_centers = self._define_centers(x_min, x_max, y_min, y_max, z_floor, chunk_size)
+            red_chunk_centers = self._remove_empty_chunks(
+                chunk_centers,
+                chunk_size,
+                clean_points,
+                out_path,
+                n=getattr(self, "min_points_per_chunk", 500),
+            )
         m_original_to_chunks, m_chunk_to_originals, relative_translations = self._get_transforms(
             red_chunk_centers, chunk_size, out_path
         )
@@ -510,9 +611,15 @@ class ScannetGtChunker(BaseChunker, ScannetGtMixin):
 
 
 class ScannetChunker(BaseChunker, ScannetMixin):
-    def __init__(self, min_overlap_factor: int = 4, chunk_size_factor: float = 1.08) -> None:
+    def __init__(
+        self,
+        min_overlap_factor: int = 4,
+        chunk_size_factor: float = 1.08,
+        fix_num_chunks: int | None = None,
+    ) -> None:
         super().__init__(min_overlap_factor=min_overlap_factor)
         self.chunk_size_factor = chunk_size_factor
+        self.fix_num_chunks = fix_num_chunks
 
 
 class ScannetIphoneMixin(ScannetMixin):
@@ -534,12 +641,14 @@ class ScannetIphoneChunker(BaseChunker, ScannetIphoneMixin):
         chunk_size_factor: float = 1.08,
         min_points_per_chunk: int | None = None,
         skip_point_cleaning: bool = False,
+        fix_num_chunks: int | None = None,
     ) -> None:
         super().__init__(min_overlap_factor=min_overlap_factor)
         self.chunk_size_factor = chunk_size_factor
         if min_points_per_chunk is not None:
             self.min_points_per_chunk = min_points_per_chunk
         self.skip_point_cleaning = skip_point_cleaning
+        self.fix_num_chunks = fix_num_chunks
 
 
 class IphoneMixin(ScannetIphoneMixin):
@@ -570,6 +679,7 @@ class IphoneChunker(BaseChunker, IphoneMixin):
         radius_m: float | None = None,
         manual_xy_bounds: tuple[float, float, float, float] | None = None,
         min_points_per_chunk: int | None = None,
+        fix_num_chunks: int | None = None,
     ) -> None:
         super().__init__(min_overlap_factor=min_overlap_factor)
         self.chunk_size_factor = chunk_size_factor
@@ -580,3 +690,4 @@ class IphoneChunker(BaseChunker, IphoneMixin):
         self.manual_xy_bounds = manual_xy_bounds
         if min_points_per_chunk is not None:
             self.min_points_per_chunk = min_points_per_chunk
+        self.fix_num_chunks = fix_num_chunks

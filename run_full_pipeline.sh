@@ -2,7 +2,7 @@
 # End-to-end pipeline: VGGT-Omega pose/depth prediction -> [optional COB-GS 3D segmentation] -> GenRecon reconstruction -> GLB bake.
 #
 # Usage:
-#   ./run_full_pipeline.sh <image_folder> <scene_name> [--simplify_threshold N] [--texture_size N] [--num_imgs_per_scene N] [--skip-frames N] [--no-align-to-gravity] [--rotate-horizontal-deg N] [--classes a,b,c] [--run_glb] [--run_trellis2] [--run_usd] [--collision_approximation convexDecomposition|convexHull|boundingCube] [--start-from-stage N] [--max_chunks_per_group N] [--max_inflated_voxels N] [--depth_conf_thres N] [--depth_edge_rtol N]
+#   ./run_full_pipeline.sh <image_folder> <scene_name> [--simplify_threshold N] [--texture_size N] [--num_imgs_per_scene N] [--skip-frames N] [--no-align-to-gravity] [--rotate-horizontal-deg N] [--classes a,b,c] [--run_glb] [--run_trellis2] [--run_usd] [--collision_approximation convexDecomposition|convexHull|boundingCube] [--start-from-stage N] [--max_chunks_per_group N] [--max_inflated_voxels N] [--depth_conf_thres N] [--depth_edge_rtol N] [--fix_num_chunks N]
 #
 # Note: gravity alignment is ON by default; pass --no-align-to-gravity to disable it.
 #
@@ -59,9 +59,10 @@ MAX_CHUNKS_PER_GROUP=""
 MAX_INFLATED_VOXELS=""
 DEPTH_CONF_THRES=50.0
 DEPTH_EDGE_RTOL=0.03
+FIX_NUM_CHUNKS=""
 
 if [[ $# -lt 2 ]]; then
-    echo "Usage: $0 <image_folder> <scene_name> [--simplify_threshold N] [--texture_size N] [--num_imgs_per_scene N] [--skip-frames N] [--no-align-to-gravity] [--rotate-horizontal-deg N] [--classes a,b,c] [--run_glb] [--run_trellis2] [--run_usd] [--collision_approximation convexDecomposition|convexHull|boundingCube] [--start-from-stage N] [--max_chunks_per_group N] [--max_inflated_voxels N] [--depth_conf_thres N] [--depth_edge_rtol N]" >&2
+    echo "Usage: $0 <image_folder> <scene_name> [--simplify_threshold N] [--texture_size N] [--num_imgs_per_scene N] [--skip-frames N] [--no-align-to-gravity] [--rotate-horizontal-deg N] [--classes a,b,c] [--run_glb] [--run_trellis2] [--run_usd] [--collision_approximation convexDecomposition|convexHull|boundingCube] [--start-from-stage N] [--max_chunks_per_group N] [--max_inflated_voxels N] [--depth_conf_thres N] [--depth_edge_rtol N] [--fix_num_chunks N]" >&2
     exit 1
 fi
 
@@ -88,6 +89,7 @@ while [[ $# -gt 0 ]]; do
         --max_inflated_voxels) MAX_INFLATED_VOXELS="$2"; shift 2 ;;
         --depth_conf_thres) DEPTH_CONF_THRES="$2"; shift 2 ;;
         --depth_edge_rtol) DEPTH_EDGE_RTOL="$2"; shift 2 ;;
+        --fix_num_chunks) FIX_NUM_CHUNKS="$2"; shift 2 ;;
         *) echo "Unknown argument: $1" >&2; exit 1 ;;
     esac
 done
@@ -101,6 +103,7 @@ RUN_DIR="${GENRECON_DIR}/runs/${SCENE_NAME}"
 EXPORT_DIR="${RUN_DIR}/vggt_export"
 SEG_DIR="${RUN_DIR}/vggt_export_after_segmentation"
 SCENE_DIR="${RUN_DIR}/genrecon_input"
+FULL_SCENE_DIR="${RUN_DIR}/genrecon_input_full"
 OUTPUT_DIR="${RUN_DIR}/genrecon_output"
 
 mkdir -p "$EXPORT_DIR" "$OUTPUT_DIR"
@@ -359,13 +362,20 @@ if [[ -n "$CLASSES" ]]; then
     fi
 fi
 
-# ── Stage 4: stage GenRecon scene dir ──
+# ── Stage 4: stage GenRecon scene dir(s) ──
+# When --classes is set, also stages FULL_SCENE_DIR pointing at the *unmasked*
+# export (images + full, object-inclusive point cloud) -- used by Stage 5's
+# second, unexcluded reconstruct_scene.py run as the source for real per-object
+# meshes, since the primary (masked) run's mesh.ply no longer contains them.
 if [[ "$START_FROM_STAGE" -le 4 ]]; then
     stage_start "Stage 4: staging ${SCENE_DIR}"
     mkdir -p "$SCENE_DIR"
     if [[ -n "$CLASSES" ]]; then
         ln -sfn "${SEG_DIR}/masked_rgb" "${SCENE_DIR}/rgb"
         ln -sfn "${SEG_DIR}/filtered_colmap" "${SCENE_DIR}/colmap"
+        mkdir -p "$FULL_SCENE_DIR"
+        ln -sfn "${EXPORT_DIR}/images" "${FULL_SCENE_DIR}/rgb"
+        ln -sfn "${EXPORT_DIR}/sparse/0" "${FULL_SCENE_DIR}/colmap"
     else
         ln -sfn "${EXPORT_DIR}/images" "${SCENE_DIR}/rgb"
         ln -sfn "${EXPORT_DIR}/sparse/0" "${SCENE_DIR}/colmap"
@@ -389,6 +399,22 @@ if [[ "$START_FROM_STAGE" -le 5 ]]; then
     if [[ -n "$MAX_INFLATED_VOXELS" ]]; then
         RECON_VRAM_ARGS+=(--max_inflated_voxels "$MAX_INFLATED_VOXELS")
     fi
+    if [[ -n "$FIX_NUM_CHUNKS" ]]; then
+        RECON_VRAM_ARGS+=(--fix_num_chunks "$FIX_NUM_CHUNKS")
+    fi
+
+    # Excludes each segmented class's object from generation itself (voxel-level
+    # carving before shape/texture SLat sampling), instead of relying on the
+    # black-masked/point-dropped input alone -- GenRecon is generative and will
+    # otherwise "resurrect" plausible geometry into the masked region. Also runs
+    # a second, unexcluded reconstruction over FULL_SCENE_DIR's unmasked images
+    # (--unmasked_path), sharing the primary run's chunk geometry/world frame,
+    # so Stage 8 has a real (non-hallucinated) source mesh to crop each object
+    # from -- the primary run's mesh.ply no longer contains them.
+    RECON_EXCLUDE_ARGS=()
+    if [[ -n "$CLASSES" ]]; then
+        RECON_EXCLUDE_ARGS=(--exclude_masks_root "$COBGS_MASK_DIR" --unmasked_path "$FULL_SCENE_DIR")
+    fi
 
     log_debug_config "stage5_reconstruct_scene" "${GENRECON_DIR}/reconstruct_scene.py" "$GENRECON_DIR" \
         --mode Iphone --path "$SCENE_DIR" --output_path "$OUTPUT_DIR" \
@@ -396,13 +422,13 @@ if [[ "$START_FROM_STAGE" -le 5 ]]; then
         --shape_ckpt checkpoints/shape_slat/ckpts/shape_slat.pt \
         --tex_ckpt checkpoints/texture_slat/ckpts/texture_slat.pt \
         --num_imgs_per_scene "$NUM_IMGS_PER_SCENE" --colmap_subdir colmap \
-        "${RECON_VRAM_ARGS[@]}"
+        "${RECON_VRAM_ARGS[@]}" "${RECON_EXCLUDE_ARGS[@]}"
     uv run python -u reconstruct_scene.py --mode Iphone --path "$SCENE_DIR" --output_path "$OUTPUT_DIR" \
         --ss_ckpt checkpoints/sparse_structure/ckpts/sparse_structure.pt \
         --shape_ckpt checkpoints/shape_slat/ckpts/shape_slat.pt \
         --tex_ckpt checkpoints/texture_slat/ckpts/texture_slat.pt \
         --num_imgs_per_scene "$NUM_IMGS_PER_SCENE" --colmap_subdir colmap \
-        "${RECON_VRAM_ARGS[@]}" \
+        "${RECON_VRAM_ARGS[@]}" "${RECON_EXCLUDE_ARGS[@]}" \
         > "${OUTPUT_DIR}/reconstruct.log" 2>&1
     mirror_log "${OUTPUT_DIR}/reconstruct.log"
     stage_end
@@ -462,16 +488,29 @@ fi
 # hull into each camera view and comparing it against that class's real
 # per-frame segmentation mask (COBGS_MASK_DIR/<label>/mask_bin), instead of
 # using a single fixed --hull_padding.
+#
+# --object_mesh_ply points the object side of the crop at Stage 5's second
+# (unexcluded) reconstruction instead of background_mesh.ply -- the primary
+# run had every class excluded from generation, so background_mesh.ply no
+# longer contains real object geometry to crop; --remainder_out_ply still
+# always chains off background_mesh.ply.
+OBJECT_SOURCE_MESH="${OUTPUT_DIR}/object_source_mesh.ply"
 if [[ -n "$CLASSES" && "$START_FROM_STAGE" -le 8 ]]; then
     stage_start "Stage 8: cascading per-object mesh extraction -> ${SHAPES_DIR}"
     BACKGROUND_MESH="${SHAPES_DIR}/background_mesh.ply"
     cp "${SHAPES_DIR}/mesh.ply" "$BACKGROUND_MESH"
     for obj_ply in "$SHAPES_DIR"/*.ply; do
         obj_name="$(basename "$obj_ply")"
-        [[ "$obj_name" == "mesh.ply" || "$obj_name" == "background.ply" || "$obj_name" == "background_mesh.ply" ]] && continue
+        # Skip mesh.ply/background.ply plus anything matching this stage's own
+        # <label>_mesh.ply output naming -- a stale one from a previous run
+        # (Stage 7 doesn't wipe SHAPES_DIR before re-copying raw point clouds)
+        # would otherwise get globbed as a brand-new "object" here, producing a
+        # spurious <label>_mesh_mesh.ply crop and a duplicate USD asset later.
+        [[ "$obj_name" == "mesh.ply" || "$obj_name" == "background.ply" || "$obj_name" == *_mesh.ply ]] && continue
         label="${obj_name%.ply}"
         log_debug_config "stage8_extract_object_mesh_${label}" "${GENRECON_DIR}/scripts/extract_object_mesh.py" "$GENRECON_DIR" \
             --mesh_ply "$BACKGROUND_MESH" \
+            --object_mesh_ply "$OBJECT_SOURCE_MESH" \
             --object_ply "$obj_ply" \
             --out_ply "${SHAPES_DIR}/${label}_mesh.ply" \
             --remainder_out_ply "$BACKGROUND_MESH" \
@@ -479,6 +518,7 @@ if [[ -n "$CLASSES" && "$START_FROM_STAGE" -le 8 ]]; then
             --masks_dir "${COBGS_MASK_DIR}/${label}/mask_bin"
         uv run python -u scripts/extract_object_mesh.py \
             --mesh_ply "$BACKGROUND_MESH" \
+            --object_mesh_ply "$OBJECT_SOURCE_MESH" \
             --object_ply "$obj_ply" \
             --out_ply "${SHAPES_DIR}/${label}_mesh.ply" \
             --remainder_out_ply "$BACKGROUND_MESH" \

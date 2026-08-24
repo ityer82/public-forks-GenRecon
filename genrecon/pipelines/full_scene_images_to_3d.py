@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager, nullcontext
 from typing import Optional
 
+import numpy as np
 import torch
 
 from ..modules.cond_3D.projection import project_features_on_points
@@ -270,6 +271,40 @@ class FullSceneImagesTo3DPipeline(ImagesTo3DPipeline):
             coords_list.append(torch.cat([batch_col, xyz], dim=1))  # [K, 4]
         return coords_list
 
+    @staticmethod
+    def _filter_excluded_coords(
+        coords_list: list[torch.Tensor],
+        target_resolution: int,
+        exclude_equations: Optional[list[list[np.ndarray]]],
+    ) -> list[torch.Tensor]:
+        """Drop voxel coords that fall inside a known-excluded region.
+
+        ``exclude_equations[i]`` is a list of padded convex-hull half-space
+        equation arrays (``[F, 4]``, rows ``[a, b, c, d]``, interior iff
+        ``a*x+b*y+c*z+d <= 0``) for chunk ``i``, already expressed in that
+        chunk's own local unit-cube frame (``[-0.5, 0.5]``, same frame each
+        chunk's ``SparseTensor`` coords implicitly live in once converted via
+        ``(idx + 0.5) / target_resolution - 0.5``). A voxel is dropped if it
+        falls inside *any* of a chunk's excluded hulls. No-op if
+        ``exclude_equations`` is ``None`` or empty.
+        """
+        if not exclude_equations:
+            return coords_list
+        filtered = []
+        for coords, equations_list in zip(coords_list, exclude_equations):
+            if not equations_list or coords.shape[0] == 0:
+                filtered.append(coords)
+                continue
+            unit_cube = (coords[:, 1:].float() + 0.5) / target_resolution - 0.5
+            pts = unit_cube.detach().cpu().numpy()
+            excluded = np.zeros(len(pts), dtype=bool)
+            for equations in equations_list:
+                inside = np.all(equations[:, :3] @ pts.T + equations[:, 3:4] <= 0.0, axis=0)
+                excluded |= inside
+            keep = torch.from_numpy(~excluded).to(coords.device)
+            filtered.append(coords[keep])
+        return filtered
+
     @torch.no_grad()
     def joint_decode_sparse_structure(
         self,
@@ -416,6 +451,7 @@ class FullSceneImagesTo3DPipeline(ImagesTo3DPipeline):
         pipeline_type: Optional[str] = None,
         occ_threshold: float = 0.0,
         zero_3d_cond: bool = False,
+        exclude_equations: Optional[list[list[np.ndarray]]] = None,
     ) -> tuple[MeshWithVoxel, list[torch.Tensor]]:
         pipeline_type = pipeline_type or self.default_pipeline_type
         if pipeline_type not in ("512", "1024"):
@@ -507,6 +543,7 @@ class FullSceneImagesTo3DPipeline(ImagesTo3DPipeline):
             threshold=occ_threshold,
         )
         del aggr_occ_logit_list
+        coords_list = self._filter_excluded_coords(coords_list, shape_model.resolution, exclude_equations)
         std = torch.tensor(self.shape_slat_normalization["std"])[None].to(self.device)
         mean = torch.tensor(self.shape_slat_normalization["mean"])[None].to(self.device)
 

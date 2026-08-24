@@ -33,6 +33,12 @@ object crop that leaves a rim of the object's own boundary faces behind in
 the background, or a hull loose enough to fully clear the background that
 then bleeds environment geometry into the object crop.
 
+If --mesh_ply had this object excluded from generation itself (e.g.
+reconstruct_scene.py --exclude_masks_root) and so no longer contains it,
+pass --object_mesh_ply pointing at a separate, unexcluded reconstruction of
+the same scene (same world frame) to crop the object from instead --
+--remainder_out_ply still always comes from --mesh_ply.
+
 Usage:
     uv run python scripts/extract_object_mesh.py \
         --mesh_ply runs/<scene>/genrecon_output/shapes/mesh.ply \
@@ -46,150 +52,13 @@ import argparse
 import shutil
 from pathlib import Path
 
-import cv2
 import numpy as np
-from PIL import Image
 from plyfile import PlyData, PlyElement
-from scipy.spatial import ConvexHull, HalfspaceIntersection, QhullError
+from scipy.spatial import QhullError
 
-from genrecon.utils.colmap_utils import parse_colmap_cameras, project_points
+from genrecon.utils.colmap_utils import parse_colmap_cameras
+from genrecon.utils.hull import load_object_points, padded_hull_equations, search_hull_padding
 from genrecon.utils.logger import logger
-
-
-def load_object_points(object_ply: Path) -> np.ndarray:
-    ply = PlyData.read(object_ply)
-    vertex = ply["vertex"]
-    return np.stack([vertex["x"], vertex["y"], vertex["z"]], axis=1).astype(np.float64)
-
-
-def padded_hull_equations(points: np.ndarray, padding: float) -> np.ndarray:
-    hull = ConvexHull(points)
-    equations = hull.equations.copy()  # rows [a, b, c, d]; interior iff a*x+b*y+c*z+d <= 0
-    equations[:, 3] -= padding
-    return equations
-
-
-def padded_hull_vertices(points: np.ndarray, padding: float) -> np.ndarray:
-    """Vertices of the hull after offsetting every facet outward by `padding`.
-
-    Padding moves facet planes, not the original points, so the padded
-    polytope's vertices must be re-derived from the offset half-spaces
-    rather than just nudging `points` outward.
-    """
-    equations = padded_hull_equations(points, padding)
-    interior_point = points.mean(axis=0)
-    hs = HalfspaceIntersection(equations, interior_point)
-    return hs.intersections
-
-
-def resolve_mask_path(mask_dir: Path, frame_name: str) -> Path | None:
-    """Find the mask file for `frame_name`, tolerating extension mismatches
-    (e.g. COLMAP image names ending in .jpg vs. exported .png masks)."""
-    exact = mask_dir / frame_name
-    if exact.exists():
-        return exact
-    stem = Path(frame_name).stem
-    for ext in (".png", ".jpg", ".jpeg"):
-        candidate = mask_dir / f"{stem}{ext}"
-        if candidate.exists():
-            return candidate
-    return None
-
-
-def load_mask_resized(mask_path: Path, target_hw: tuple[int, int]) -> np.ndarray:
-    """Read a mask PNG as bool and resize (nearest-neighbor) to `target_hw`
-    if it doesn't already match (e.g. masks produced at a downsampled scale)."""
-    mask = np.array(Image.open(mask_path).convert("L"))
-    if mask.shape != tuple(target_hw):
-        mask = cv2.resize(mask, (target_hw[1], target_hw[0]), interpolation=cv2.INTER_NEAREST)
-    return mask > 0
-
-
-def reprojection_overshoot(padded_vertices: np.ndarray, cam: dict, mask: np.ndarray) -> float | None:
-    """Fraction of the padded hull's reprojected 2D silhouette that falls
-    outside the true segmentation `mask` for this camera view. Returns None
-    if too few hull vertices project on-screen to form a meaningful polygon.
-    """
-    pixels, in_front = project_points(padded_vertices, cam)
-    W, H = cam["W"], cam["H"]
-    on_screen = in_front & (pixels[:, 0] >= 0) & (pixels[:, 0] < W) & (pixels[:, 1] >= 0) & (pixels[:, 1] < H)
-    visible_pixels = pixels[in_front]
-    if visible_pixels.shape[0] < 3 or on_screen.sum() == 0:
-        return None
-
-    try:
-        hull2d = ConvexHull(visible_pixels)
-    except QhullError:
-        return None
-    polygon = visible_pixels[hull2d.vertices].round().astype(np.int32)
-
-    silhouette = np.zeros((H, W), dtype=np.uint8)
-    cv2.fillPoly(silhouette, [polygon], color=1)
-    silhouette = silhouette.astype(bool)
-
-    silhouette_area = silhouette.sum()
-    if silhouette_area == 0:
-        return None
-    outside = np.count_nonzero(silhouette & ~mask)
-    return outside / silhouette_area
-
-
-def search_hull_padding(
-    points: np.ndarray,
-    cameras: list[dict],
-    masks_dir: Path,
-    padding_min: float,
-    padding_max: float,
-    max_overshoot: float,
-    iters: int,
-) -> float:
-    """Binary-search the largest padding in [padding_min, padding_max] whose
-    reprojected hull silhouette overshoots the true per-frame masks by no
-    more than `max_overshoot` on average. Falls back to `padding_max` if no
-    camera has a usable mask, or to `padding_min` if even that overshoots.
-    """
-    qualifying_cams: list[tuple[dict, np.ndarray]] = []
-    for cam in cameras:
-        mask_path = resolve_mask_path(masks_dir, cam["name"])
-        if mask_path is None:
-            continue
-        mask = load_mask_resized(mask_path, (cam["H"], cam["W"]))
-        if not mask.any():
-            continue
-        qualifying_cams.append((cam, mask))
-
-    if not qualifying_cams:
-        logger.warning(f"No usable masks found in {masks_dir}; using --hull_padding={padding_max} as-is.")
-        return padding_max
-
-    def score(padding: float) -> float:
-        try:
-            verts = padded_hull_vertices(points, padding)
-        except QhullError:
-            return float("inf")
-        overshoots = [
-            o for cam, mask in qualifying_cams if (o := reprojection_overshoot(verts, cam, mask)) is not None
-        ]
-        if not overshoots:
-            return float("inf")
-        return float(np.mean(overshoots))
-
-    if score(padding_max) <= max_overshoot:
-        return padding_max
-    if score(padding_min) > max_overshoot:
-        logger.warning(
-            f"Even --hull_padding_min={padding_min} overshoots masks in {masks_dir}; using it as-is."
-        )
-        return padding_min
-
-    lo, hi = padding_min, padding_max
-    for _ in range(iters):
-        mid = (lo + hi) / 2.0
-        if score(mid) <= max_overshoot:
-            lo = mid
-        else:
-            hi = mid
-    return lo
 
 
 def compact_mesh(vertex: np.ndarray, faces: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -228,15 +97,37 @@ def _inside_mask(equations: np.ndarray, bbox_min: np.ndarray, bbox_max: np.ndarr
     return inside
 
 
+def _crop_side(mesh_ply: Path, equations: np.ndarray, bbox_min: np.ndarray, bbox_max: np.ndarray, *, keep_inside: bool) -> tuple[np.ndarray, np.ndarray]:
+    """Crop `mesh_ply` against one padded hull (`equations`).
+
+    ``keep_inside=True`` keeps faces whose 3 vertices are *all* inside the
+    hull (the "object" side); ``keep_inside=False`` keeps faces with *no*
+    vertex inside the hull (the "remainder" side, everything outside it).
+    """
+    ply = PlyData.read(mesh_ply)
+    vertex = ply["vertex"]
+    face = ply["face"]
+    logger.info(f"Cropping {mesh_ply}: {len(vertex.data)} vertices, {len(face.data)} faces before this crop.")
+
+    verts_xyz = np.stack([vertex["x"], vertex["y"], vertex["z"]], axis=1).astype(np.float64)
+    inside = _inside_mask(equations, bbox_min, bbox_max, verts_xyz)
+
+    faces = np.stack(face["vertex_indices"])
+    keep_face = inside[faces].all(axis=1) if keep_inside else ~inside[faces].any(axis=1)
+    return compact_mesh(vertex.data, faces[keep_face])
+
+
 def crop_mesh(
     mesh_ply: Path,
     object_equations: np.ndarray,
     remainder_equations: np.ndarray,
     bbox_min: np.ndarray,
     bbox_max: np.ndarray,
+    *,
+    object_mesh_ply: Path | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Split `mesh_ply`'s faces into an object crop and a remainder, using two
-    separate hulls (`object_equations` tight, `remainder_equations` >= it in
+    """Split faces into an object crop and a remainder, using two separate
+    hulls (`object_equations` tight, `remainder_equations` >= it in
     coverage). A single shared hull would force a choice between a tight
     object crop that leaves a rim of the object's own boundary faces behind
     in the remainder (straddling faces have >=1 vertex outside a tight hull,
@@ -248,22 +139,16 @@ def crop_mesh(
     in between (excluded from the tight object hull, but not fully outside
     the looser remainder hull) are dropped from both -- a thin gap rather
     than a leftover rim in either mesh.
+
+    ``object_mesh_ply``, if given, is a *different* source mesh for the
+    object crop than `mesh_ply` (e.g. a real, unexcluded reconstruction, when
+    `mesh_ply` had this object excluded from generation and so no longer
+    contains it) -- the remainder crop always comes from `mesh_ply`.
     """
-    ply = PlyData.read(mesh_ply)
-    vertex = ply["vertex"]
-    face = ply["face"]
-    logger.info(f"Cropping {mesh_ply}: {len(vertex.data)} vertices, {len(face.data)} faces before this crop.")
-
-    verts_xyz = np.stack([vertex["x"], vertex["y"], vertex["z"]], axis=1).astype(np.float64)
-    inside_object = _inside_mask(object_equations, bbox_min, bbox_max, verts_xyz)
-    inside_remainder = _inside_mask(remainder_equations, bbox_min, bbox_max, verts_xyz)
-
-    faces = np.stack(face["vertex_indices"])
-    keep_face_object = inside_object[faces].all(axis=1)
-    keep_face_remainder = ~inside_remainder[faces].any(axis=1)
-
-    object_vertex, object_faces = compact_mesh(vertex.data, faces[keep_face_object])
-    remainder_vertex, remainder_faces = compact_mesh(vertex.data, faces[keep_face_remainder])
+    object_vertex, object_faces = _crop_side(
+        object_mesh_ply if object_mesh_ply is not None else mesh_ply, object_equations, bbox_min, bbox_max, keep_inside=True
+    )
+    remainder_vertex, remainder_faces = _crop_side(mesh_ply, remainder_equations, bbox_min, bbox_max, keep_inside=False)
     return object_vertex, object_faces, remainder_vertex, remainder_faces
 
 
@@ -285,6 +170,16 @@ def main():
     parser.add_argument("--mesh_ply", type=Path, required=True)
     parser.add_argument("--object_ply", type=Path, required=True)
     parser.add_argument("--out_ply", type=Path, required=True)
+    parser.add_argument(
+        "--object_mesh_ply",
+        type=Path,
+        default=None,
+        help="If set, crop the object (--out_ply) from this mesh instead of --mesh_ply -- "
+        "e.g. a real, unexcluded reconstruction, when --mesh_ply had this object excluded "
+        "from generation and so no longer contains it. The remainder (--remainder_out_ply) "
+        "always comes from --mesh_ply, unaffected by this. Defaults to --mesh_ply (today's "
+        "single-source behavior).",
+    )
     parser.add_argument(
         "--remainder_out_ply",
         type=Path,
@@ -397,7 +292,8 @@ def main():
     bbox_min = points.min(axis=0) - bbox_margin
     bbox_max = points.max(axis=0) + bbox_margin
     object_vertex, object_faces, remainder_vertex, remainder_faces = crop_mesh(
-        args.mesh_ply, object_equations, remainder_equations, bbox_min, bbox_max
+        args.mesh_ply, object_equations, remainder_equations, bbox_min, bbox_max,
+        object_mesh_ply=args.object_mesh_ply,
     )
     if len(object_faces) == 0:
         skip("no mesh faces fell inside the padded hull.")

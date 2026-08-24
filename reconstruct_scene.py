@@ -25,8 +25,11 @@ from pathlib import Path
 import numpy as np
 import torch
 from PIL import Image
+from scipy.spatial import QhullError
 
 from genrecon.pipelines.full_scene_images_to_3d import FullSceneImagesTo3DPipeline
+from genrecon.utils.colmap_utils import parse_colmap_cameras
+from genrecon.utils.hull import load_object_points, padded_hull_equations, padded_hull_vertices, search_hull_padding
 from genrecon.utils.logger import logger
 from inference.get_chunks import (
     IphoneChunker,
@@ -162,6 +165,73 @@ def _save_to_glb_inputs(
     logger.info(f"saved {label}to_glb_inputs to {out_path / 'to_glb_inputs.pt'}")
 
 
+def _chunk_world_aabb(m_c2o_i: torch.Tensor) -> tuple[np.ndarray, np.ndarray]:
+    """Approximate world-space AABB of chunk i's unit cube, from its chunk-to-original transform."""
+    size = abs(m_c2o_i[0, 0].item())
+    center = m_c2o_i[:3, 3].cpu().numpy()
+    half = size * 0.5
+    return center - half, center + half
+
+
+def _build_exclude_equations(
+    masks_root: Path,
+    colmap_dir: Path,
+    m_o2c: list[torch.Tensor],
+    m_c2o: list[torch.Tensor],
+    chunk_indices,
+) -> list[list[np.ndarray]]:
+    """Build, per kept chunk, a list of padded+reprojection-tightened convex-hull
+    half-space equations (one per excluded class) in that chunk's local unit-cube
+    frame -- for FullSceneImagesTo3DPipeline.run()'s exclude_equations.
+
+    Reuses the same hull + reprojection-tightening machinery as
+    scripts/extract_object_mesh.py's post-hoc mesh crop (genrecon/utils/hull.py),
+    applied before generation instead of after.
+    """
+    labels = json.loads((masks_root / "labels.json").read_text())
+    cameras = parse_colmap_cameras(colmap_dir)
+
+    world_hulls: list[np.ndarray] = []
+    for label, dirname in labels.items():
+        object_ply = masks_root / dirname / "point_cloud" / f"{label}.ply"
+        masks_dir = masks_root / dirname / "mask_bin"
+        if not object_ply.exists():
+            logger.warning(f"exclude_equations: {object_ply} not found, skipping class {label!r}.")
+            continue
+        points = load_object_points(object_ply)
+        if len(points) < 4:
+            logger.warning(f"exclude_equations: {label!r} has only {len(points)} points, skipping.")
+            continue
+        padding = search_hull_padding(
+            points, cameras, masks_dir, padding_min=-0.01, padding_max=0.02, max_overshoot=0.15, iters=8
+        )
+        try:
+            verts = padded_hull_vertices(points, padding)
+        except QhullError as e:
+            logger.warning(f"exclude_equations: {label!r} hull construction failed ({e}), skipping.")
+            continue
+        world_hulls.append(verts)
+        logger.info(f"exclude_equations: {label!r} padded hull (padding={padding:.4f}), {len(verts)} vertices.")
+
+    exclude_equations: list[list[np.ndarray]] = []
+    for chunk_idx in chunk_indices:
+        chunk_min, chunk_max = _chunk_world_aabb(m_c2o[chunk_idx])
+        m = m_o2c[chunk_idx].detach().cpu().numpy()
+        chunk_equations = []
+        for verts in world_hulls:
+            hull_min, hull_max = verts.min(axis=0), verts.max(axis=0)
+            if np.any(chunk_max < hull_min) or np.any(chunk_min > hull_max):
+                continue  # chunk's AABB doesn't intersect this hull's AABB at all
+            verts_h = np.concatenate([verts, np.ones((len(verts), 1))], axis=1)
+            chunk_verts = (m @ verts_h.T).T[:, :3]
+            try:
+                chunk_equations.append(padded_hull_equations(chunk_verts, 0.0))
+            except QhullError:
+                continue
+        exclude_equations.append(chunk_equations)
+    return exclude_equations
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", required=True, choices=list(MODES))
@@ -221,6 +291,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Override chunk_size = delta_z * chunk_size_factor (default 1.11). "
         "Applied to all multiplicative-chunk modes. Not supported for Sage_gt "
         "(additive chunk_size); passing it explicitly there is an error.",
+    )
+    parser.add_argument(
+        "--fix_num_chunks",
+        type=int,
+        default=None,
+        help="Force exactly this many chunks, sized to cover the scene's x/y "
+        "footprint with the default overlap (chunk_size is no longer derived "
+        "from delta_z). For scenes with a small vertical span, chunks will be "
+        "empty above/below the real content in z. Not supported for --mode "
+        "Sage_gt/Scannet_gt.",
     )
     parser.add_argument(
         "--colmap_subdir",
@@ -302,6 +382,18 @@ def build_parser() -> argparse.ArgumentParser:
         "decode passes.",
     )
     parser.add_argument(
+        "--exclude_masks_root",
+        default=None,
+        help="Directory of COB-GS's per-class 3D segmentation output (labels.json + "
+        "<label>/point_cloud/<label>.ply + <label>/mask_bin/), e.g. "
+        "segmentation_raw/masks/classes. If set, each class's object is excluded from "
+        "generation itself: its padded, reprojection-tightened convex hull (same "
+        "computation as scripts/extract_object_mesh.py's post-hoc crop) is used to drop "
+        "sparse-structure voxel coords in that region before shape/texture SLat sampling "
+        "runs, so GenRecon never hallucinates the object back in. Requires cameras.txt/"
+        "images.txt under <--path>/<--colmap_subdir>. mode=Iphone only.",
+    )
+    parser.add_argument(
         "--max_inflated_voxels",
         type=int,
         default=None,
@@ -310,6 +402,21 @@ def build_parser() -> argparse.ArgumentParser:
         "full_scene_images_to_3d.py). Normally only enabled by default for "
         "--pipeline 1024; set this explicitly to enable it for 512 too. "
         "Lower = less peak VRAM, more decode passes.",
+    )
+    parser.add_argument(
+        "--unmasked_path",
+        default=None,
+        help="Second scene dir (same rgb/colmap layout as --path) holding the "
+        "*unmasked* images and full (object-inclusive) point cloud. If set, chunk "
+        "geometry (m_o2c/m_c2o/rel_t) is computed from this scene instead of "
+        "--path (it has strictly more points, so a more representative bbox), and "
+        "shared by a second, unexcluded pipeline.run() over these images -- a real "
+        "multi-view reconstruction that still contains whatever --exclude_masks_root "
+        "excluded from the primary (--path) run. Saved to <output_path>/"
+        "object_source_mesh.ply, in the same world frame as the primary run's "
+        "mesh.ply (same chunk geometry), for scripts/extract_object_mesh.py's "
+        "--object_mesh_ply to crop real per-object meshes from. Roughly doubles "
+        "Stage 5 GPU cost when set. mode=Iphone only.",
     )
     return parser
 
@@ -365,6 +472,10 @@ def main() -> None:
             parser.error("--chunk_size_factor is not supported for mode=Sage_gt (additive chunk_size).")
     elif args.chunk_size_factor is not None:
         chunker_kwargs["chunk_size_factor"] = args.chunk_size_factor
+    if args.mode in ("Sage_gt", "Scannet_gt") and args.fix_num_chunks is not None:
+        parser.error(f"--fix_num_chunks is not supported for --mode {args.mode}.")
+    if args.fix_num_chunks is not None:
+        chunker_kwargs["fix_num_chunks"] = args.fix_num_chunks
     if args.mode == "Iphone":
         chunker_kwargs["colmap_subdir"] = args.colmap_subdir
         if args.stat_std_ratio is not None:
@@ -393,7 +504,12 @@ def main() -> None:
             json.dump(crop, f, indent=2)
         logger.info(f"using crops/{scene_id}.json[chunks][{args.validation_crop_idx}]")
     else:
-        _, m_o2c, m_c2o, rel_t = chunker_cls(**chunker_kwargs).get_chunks(scene_path, out_path)
+        # If a second (unmasked) scene is given, derive chunk geometry from it --
+        # it has strictly more points (nothing dropped), so a more representative
+        # bbox -- and reuse the same m_o2c/m_c2o/rel_t for both pipeline.run() calls
+        # below so their meshes land in the same world frame with no drift.
+        chunk_source_path = Path(args.unmasked_path) if args.unmasked_path is not None else scene_path
+        _, m_o2c, m_c2o, rel_t = chunker_cls(**chunker_kwargs).get_chunks(chunk_source_path, out_path)
     selecter_kwargs: dict = {}
     if args.mode in ("Scannet_iphone", "Iphone"):
         selecter_kwargs["center_crop"] = args.center_crop
@@ -405,6 +521,16 @@ def main() -> None:
         seed=args.seed,
     )
     rel_t_kept = [rel_t[i] for i in sel.chunk_indices]
+
+    exclude_equations = None
+    if args.exclude_masks_root is not None:
+        exclude_equations = _build_exclude_equations(
+            Path(args.exclude_masks_root),
+            scene_path / args.colmap_subdir,
+            m_o2c,
+            m_c2o,
+            sel.chunk_indices,
+        )
 
     if args.save_imgs:
         scene_dir = out_path / "scene"
@@ -432,6 +558,7 @@ def main() -> None:
         shape_slat_sampler_params=slat_sampler_params,
         tex_slat_sampler_params=slat_sampler_params,
         occ_threshold=args.occ_threshold,
+        exclude_equations=exclude_equations,
     )
 
     coords_resolution = pipeline.models[f"shape_slat_flow_model_{args.pipeline}"].resolution
@@ -504,6 +631,40 @@ def main() -> None:
         }
         torch.save(chunk_inputs, out_path / "chunk_inputs.pt")
         logger.info(f"saved chunk metadata to {out_path / 'chunk_inputs.pt'}")
+
+    if args.unmasked_path is not None:
+        # Second, unexcluded run over the unmasked images -- a real multi-view
+        # reconstruction that still contains whatever --exclude_masks_root excluded
+        # from the primary run above. Reuses the same m_o2c/m_c2o (computed from
+        # this same unmasked scene already, see chunk_source_path above), so this
+        # mesh lands in the same world frame as the primary mesh.ply with no
+        # separate registration step needed.
+        unmasked_scene_path = Path(args.unmasked_path)
+        sel_full = selecter_cls(**selecter_kwargs).get_images(
+            m_o2c,
+            transforms_json(unmasked_scene_path),
+            args.num_imgs_per_scene,
+            out_path,
+            seed=args.seed,
+        )
+        rel_t_kept_full = [rel_t[i] for i in sel_full.chunk_indices]
+        scene_mesh_full, _ = pipeline.run(
+            sel_full,
+            rel_t_kept_full,
+            seed=args.seed,
+            pipeline_type=args.pipeline,
+            sparse_structure_sampler_params=ss_sampler_params,
+            shape_slat_sampler_params=slat_sampler_params,
+            tex_slat_sampler_params=slat_sampler_params,
+            occ_threshold=args.occ_threshold,
+            exclude_equations=None,
+        )
+        mesh_transform_full = (
+            torch.eye(4, dtype=torch.float32) if args.validation_crop_idx is not None else m_c2o[0]
+        )
+        object_source_mesh_path = out_path / "object_source_mesh.ply"
+        save_mesh_to_original(object_source_mesh_path, scene_mesh_full, mesh_transform_full)
+        logger.info(f"saved object-source mesh (unmasked run) to {object_source_mesh_path}")
 
 
 if __name__ == "__main__":
