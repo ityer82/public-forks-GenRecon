@@ -2,7 +2,7 @@
 # End-to-end pipeline: VGGT-Omega pose/depth prediction -> [optional COB-GS 3D segmentation] -> GenRecon reconstruction -> GLB bake.
 #
 # Usage:
-#   ./run_full_pipeline.sh <image_folder> <scene_name> [--simplify_threshold N] [--texture_size N] [--num_imgs_per_scene N] [--skip-frames N] [--no-align-to-gravity] [--rotate-horizontal-deg N] [--classes a,b,c] [--run_glb] [--run_trellis2] [--run_usd] [--collision_approximation convexDecomposition|convexHull|boundingCube] [--start-from-stage N] [--max_chunks_per_group N] [--max_inflated_voxels N] [--depth_conf_thres N] [--depth_edge_rtol N] [--fix_num_chunks N]
+#   ./run_full_pipeline.sh <image_folder> <scene_name> [--simplify_threshold N] [--texture_size N] [--num_imgs_per_scene N] [--skip-frames N] [--no-align-to-gravity] [--rotate-horizontal-deg N] [--classes a,b,c] [--run_glb] [--run_trellis2] [--skip_isaac] [--collision_approximation convexDecomposition|convexHull|boundingCube] [--start-from-stage N] [--stop-after-stage N] [--max_chunks_per_group N] [--max_inflated_voxels N] [--depth_conf_thres N] [--depth_edge_rtol N] [--fix_num_voxels N]
 #
 # Note: gravity alignment is ON by default; pass --no-align-to-gravity to disable it.
 #
@@ -48,21 +48,22 @@ NUM_IMGS_PER_SCENE=32
 VGGT_EXPORT_TIMEOUT=1800
 RUN_GLB=0
 RUN_TRELLIS2=0
-RUN_USD=0
+RUN_USD=1
 COLLISION_APPROXIMATION="convexDecomposition"
 SKIP_FRAMES=-1
 ALIGN_TO_GRAVITY=1
 ROTATE_HORIZONTAL_DEG=0.0
 CLASSES=""
 START_FROM_STAGE=0
+STOP_AFTER_STAGE=999
 MAX_CHUNKS_PER_GROUP=""
 MAX_INFLATED_VOXELS=""
 DEPTH_CONF_THRES=50.0
 DEPTH_EDGE_RTOL=0.03
-FIX_NUM_CHUNKS=""
+FIX_NUM_VOXELS=16
 
 if [[ $# -lt 2 ]]; then
-    echo "Usage: $0 <image_folder> <scene_name> [--simplify_threshold N] [--texture_size N] [--num_imgs_per_scene N] [--skip-frames N] [--no-align-to-gravity] [--rotate-horizontal-deg N] [--classes a,b,c] [--run_glb] [--run_trellis2] [--run_usd] [--collision_approximation convexDecomposition|convexHull|boundingCube] [--start-from-stage N] [--max_chunks_per_group N] [--max_inflated_voxels N] [--depth_conf_thres N] [--depth_edge_rtol N] [--fix_num_chunks N]" >&2
+    echo "Usage: $0 <image_folder> <scene_name> [--simplify_threshold N] [--texture_size N] [--num_imgs_per_scene N] [--skip-frames N] [--no-align-to-gravity] [--rotate-horizontal-deg N] [--classes a,b,c] [--run_glb] [--run_trellis2] [--skip_isaac] [--collision_approximation convexDecomposition|convexHull|boundingCube] [--start-from-stage N] [--stop-after-stage N] [--max_chunks_per_group N] [--max_inflated_voxels N] [--depth_conf_thres N] [--depth_edge_rtol N] [--fix_num_voxels N]" >&2
     exit 1
 fi
 
@@ -82,14 +83,15 @@ while [[ $# -gt 0 ]]; do
         --classes) CLASSES="$2"; shift 2 ;;
         --run_glb) RUN_GLB=1; shift 1 ;;
         --run_trellis2) RUN_TRELLIS2=1; shift 1 ;;
-        --run_usd) RUN_USD=1; shift 1 ;;
+        --skip_isaac) RUN_USD=0; shift 1 ;;
         --collision_approximation) COLLISION_APPROXIMATION="$2"; shift 2 ;;
         --start-from-stage) START_FROM_STAGE="$2"; shift 2 ;;
+        --stop-after-stage) STOP_AFTER_STAGE="$2"; shift 2 ;;
         --max_chunks_per_group) MAX_CHUNKS_PER_GROUP="$2"; shift 2 ;;
         --max_inflated_voxels) MAX_INFLATED_VOXELS="$2"; shift 2 ;;
         --depth_conf_thres) DEPTH_CONF_THRES="$2"; shift 2 ;;
         --depth_edge_rtol) DEPTH_EDGE_RTOL="$2"; shift 2 ;;
-        --fix_num_chunks) FIX_NUM_CHUNKS="$2"; shift 2 ;;
+        --fix_num_voxels) FIX_NUM_VOXELS="$2"; shift 2 ;;
         *) echo "Unknown argument: $1" >&2; exit 1 ;;
     esac
 done
@@ -148,6 +150,17 @@ stage_end() {
 format_duration() {
     local s=$1
     printf '%dm%02ds' $((s / 60)) $((s % 60))
+}
+
+# Exits after the given stage number finishes (whether it ran or was
+# skipped) if that's what --stop-after-stage asked for -- lets a single
+# stage be re-run in isolation via --start-from-stage N --stop-after-stage N.
+check_stop_after_stage() {
+    local n="$1"
+    if [[ "$STOP_AFTER_STAGE" -eq "$n" ]]; then
+        log "Stopping after stage ${n} (--stop-after-stage ${STOP_AFTER_STAGE})."
+        exit 0
+    fi
 }
 
 declare -A LOG_LINE_OFFSET
@@ -241,6 +254,7 @@ if [[ "$START_FROM_STAGE" -le 0 ]]; then
 else
     log "Stage 0: skipped (--start-from-stage ${START_FROM_STAGE}), assuming existing export at ${EXPORT_DIR}"
 fi
+check_stop_after_stage 0
 
 # ── Stage 1 (optional): COB-GS 3D segmentation ──
 # When --classes is set, only the background reaches GenRecon: foreground
@@ -313,6 +327,7 @@ if [[ -n "$CLASSES" ]]; then
     else
         log "Stage 1: skipped (--start-from-stage ${START_FROM_STAGE}), assuming existing segmentation at ${SEG_DIR}"
     fi
+    check_stop_after_stage 1
 
     # ── Stage 2: RGBA best-view mask export ──
     # For each class, picks the frame where the object covers the largest
@@ -332,6 +347,7 @@ if [[ -n "$CLASSES" ]]; then
     else
         log "Stage 2: skipped (--start-from-stage ${START_FROM_STAGE})"
     fi
+    check_stop_after_stage 2
 
     # ── Stage 3 (optional): TRELLIS.2 3D reconstruction per class ──
     if [[ "$RUN_TRELLIS2" -eq 1 && "$START_FROM_STAGE" -le 3 ]]; then
@@ -360,6 +376,7 @@ if [[ -n "$CLASSES" ]]; then
         mirror_log "$SEG_LOG"
         stage_end
     fi
+    check_stop_after_stage 3
 fi
 
 # ── Stage 4: stage GenRecon scene dir(s) ──
@@ -384,6 +401,7 @@ if [[ "$START_FROM_STAGE" -le 4 ]]; then
 else
     log "Stage 4: skipped (--start-from-stage ${START_FROM_STAGE}), assuming existing ${SCENE_DIR}"
 fi
+check_stop_after_stage 4
 
 # ── Stage 5: GenRecon reconstruction + GLB bake (exp2 settings) ──
 cd "$GENRECON_DIR"
@@ -399,8 +417,8 @@ if [[ "$START_FROM_STAGE" -le 5 ]]; then
     if [[ -n "$MAX_INFLATED_VOXELS" ]]; then
         RECON_VRAM_ARGS+=(--max_inflated_voxels "$MAX_INFLATED_VOXELS")
     fi
-    if [[ -n "$FIX_NUM_CHUNKS" ]]; then
-        RECON_VRAM_ARGS+=(--fix_num_chunks "$FIX_NUM_CHUNKS")
+    if [[ -n "$FIX_NUM_VOXELS" ]]; then
+        RECON_VRAM_ARGS+=(--fix_num_chunks "$FIX_NUM_VOXELS")
     fi
 
     # Excludes each segmented class's object from generation itself (voxel-level
@@ -435,6 +453,7 @@ if [[ "$START_FROM_STAGE" -le 5 ]]; then
 else
     log "Stage 5: skipped (--start-from-stage ${START_FROM_STAGE})"
 fi
+check_stop_after_stage 5
 
 # ── Stage 6: reprojection validation ──
 if [[ "$START_FROM_STAGE" -le 6 ]]; then
@@ -457,6 +476,7 @@ if [[ "$START_FROM_STAGE" -le 6 ]]; then
 else
     log "Stage 6: skipped (--start-from-stage ${START_FROM_STAGE})"
 fi
+check_stop_after_stage 6
 
 # ── Stage 7: collect shapes (reconstructed mesh + per-class point clouds) ──
 SHAPES_DIR="${OUTPUT_DIR}/shapes"
@@ -471,6 +491,7 @@ if [[ "$START_FROM_STAGE" -le 7 ]]; then
 else
     log "Stage 7: skipped (--start-from-stage ${START_FROM_STAGE}), assuming existing ${SHAPES_DIR}"
 fi
+check_stop_after_stage 7
 
 # ── Stage 8 (optional): per-object mesh extraction (cascading convex hull crop) ──
 # Crops each class's object out of the scene mesh in turn, using its point
@@ -529,6 +550,7 @@ if [[ -n "$CLASSES" && "$START_FROM_STAGE" -le 8 ]]; then
     mirror_log "${OUTPUT_DIR}/reconstruct.log"
     stage_end
 fi
+check_stop_after_stage 8
 
 # ── Stage 9/10/11 (optional): per-object mesh -> GLB -> physics-ready USD -> composed scene ──
 # Only the *_mesh.ply crops from Stage 8 are converted (never the whole-scene
@@ -548,6 +570,7 @@ if [[ "$RUN_USD" -eq 1 ]]; then
     else
         log "Stage 9: skipped (--start-from-stage ${START_FROM_STAGE})"
     fi
+    check_stop_after_stage 9
 
     if [[ "$START_FROM_STAGE" -le 10 ]]; then
         stage_start "Stage 10: convert_asset.py (collision_approximation=${COLLISION_APPROXIMATION}) -> ${SHAPES_DIR}/glb/<label>/asset.usd"
@@ -565,6 +588,7 @@ if [[ "$RUN_USD" -eq 1 ]]; then
     else
         log "Stage 10: skipped (--start-from-stage ${START_FROM_STAGE})"
     fi
+    check_stop_after_stage 10
 
     if [[ "$START_FROM_STAGE" -le 11 ]]; then
         stage_start "Stage 11: compose_isaac_scene.py -> ${SHAPES_DIR}/glb/scene.usda"
@@ -584,6 +608,7 @@ if [[ "$RUN_USD" -eq 1 ]]; then
     else
         log "Stage 11: skipped (--start-from-stage ${START_FROM_STAGE})"
     fi
+    check_stop_after_stage 11
 fi
 
 if [[ "$RUN_GLB" -eq 1 && "$START_FROM_STAGE" -le 12 ]]; then
@@ -612,6 +637,35 @@ else
     log "--run_glb not set, skipping GLB bake."
     log "Done: ${SHAPES_DIR}/mesh.ply"
 fi
+
+# ── Stage 13 (optional): organize final per-object deliverables ──
+# Copies the background point-cloud/mesh plus, per class, the detection
+# preview, point cloud, cropped mesh, TRELLIS.2 input image and TRELLIS.2
+# mesh (if --run_trellis2 was used) into one self-contained final_objects/
+# folder -- only meaningful when --classes was set (otherwise there's no
+# per-object split, just a single whole-scene mesh.ply).
+FINAL_OBJECTS_DIR="${RUN_DIR}/final_objects"
+if [[ -n "$CLASSES" && "$START_FROM_STAGE" -le 13 ]]; then
+    stage_start "Stage 13: organizing final objects -> ${FINAL_OBJECTS_DIR}"
+    log_debug_config "stage13_organize_final_objects" "${GENRECON_DIR}/scripts/organize_final_objects.py" "$GENRECON_DIR" \
+        --shapes_dir "$SHAPES_DIR" \
+        --segmentation_raw_dir "${OUTPUT_DIR}/segmentation_raw" \
+        --trellis2_input_dir "${RUN_DIR}/trellis2_input" \
+        --trellis2_meshes_dir "${RUN_DIR}/trellis2_meshes" \
+        --out_dir "$FINAL_OBJECTS_DIR"
+    uv run python -u scripts/organize_final_objects.py \
+        --shapes_dir "$SHAPES_DIR" \
+        --segmentation_raw_dir "${OUTPUT_DIR}/segmentation_raw" \
+        --trellis2_input_dir "${RUN_DIR}/trellis2_input" \
+        --trellis2_meshes_dir "${RUN_DIR}/trellis2_meshes" \
+        --out_dir "$FINAL_OBJECTS_DIR" \
+        >> "${OUTPUT_DIR}/reconstruct.log" 2>&1
+    mirror_log "${OUTPUT_DIR}/reconstruct.log"
+    stage_end
+else
+    log "Stage 13: skipped (no --classes, or --start-from-stage ${START_FROM_STAGE})"
+fi
+check_stop_after_stage 13
 
 PIPELINE_ELAPSED=$(( $(date +%s) - PIPELINE_T0 ))
 log "Pipeline finished for scene '${SCENE_NAME}' (total elapsed $(format_duration "$PIPELINE_ELAPSED"))"

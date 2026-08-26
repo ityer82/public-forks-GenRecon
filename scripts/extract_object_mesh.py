@@ -378,10 +378,10 @@ def main():
         skip("no mesh faces fell inside the padded hull.")
         return
 
-    try:
-        object_vertex, object_faces = repair_object_mesh(object_vertex, object_faces)
-    except Exception as e:
-        logger.warning(f"{args.object_ply}: mesh repair failed ({e}); writing the unrepaired crop instead.")
+    # try:
+    #     object_vertex, object_faces = repair_object_mesh(object_vertex, object_faces)
+    # except Exception as e:
+    #     logger.warning(f"{args.object_ply}: mesh repair failed ({e}); writing the unrepaired crop instead.")
 
     write_cropped_ply(args.out_ply, object_vertex, object_faces)
     logger.info(f"Wrote {args.out_ply}: {len(object_vertex)} vertices, {len(object_faces)} faces.")
