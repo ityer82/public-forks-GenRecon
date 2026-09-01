@@ -2,7 +2,7 @@
 # End-to-end pipeline: VGGT-Omega pose/depth prediction -> [optional COB-GS 3D segmentation] -> GenRecon reconstruction -> GLB bake.
 #
 # Usage:
-#   ./run_full_pipeline.sh <image_folder> <scene_name> [--simplify_threshold N] [--texture_size N] [--num_imgs_per_scene N] [--skip-frames N] [--no-align-to-gravity] [--rotate-horizontal-deg N] [--classes a,b,c] [--run_glb] [--run_trellis2] [--skip_isaac] [--collision_approximation convexDecomposition|convexHull|boundingCube] [--start-from-stage N] [--stop-after-stage N] [--max_chunks_per_group N] [--max_inflated_voxels N] [--depth_conf_thres N] [--depth_edge_rtol N] [--fix_num_voxels N]
+#   ./run_full_pipeline.sh <image_folder> <scene_name> [--simplify_threshold N] [--texture_size N] [--num_imgs_per_scene N] [--skip-frames N] [--no-align-to-gravity] [--rotate-horizontal-deg N] [--classes a,b,c] [--run_glb] [--use-trellis] [--skip_isaac] [--collision_approximation convexDecomposition|convexHull|boundingCube] [--start-from-stage N] [--stop-after-stage N] [--max_chunks_per_group N] [--max_inflated_voxels N] [--depth_conf_thres N] [--depth_edge_rtol N] [--fix_num_voxels N]
 #
 # Note: gravity alignment is ON by default; pass --no-align-to-gravity to disable it.
 #
@@ -11,7 +11,7 @@
 #   ./run_full_pipeline.sh /home/gabis/Work/GitHub/COB-GS/dataset/food2/images food2_vggt --run_glb
 #   ./run_full_pipeline.sh /home/gabis/Work/GitHub/COB-GS/dataset/food2/images food2_vggt --align-to-gravity --rotate-horizontal-deg 90
 #   ./run_full_pipeline.sh /home/gabis/Work/GitHub/COB-GS/dataset/food2/images food2_vggt --classes "person,chair,bag"
-#   ./run_full_pipeline.sh /home/gabis/Work/GitHub/COB-GS/dataset/food2/images food2_vggt --classes "person,chair,bag" --run_trellis2
+#   ./run_full_pipeline.sh /home/gabis/Work/GitHub/COB-GS/dataset/food2/images food2_vggt --classes "person,chair,bag" --use-trellis
 
 set -euo pipefail
 
@@ -47,7 +47,7 @@ TEXTURE_SIZE=2048
 NUM_IMGS_PER_SCENE=32
 VGGT_EXPORT_TIMEOUT=1800
 RUN_GLB=0
-RUN_TRELLIS2=0
+USE_TRELLIS=0
 RUN_USD=1
 COLLISION_APPROXIMATION="convexDecomposition"
 SKIP_FRAMES=-1
@@ -63,7 +63,7 @@ DEPTH_EDGE_RTOL=0.03
 FIX_NUM_VOXELS=16
 
 if [[ $# -lt 2 ]]; then
-    echo "Usage: $0 <image_folder> <scene_name> [--simplify_threshold N] [--texture_size N] [--num_imgs_per_scene N] [--skip-frames N] [--no-align-to-gravity] [--rotate-horizontal-deg N] [--classes a,b,c] [--run_glb] [--run_trellis2] [--skip_isaac] [--collision_approximation convexDecomposition|convexHull|boundingCube] [--start-from-stage N] [--stop-after-stage N] [--max_chunks_per_group N] [--max_inflated_voxels N] [--depth_conf_thres N] [--depth_edge_rtol N] [--fix_num_voxels N]" >&2
+    echo "Usage: $0 <image_folder> <scene_name> [--simplify_threshold N] [--texture_size N] [--num_imgs_per_scene N] [--skip-frames N] [--no-align-to-gravity] [--rotate-horizontal-deg N] [--classes a,b,c] [--run_glb] [--use-trellis] [--skip_isaac] [--collision_approximation convexDecomposition|convexHull|boundingCube] [--start-from-stage N] [--stop-after-stage N] [--max_chunks_per_group N] [--max_inflated_voxels N] [--depth_conf_thres N] [--depth_edge_rtol N] [--fix_num_voxels N]" >&2
     exit 1
 fi
 
@@ -82,7 +82,7 @@ while [[ $# -gt 0 ]]; do
         --rotate-horizontal-deg) ROTATE_HORIZONTAL_DEG="$2"; shift 2 ;;
         --classes) CLASSES="$2"; shift 2 ;;
         --run_glb) RUN_GLB=1; shift 1 ;;
-        --run_trellis2) RUN_TRELLIS2=1; shift 1 ;;
+        --use-trellis) USE_TRELLIS=1; shift 1 ;;
         --skip_isaac) RUN_USD=0; shift 1 ;;
         --collision_approximation) COLLISION_APPROXIMATION="$2"; shift 2 ;;
         --start-from-stage) START_FROM_STAGE="$2"; shift 2 ;;
@@ -98,6 +98,11 @@ done
 
 if [[ ! -d "$IMAGE_FOLDER" ]]; then
     echo "Image folder not found: $IMAGE_FOLDER" >&2
+    exit 1
+fi
+
+if [[ "$USE_TRELLIS" -eq 1 && -z "$CLASSES" ]]; then
+    echo "--use-trellis requires --classes (TRELLIS.2 reconstruction is per-class)." >&2
     exit 1
 fi
 
@@ -350,7 +355,7 @@ if [[ -n "$CLASSES" ]]; then
     check_stop_after_stage 2
 
     # ── Stage 3 (optional): TRELLIS.2 3D reconstruction per class ──
-    if [[ "$RUN_TRELLIS2" -eq 1 && "$START_FROM_STAGE" -le 3 ]]; then
+    if [[ "$USE_TRELLIS" -eq 1 && "$START_FROM_STAGE" -le 3 ]]; then
         stage_start "Stage 3: TRELLIS.2 reconstruction -> ${RUN_DIR}/trellis2_meshes"
         TRELLIS2_INPUT_DIR="${RUN_DIR}/trellis2_input"
         TRELLIS2_OUTPUT_DIR="${RUN_DIR}/trellis2_meshes"
@@ -557,7 +562,11 @@ check_stop_after_stage 8
 # mesh.ply, and never the plain per-class point clouds like chair.ply/background.ply).
 if [[ "$RUN_USD" -eq 1 ]]; then
     if [[ "$START_FROM_STAGE" -le 9 ]]; then
-        stage_start "Stage 9: mesh_to_glb.py -> ${SHAPES_DIR}/glb"
+        if [[ "$USE_TRELLIS" -eq 1 ]]; then
+            stage_start "Stage 9: mesh_to_glb.py -> ${SHAPES_DIR}/glb (+ TRELLIS.2 substitution)"
+        else
+            stage_start "Stage 9: mesh_to_glb.py -> ${SHAPES_DIR}/glb"
+        fi
         log_debug_config "stage9_mesh_to_glb" "${GENRECON_DIR}/scripts/mesh_to_glb.py" "$GENRECON_DIR" \
             --shapes_dir "$SHAPES_DIR" \
             --out_dir "${SHAPES_DIR}/glb"
@@ -566,6 +575,41 @@ if [[ "$RUN_USD" -eq 1 ]]; then
             --out_dir "${SHAPES_DIR}/glb" \
             > "${OUTPUT_DIR}/mesh_to_glb.log" 2>&1
         mirror_log "${OUTPUT_DIR}/mesh_to_glb.log"
+
+        # --use-trellis: swap the crop-based glb produced above for the
+        # TRELLIS.2 reconstruction, rescaled/translated (no rotation search)
+        # into the scene's world frame by align_trellis2_mesh_to_scene.py,
+        # for every class that has both a trellis mesh and a scene crop.
+        # Stage 10/11 only ever move an asset by a pure translation derived
+        # from its own glb bbox (no external pose file), so overwriting
+        # <label>/mesh.glb in place here is a drop-in substitution -- no
+        # changes needed downstream. background is never substituted (no
+        # TRELLIS.2 reconstruction exists for it).
+        if [[ "$USE_TRELLIS" -eq 1 ]]; then
+            IFS=',' read -ra USE_TRELLIS_CLASSES <<< "$CLASSES"
+            for label in "${USE_TRELLIS_CLASSES[@]}"; do
+                TRELLIS_LABEL_GLB="${RUN_DIR}/trellis2_meshes/${label}/mesh.glb"
+                SCENE_CROP_PLY="${SHAPES_DIR}/${label}_mesh.ply"
+                if [[ ! -f "$TRELLIS_LABEL_GLB" ]]; then
+                    log "Stage 9: --use-trellis: no TRELLIS.2 mesh for '${label}' at ${TRELLIS_LABEL_GLB}, keeping scene-crop glb."
+                    continue
+                fi
+                if [[ ! -f "$SCENE_CROP_PLY" ]]; then
+                    log "Stage 9: --use-trellis: no scene crop for '${label}' at ${SCENE_CROP_PLY}, keeping scene-crop glb."
+                    continue
+                fi
+                log_debug_config "stage9_align_trellis2_mesh_${label}" "${GENRECON_DIR}/scripts/align_trellis2_mesh_to_scene.py" "$GENRECON_DIR" \
+                    --trellis_glb "$TRELLIS_LABEL_GLB" \
+                    --scene_mesh_ply "$SCENE_CROP_PLY" \
+                    --out_glb "${SHAPES_DIR}/glb/${label}/mesh.glb"
+                uv run python -u scripts/align_trellis2_mesh_to_scene.py \
+                    --trellis_glb "$TRELLIS_LABEL_GLB" \
+                    --scene_mesh_ply "$SCENE_CROP_PLY" \
+                    --out_glb "${SHAPES_DIR}/glb/${label}/mesh.glb" \
+                    >> "${OUTPUT_DIR}/mesh_to_glb.log" 2>&1
+            done
+            mirror_log "${OUTPUT_DIR}/mesh_to_glb.log"
+        fi
         stage_end
     else
         log "Stage 9: skipped (--start-from-stage ${START_FROM_STAGE})"
@@ -641,7 +685,7 @@ fi
 # ── Stage 13 (optional): organize final per-object deliverables ──
 # Copies the background point-cloud/mesh plus, per class, the detection
 # preview, point cloud, cropped mesh, TRELLIS.2 input image and TRELLIS.2
-# mesh (if --run_trellis2 was used) into one self-contained final_objects/
+# mesh (if --use-trellis was used) into one self-contained final_objects/
 # folder -- only meaningful when --classes was set (otherwise there's no
 # per-object split, just a single whole-scene mesh.ply).
 FINAL_OBJECTS_DIR="${RUN_DIR}/final_objects"
