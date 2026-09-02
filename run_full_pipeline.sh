@@ -557,17 +557,44 @@ if [[ -n "$CLASSES" && "$START_FROM_STAGE" -le 8 ]]; then
 fi
 check_stop_after_stage 8
 
-# ── Stage 9/10/11 (optional): per-object mesh -> GLB -> physics-ready USD -> composed scene ──
-# Only the *_mesh.ply crops from Stage 8 are converted (never the whole-scene
+# ── Stage 9 (optional): floor segmentation ──
+# Splits the flat floor region out of background_mesh.ply into its own asset
+# (floor_mesh.ply) so Stage 11 (convert_asset.py) can give it an analytic-plane
+# collider -- the same mechanism that makes the synthetic ground-plane safety
+# net reliable -- instead of the rest of the background's decimated
+# meshSimplification triangle-mesh proxy, which is what lets objects fall
+# through the visible floor. Only meaningful once a background_mesh.ply exists
+# (i.e. --classes was set); background_mesh.ply is overwritten in place with
+# the floor removed, chaining the same way Stage 8's per-class crops do.
+if [[ -n "$CLASSES" && "$START_FROM_STAGE" -le 9 ]]; then
+    stage_start "Stage 9: extract_floor_mesh.py -> ${SHAPES_DIR}/floor_mesh.ply"
+    log_debug_config "stage9_extract_floor_mesh" "${GENRECON_DIR}/scripts/extract_floor_mesh.py" "$GENRECON_DIR" \
+        --mesh_ply "${SHAPES_DIR}/background_mesh.ply" \
+        --out_ply "${SHAPES_DIR}/floor_mesh.ply" \
+        --remainder_out_ply "${SHAPES_DIR}/background_mesh.ply"
+    uv run python -u scripts/extract_floor_mesh.py \
+        --mesh_ply "${SHAPES_DIR}/background_mesh.ply" \
+        --out_ply "${SHAPES_DIR}/floor_mesh.ply" \
+        --remainder_out_ply "${SHAPES_DIR}/background_mesh.ply" \
+        >> "${OUTPUT_DIR}/reconstruct.log" 2>&1
+    mirror_log "${OUTPUT_DIR}/reconstruct.log"
+    stage_end
+else
+    log "Stage 9: skipped (no --classes, or --start-from-stage ${START_FROM_STAGE})"
+fi
+check_stop_after_stage 9
+
+# ── Stage 10/11/12 (optional): per-object mesh -> GLB -> physics-ready USD -> composed scene ──
+# Only the *_mesh.ply crops from Stage 8/9 are converted (never the whole-scene
 # mesh.ply, and never the plain per-class point clouds like chair.ply/background.ply).
 if [[ "$RUN_USD" -eq 1 ]]; then
-    if [[ "$START_FROM_STAGE" -le 9 ]]; then
+    if [[ "$START_FROM_STAGE" -le 10 ]]; then
         if [[ "$USE_TRELLIS" -eq 1 ]]; then
-            stage_start "Stage 9: mesh_to_glb.py -> ${SHAPES_DIR}/glb (+ TRELLIS.2 substitution)"
+            stage_start "Stage 10: mesh_to_glb.py -> ${SHAPES_DIR}/glb (+ TRELLIS.2 substitution)"
         else
-            stage_start "Stage 9: mesh_to_glb.py -> ${SHAPES_DIR}/glb"
+            stage_start "Stage 10: mesh_to_glb.py -> ${SHAPES_DIR}/glb"
         fi
-        log_debug_config "stage9_mesh_to_glb" "${GENRECON_DIR}/scripts/mesh_to_glb.py" "$GENRECON_DIR" \
+        log_debug_config "stage10_mesh_to_glb" "${GENRECON_DIR}/scripts/mesh_to_glb.py" "$GENRECON_DIR" \
             --shapes_dir "$SHAPES_DIR" \
             --out_dir "${SHAPES_DIR}/glb"
         uv run python -u scripts/mesh_to_glb.py \
@@ -580,7 +607,7 @@ if [[ "$RUN_USD" -eq 1 ]]; then
         # TRELLIS.2 reconstruction, rescaled/translated (no rotation search)
         # into the scene's world frame by align_trellis2_mesh_to_scene.py,
         # for every class that has both a trellis mesh and a scene crop.
-        # Stage 10/11 only ever move an asset by a pure translation derived
+        # Stage 11/12 only ever move an asset by a pure translation derived
         # from its own glb bbox (no external pose file), so overwriting
         # <label>/mesh.glb in place here is a drop-in substitution -- no
         # changes needed downstream. background is never substituted (no
@@ -591,14 +618,14 @@ if [[ "$RUN_USD" -eq 1 ]]; then
                 TRELLIS_LABEL_GLB="${RUN_DIR}/trellis2_meshes/${label}/mesh.glb"
                 SCENE_CROP_PLY="${SHAPES_DIR}/${label}_mesh.ply"
                 if [[ ! -f "$TRELLIS_LABEL_GLB" ]]; then
-                    log "Stage 9: --use-trellis: no TRELLIS.2 mesh for '${label}' at ${TRELLIS_LABEL_GLB}, keeping scene-crop glb."
+                    log "Stage 10: --use-trellis: no TRELLIS.2 mesh for '${label}' at ${TRELLIS_LABEL_GLB}, keeping scene-crop glb."
                     continue
                 fi
                 if [[ ! -f "$SCENE_CROP_PLY" ]]; then
-                    log "Stage 9: --use-trellis: no scene crop for '${label}' at ${SCENE_CROP_PLY}, keeping scene-crop glb."
+                    log "Stage 10: --use-trellis: no scene crop for '${label}' at ${SCENE_CROP_PLY}, keeping scene-crop glb."
                     continue
                 fi
-                log_debug_config "stage9_align_trellis2_mesh_${label}" "${GENRECON_DIR}/scripts/align_trellis2_mesh_to_scene.py" "$GENRECON_DIR" \
+                log_debug_config "stage10_align_trellis2_mesh_${label}" "${GENRECON_DIR}/scripts/align_trellis2_mesh_to_scene.py" "$GENRECON_DIR" \
                     --trellis_glb "$TRELLIS_LABEL_GLB" \
                     --scene_mesh_ply "$SCENE_CROP_PLY" \
                     --out_glb "${SHAPES_DIR}/glb/${label}/mesh.glb"
@@ -612,13 +639,13 @@ if [[ "$RUN_USD" -eq 1 ]]; then
         fi
         stage_end
     else
-        log "Stage 9: skipped (--start-from-stage ${START_FROM_STAGE})"
+        log "Stage 10: skipped (--start-from-stage ${START_FROM_STAGE})"
     fi
-    check_stop_after_stage 9
+    check_stop_after_stage 10
 
-    if [[ "$START_FROM_STAGE" -le 10 ]]; then
-        stage_start "Stage 10: convert_asset.py (collision_approximation=${COLLISION_APPROXIMATION}) -> ${SHAPES_DIR}/glb/<label>/asset.usd"
-        log_debug_config "stage10_convert_asset" "${ISAACSIM_DIR}/convert_asset.py" "$ISAACSIM_DIR" \
+    if [[ "$START_FROM_STAGE" -le 11 ]]; then
+        stage_start "Stage 11: convert_asset.py (collision_approximation=${COLLISION_APPROXIMATION}) -> ${SHAPES_DIR}/glb/<label>/asset.usd"
+        log_debug_config "stage11_convert_asset" "${ISAACSIM_DIR}/convert_asset.py" "$ISAACSIM_DIR" \
             --input "${SHAPES_DIR}/glb" \
             --collision-approximation "$COLLISION_APPROXIMATION"
         (
@@ -630,13 +657,13 @@ if [[ "$RUN_USD" -eq 1 ]]; then
         mirror_log "${OUTPUT_DIR}/convert_asset.log"
         stage_end
     else
-        log "Stage 10: skipped (--start-from-stage ${START_FROM_STAGE})"
+        log "Stage 11: skipped (--start-from-stage ${START_FROM_STAGE})"
     fi
-    check_stop_after_stage 10
+    check_stop_after_stage 11
 
-    if [[ "$START_FROM_STAGE" -le 11 ]]; then
-        stage_start "Stage 11: compose_isaac_scene.py -> ${SHAPES_DIR}/glb/scene.usda"
-        log_debug_config "stage11_compose_isaac_scene" "${ISAACSIM_DIR}/compose_isaac_scene.py" "$ISAACSIM_DIR" \
+    if [[ "$START_FROM_STAGE" -le 12 ]]; then
+        stage_start "Stage 12: compose_isaac_scene.py -> ${SHAPES_DIR}/glb/scene.usda"
+        log_debug_config "stage12_compose_isaac_scene" "${ISAACSIM_DIR}/compose_isaac_scene.py" "$ISAACSIM_DIR" \
             --input "${SHAPES_DIR}/glb" \
             --output "${SHAPES_DIR}/glb/scene.usda" \
             --background-label background
@@ -650,14 +677,14 @@ if [[ "$RUN_USD" -eq 1 ]]; then
         mirror_log "${OUTPUT_DIR}/compose_isaac_scene.log"
         stage_end
     else
-        log "Stage 11: skipped (--start-from-stage ${START_FROM_STAGE})"
+        log "Stage 12: skipped (--start-from-stage ${START_FROM_STAGE})"
     fi
-    check_stop_after_stage 11
+    check_stop_after_stage 12
 fi
 
-if [[ "$RUN_GLB" -eq 1 && "$START_FROM_STAGE" -le 12 ]]; then
-    stage_start "Stage 12: chunked_to_glb.py (simplify_threshold=${SIMPLIFY_THRESHOLD}, texture_size=${TEXTURE_SIZE})"
-    log_debug_config "stage12_chunked_to_glb" "${GENRECON_DIR}/chunked_to_glb.py" "$GENRECON_DIR" \
+if [[ "$RUN_GLB" -eq 1 && "$START_FROM_STAGE" -le 13 ]]; then
+    stage_start "Stage 13: chunked_to_glb.py (simplify_threshold=${SIMPLIFY_THRESHOLD}, texture_size=${TEXTURE_SIZE})"
+    log_debug_config "stage13_chunked_to_glb" "${GENRECON_DIR}/chunked_to_glb.py" "$GENRECON_DIR" \
         --inputs "${OUTPUT_DIR}/to_glb_inputs.pt" \
         --chunk_inputs "${OUTPUT_DIR}/chunk_inputs.pt" \
         --output_dir "$OUTPUT_DIR" \
@@ -675,23 +702,23 @@ if [[ "$RUN_GLB" -eq 1 && "$START_FROM_STAGE" -le 12 ]]; then
 
     log "Done: ${OUTPUT_DIR}/scene.glb"
 elif [[ "$RUN_GLB" -eq 1 ]]; then
-    log "Stage 12: skipped (--start-from-stage ${START_FROM_STAGE})"
+    log "Stage 13: skipped (--start-from-stage ${START_FROM_STAGE})"
     log "Done: ${SHAPES_DIR}/mesh.ply"
 else
     log "--run_glb not set, skipping GLB bake."
     log "Done: ${SHAPES_DIR}/mesh.ply"
 fi
 
-# ── Stage 13 (optional): organize final per-object deliverables ──
+# ── Stage 14 (optional): organize final per-object deliverables ──
 # Copies the background point-cloud/mesh plus, per class, the detection
 # preview, point cloud, cropped mesh, TRELLIS.2 input image and TRELLIS.2
 # mesh (if --use-trellis was used) into one self-contained final_objects/
 # folder -- only meaningful when --classes was set (otherwise there's no
 # per-object split, just a single whole-scene mesh.ply).
 FINAL_OBJECTS_DIR="${RUN_DIR}/final_objects"
-if [[ -n "$CLASSES" && "$START_FROM_STAGE" -le 13 ]]; then
-    stage_start "Stage 13: organizing final objects -> ${FINAL_OBJECTS_DIR}"
-    log_debug_config "stage13_organize_final_objects" "${GENRECON_DIR}/scripts/organize_final_objects.py" "$GENRECON_DIR" \
+if [[ -n "$CLASSES" && "$START_FROM_STAGE" -le 14 ]]; then
+    stage_start "Stage 14: organizing final objects -> ${FINAL_OBJECTS_DIR}"
+    log_debug_config "stage14_organize_final_objects" "${GENRECON_DIR}/scripts/organize_final_objects.py" "$GENRECON_DIR" \
         --shapes_dir "$SHAPES_DIR" \
         --segmentation_raw_dir "${OUTPUT_DIR}/segmentation_raw" \
         --trellis2_input_dir "${RUN_DIR}/trellis2_input" \
@@ -707,9 +734,9 @@ if [[ -n "$CLASSES" && "$START_FROM_STAGE" -le 13 ]]; then
     mirror_log "${OUTPUT_DIR}/reconstruct.log"
     stage_end
 else
-    log "Stage 13: skipped (no --classes, or --start-from-stage ${START_FROM_STAGE})"
+    log "Stage 14: skipped (no --classes, or --start-from-stage ${START_FROM_STAGE})"
 fi
-check_stop_after_stage 13
+check_stop_after_stage 14
 
 PIPELINE_ELAPSED=$(( $(date +%s) - PIPELINE_T0 ))
 log "Pipeline finished for scene '${SCENE_NAME}' (total elapsed $(format_duration "$PIPELINE_ELAPSED"))"
