@@ -193,7 +193,7 @@ def _build_exclude_equations(
 
     world_hulls: list[np.ndarray] = []
     for label, dirname in labels.items():
-        object_ply = masks_root / dirname / "point_cloud" / f"{label}.ply"
+        object_ply = masks_root / dirname / "point_cloud" / f"{dirname}.ply"
         masks_dir = masks_root / dirname / "mask_bin"
         if not object_ply.exists():
             logger.warning(f"exclude_equations: {object_ply} not found, skipping class {label!r}.")

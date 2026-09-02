@@ -36,10 +36,22 @@ def padded_hull_vertices(points: np.ndarray, padding: float) -> np.ndarray:
     Padding moves facet planes, not the original points, so the padded
     polytope's vertices must be re-derived from the offset half-spaces
     rather than just nudging `points` outward.
+
+    For a thin/sparse point set, shrinking inward (padding < 0) can push the
+    hull's mean-point interior reference outside the offset half-spaces,
+    raising a Qhull "feasible point is not clearly inside halfspace" error.
+    If that happens and `padding` is negative, retry once at padding=0.0
+    (no shrink) instead of failing outright.
     """
     equations = padded_hull_equations(points, padding)
     interior_point = points.mean(axis=0)
-    hs = HalfspaceIntersection(equations, interior_point)
+    try:
+        hs = HalfspaceIntersection(equations, interior_point)
+    except QhullError:
+        if padding >= 0.0:
+            raise
+        equations = padded_hull_equations(points, 0.0)
+        hs = HalfspaceIntersection(equations, interior_point)
     return hs.intersections
 
 
@@ -138,10 +150,18 @@ def search_hull_padding(
     if score(padding_max) <= max_overshoot:
         return padding_max
     if score(padding_min) > max_overshoot:
+        # padding_min is meant to shrink the hull toward the mask; for a
+        # small/sparse-point object it can shrink it enough to enclose no
+        # real geometry at all (verified: 0 scene-mesh vertices survive at
+        # padding_min for a couple of small classes here), which guarantees
+        # downstream crop failure regardless of overshoot. Falling back to
+        # 0.0 (the raw, unshrunk hull) instead keeps a hull that still
+        # contains real geometry, at the cost of a looser silhouette fit.
         logger.warning(
-            f"Even --hull_padding_min={padding_min} overshoots masks in {masks_dir}; using it as-is."
+            f"Even --hull_padding_min={padding_min} overshoots masks in {masks_dir}; "
+            "falling back to padding=0.0 instead (unshrunk hull) to avoid collapsing it."
         )
-        return padding_min
+        return 0.0
 
     lo, hi = padding_min, padding_max
     for _ in range(iters):

@@ -46,13 +46,16 @@ def organize_final_objects(
     labels_json = segmentation_raw_dir / "masks" / "classes" / "labels.json"
     labels = json.loads(labels_json.read_text())
 
-    for label in labels:
+    for label, dirname in labels.items():
         class_dir = out_dir / label
         class_dir.mkdir(parents=True, exist_ok=True)
 
-        _copy(segmentation_raw_dir / f"detection_{label}.png", class_dir / "detection.png", label, "detection")
-        _copy(shapes_dir / f"{label}.ply", class_dir / "pointcloud.ply", label, "point cloud")
-        _copy(shapes_dir / f"{label}_mesh.ply", class_dir / "mesh.ply", label, "mesh")
+        # shapes_dir/segmentation_raw_dir artifacts are keyed by the sanitized
+        # `dirname` (e.g. "plastic_cup"); trellis2_input_dir/trellis2_meshes_dir
+        # are keyed by the raw `label` (e.g. "plastic cup") -- see labels.json.
+        _copy(segmentation_raw_dir / f"detection_{dirname}.png", class_dir / "detection.png", label, "detection")
+        _copy(shapes_dir / f"{dirname}.ply", class_dir / "pointcloud.ply", label, "point cloud")
+        _copy(shapes_dir / f"{dirname}_mesh.ply", class_dir / "mesh.ply", label, "mesh")
         _copy(trellis2_input_dir / f"{label}.png", class_dir / "trellis_input.png", label, "trellis input")
 
         trellis_mesh = trellis2_meshes_dir / label / "mesh.glb"
