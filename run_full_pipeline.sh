@@ -2,7 +2,7 @@
 # End-to-end pipeline: VGGT-Omega pose/depth prediction -> [optional COB-GS 3D segmentation] -> GenRecon reconstruction -> GLB bake.
 #
 # Usage:
-#   ./run_full_pipeline.sh <image_folder> <scene_name> [--simplify_threshold N] [--texture_size N] [--num_imgs_per_scene N] [--skip-frames N] [--no-align-to-gravity] [--rotate-horizontal-deg N] [--classes a,b,c] [--run_glb] [--use-trellis] [--skip_isaac] [--collision_approximation convexDecomposition|convexHull|boundingCube] [--start-from-stage N] [--stop-after-stage N] [--max_chunks_per_group N] [--max_inflated_voxels N] [--depth_conf_thres N] [--depth_edge_rtol N] [--fix_num_voxels N]
+#   ./run_full_pipeline.sh <image_folder> <scene_name> [--simplify_threshold N] [--texture_size N] [--num_imgs_per_scene N] [--skip-frames N] [--no-align-to-gravity] [--rotate-horizontal-deg N] [--classes a,b,c] [--run_glb] [--use-trellis] [--skip_isaac] [--collision_approximation convexDecomposition|convexHull|boundingCube] [--start-from-stage N] [--stop-after-stage N] [--max_chunks_per_group N] [--max_inflated_voxels N] [--depth_conf_thres N] [--depth_edge_rtol N] [--fix_num_voxels N] [--robot-target LABEL]
 #
 # Note: gravity alignment is ON by default; pass --no-align-to-gravity to disable it.
 #
@@ -61,9 +61,10 @@ MAX_INFLATED_VOXELS=""
 DEPTH_CONF_THRES=50.0
 DEPTH_EDGE_RTOL=0.03
 FIX_NUM_VOXELS=16
+ROBOT_TARGET=""
 
 if [[ $# -lt 2 ]]; then
-    echo "Usage: $0 <image_folder> <scene_name> [--simplify_threshold N] [--texture_size N] [--num_imgs_per_scene N] [--skip-frames N] [--no-align-to-gravity] [--rotate-horizontal-deg N] [--classes a,b,c] [--run_glb] [--use-trellis] [--skip_isaac] [--collision_approximation convexDecomposition|convexHull|boundingCube] [--start-from-stage N] [--stop-after-stage N] [--max_chunks_per_group N] [--max_inflated_voxels N] [--depth_conf_thres N] [--depth_edge_rtol N] [--fix_num_voxels N]" >&2
+    echo "Usage: $0 <image_folder> <scene_name> [--simplify_threshold N] [--texture_size N] [--num_imgs_per_scene N] [--skip-frames N] [--no-align-to-gravity] [--rotate-horizontal-deg N] [--classes a,b,c] [--run_glb] [--use-trellis] [--skip_isaac] [--collision_approximation convexDecomposition|convexHull|boundingCube] [--start-from-stage N] [--stop-after-stage N] [--max_chunks_per_group N] [--max_inflated_voxels N] [--depth_conf_thres N] [--depth_edge_rtol N] [--fix_num_voxels N] [--robot-target LABEL]" >&2
     exit 1
 fi
 
@@ -92,6 +93,7 @@ while [[ $# -gt 0 ]]; do
         --depth_conf_thres) DEPTH_CONF_THRES="$2"; shift 2 ;;
         --depth_edge_rtol) DEPTH_EDGE_RTOL="$2"; shift 2 ;;
         --fix_num_voxels) FIX_NUM_VOXELS="$2"; shift 2 ;;
+        --robot-target) ROBOT_TARGET="$2"; shift 2 ;;
         *) echo "Unknown argument: $1" >&2; exit 1 ;;
     esac
 done
@@ -737,6 +739,33 @@ else
     log "Stage 14: skipped (no --classes, or --start-from-stage ${START_FROM_STAGE})"
 fi
 check_stop_after_stage 14
+
+# ── Stage 15 (optional): Isaac Sim robot-collision demo ──
+# Drives a Jetbot into --robot-target inside the composed scene.usda (Stage 12's
+# output) and records a collision proof video + a reusable pre-drive USD stage.
+# Runs by default once the USD scene exists and --robot-target is supplied
+# (RUN_USD=1 is itself the default; --skip_isaac disables it, same as Stage 11/12).
+if [[ "$RUN_USD" -eq 1 && -n "$ROBOT_TARGET" && "$START_FROM_STAGE" -le 15 ]]; then
+    stage_start "Stage 15: demo_robot_collide.py (robot_target=${ROBOT_TARGET}) -> ${OUTPUT_DIR}/robot_collide.mp4"
+    log_debug_config "stage15_demo_robot_collide" "${ISAACSIM_DIR}/demo_robot_collide.py" "$ISAACSIM_DIR" \
+        --scene "${SHAPES_DIR}/glb/scene.usda" \
+        --robot-target "$ROBOT_TARGET" \
+        --output "${OUTPUT_DIR}/robot_collide.mp4" \
+        --stage-output "${OUTPUT_DIR}/robot_collide_scene.usda"
+    (
+        cd "$ISAACSIM_DIR"
+        uv run demo_robot_collide.py \
+            --scene "${SHAPES_DIR}/glb/scene.usda" \
+            --robot-target "$ROBOT_TARGET" \
+            --output "${OUTPUT_DIR}/robot_collide.mp4" \
+            --stage-output "${OUTPUT_DIR}/robot_collide_scene.usda"
+    ) > "${OUTPUT_DIR}/robot_collide.log" 2>&1
+    mirror_log "${OUTPUT_DIR}/robot_collide.log"
+    stage_end
+else
+    log "Stage 15: skipped (no --robot-target, --skip_isaac, or --start-from-stage ${START_FROM_STAGE})"
+fi
+check_stop_after_stage 15
 
 PIPELINE_ELAPSED=$(( $(date +%s) - PIPELINE_T0 ))
 log "Pipeline finished for scene '${SCENE_NAME}' (total elapsed $(format_duration "$PIPELINE_ELAPSED"))"
