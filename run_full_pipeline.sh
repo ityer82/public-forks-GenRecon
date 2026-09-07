@@ -2,7 +2,7 @@
 # End-to-end pipeline: VGGT-Omega pose/depth prediction -> [optional COB-GS 3D segmentation] -> GenRecon reconstruction -> GLB bake.
 #
 # Usage:
-#   ./run_full_pipeline.sh <image_folder> <scene_name> [--simplify_threshold N] [--texture_size N] [--num_imgs_per_scene N] [--skip-frames N] [--no-align-to-gravity] [--rotate-horizontal-deg N] [--classes a,b,c] [--run_glb] [--use-trellis] [--skip_isaac] [--collision_approximation convexDecomposition|convexHull|boundingCube] [--start-from-stage N] [--stop-after-stage N] [--max_chunks_per_group N] [--max_inflated_voxels N] [--depth_conf_thres N] [--depth_edge_rtol N] [--fix_num_voxels N] [--robot-target LABEL]
+#   ./run_full_pipeline.sh <image_folder> <scene_name> [--simplify_threshold N] [--texture_size N] [--num_imgs_per_scene N] [--skip-frames N] [--no-align-to-gravity] [--rotate-horizontal-deg N] [--classes a,b,c] [--run_glb] [--use-trellis] [--skip_isaac] [--collision_approximation convexDecomposition|convexHull|boundingCube] [--friction-table-path PATH] [--ollama-model NAME] [--start-from-stage N] [--stop-after-stage N] [--max_chunks_per_group N] [--max_inflated_voxels N] [--depth_conf_thres N] [--depth_edge_rtol N] [--fix_num_voxels N] [--robot-target LABEL]
 #
 # Note: gravity alignment is ON by default; pass --no-align-to-gravity to disable it.
 #
@@ -50,6 +50,8 @@ RUN_GLB=0
 USE_TRELLIS=0
 RUN_USD=1
 COLLISION_APPROXIMATION="convexDecomposition"
+FRICTION_TABLE_PATH="${GENRECON_DIR}/configs/materials/friction_table.example.yaml"
+OLLAMA_MODEL="llama3.1:8b"
 SKIP_FRAMES=-1
 ALIGN_TO_GRAVITY=1
 ROTATE_HORIZONTAL_DEG=0.0
@@ -64,7 +66,7 @@ FIX_NUM_VOXELS=16
 ROBOT_TARGET=""
 
 if [[ $# -lt 2 ]]; then
-    echo "Usage: $0 <image_folder> <scene_name> [--simplify_threshold N] [--texture_size N] [--num_imgs_per_scene N] [--skip-frames N] [--no-align-to-gravity] [--rotate-horizontal-deg N] [--classes a,b,c] [--run_glb] [--use-trellis] [--skip_isaac] [--collision_approximation convexDecomposition|convexHull|boundingCube] [--start-from-stage N] [--stop-after-stage N] [--max_chunks_per_group N] [--max_inflated_voxels N] [--depth_conf_thres N] [--depth_edge_rtol N] [--fix_num_voxels N] [--robot-target LABEL]" >&2
+    echo "Usage: $0 <image_folder> <scene_name> [--simplify_threshold N] [--texture_size N] [--num_imgs_per_scene N] [--skip-frames N] [--no-align-to-gravity] [--rotate-horizontal-deg N] [--classes a,b,c] [--run_glb] [--use-trellis] [--skip_isaac] [--collision_approximation convexDecomposition|convexHull|boundingCube] [--friction-table-path PATH] [--ollama-model NAME] [--start-from-stage N] [--stop-after-stage N] [--max_chunks_per_group N] [--max_inflated_voxels N] [--depth_conf_thres N] [--depth_edge_rtol N] [--fix_num_voxels N] [--robot-target LABEL]" >&2
     exit 1
 fi
 
@@ -86,6 +88,8 @@ while [[ $# -gt 0 ]]; do
         --use-trellis) USE_TRELLIS=1; shift 1 ;;
         --skip_isaac) RUN_USD=0; shift 1 ;;
         --collision_approximation) COLLISION_APPROXIMATION="$2"; shift 2 ;;
+        --friction-table-path) FRICTION_TABLE_PATH="$2"; shift 2 ;;
+        --ollama-model) OLLAMA_MODEL="$2"; shift 2 ;;
         --start-from-stage) START_FROM_STAGE="$2"; shift 2 ;;
         --stop-after-stage) STOP_AFTER_STAGE="$2"; shift 2 ;;
         --max_chunks_per_group) MAX_CHUNKS_PER_GROUP="$2"; shift 2 ;;
@@ -580,6 +584,24 @@ if [[ -n "$CLASSES" && "$START_FROM_STAGE" -le 9 ]]; then
         --remainder_out_ply "${SHAPES_DIR}/background_mesh.ply" \
         >> "${OUTPUT_DIR}/reconstruct.log" 2>&1
     mirror_log "${OUTPUT_DIR}/reconstruct.log"
+
+    # Friction inference: a LangGraph agent (local Ollama LLM) maps each detected class
+    # label to a mu(material, floor) friction coefficient looked up from
+    # --friction-table-path's YAML reference table, so Stage 11 (convert_asset.py) can
+    # author true per-object friction instead of one global value for every asset.
+    stage_start "Stage 9: infer_friction_assignments.py -> ${SHAPES_DIR}/friction_assignments.json"
+    log_debug_config "stage9_infer_friction_assignments" "${GENRECON_DIR}/scripts/infer_friction_assignments.py" "$GENRECON_DIR" \
+        --labels_json "${COBGS_MASK_DIR}/labels.json" \
+        --friction_table "$FRICTION_TABLE_PATH" \
+        --out_json "${SHAPES_DIR}/friction_assignments.json" \
+        --ollama_model "$OLLAMA_MODEL"
+    uv run python -u scripts/infer_friction_assignments.py \
+        --labels_json "${COBGS_MASK_DIR}/labels.json" \
+        --friction_table "$FRICTION_TABLE_PATH" \
+        --out_json "${SHAPES_DIR}/friction_assignments.json" \
+        --ollama_model "$OLLAMA_MODEL" \
+        >> "${OUTPUT_DIR}/reconstruct.log" 2>&1
+    mirror_log "${OUTPUT_DIR}/reconstruct.log"
     stage_end
 else
     log "Stage 9: skipped (no --classes, or --start-from-stage ${START_FROM_STAGE})"
@@ -647,14 +669,23 @@ if [[ "$RUN_USD" -eq 1 ]]; then
 
     if [[ "$START_FROM_STAGE" -le 11 ]]; then
         stage_start "Stage 11: convert_asset.py (collision_approximation=${COLLISION_APPROXIMATION}) -> ${SHAPES_DIR}/glb/<label>/asset.usd"
+        # Only pass the friction table (and switch PhysX to frictionCombineMode=max) when
+        # Stage 9 actually produced one -- keeps the --skip_isaac/no-classes invocation
+        # byte-identical to before this feature existed.
+        CONVERT_ASSET_FRICTION_ARGS=()
+        if [[ -n "$CLASSES" && -f "${SHAPES_DIR}/friction_assignments.json" ]]; then
+            CONVERT_ASSET_FRICTION_ARGS=(--friction-table "${SHAPES_DIR}/friction_assignments.json" --friction-combine-mode max)
+        fi
         log_debug_config "stage11_convert_asset" "${ISAACSIM_DIR}/convert_asset.py" "$ISAACSIM_DIR" \
             --input "${SHAPES_DIR}/glb" \
-            --collision-approximation "$COLLISION_APPROXIMATION"
+            --collision-approximation "$COLLISION_APPROXIMATION" \
+            "${CONVERT_ASSET_FRICTION_ARGS[@]}"
         (
             cd "$ISAACSIM_DIR"
             uv run convert_asset.py \
                 --input "${SHAPES_DIR}/glb" \
-                --collision-approximation "$COLLISION_APPROXIMATION"
+                --collision-approximation "$COLLISION_APPROXIMATION" \
+                "${CONVERT_ASSET_FRICTION_ARGS[@]}"
         ) > "${OUTPUT_DIR}/convert_asset.log" 2>&1
         mirror_log "${OUTPUT_DIR}/convert_asset.log"
         stage_end
@@ -745,22 +776,24 @@ check_stop_after_stage 14
 # output) and records a collision proof video + a reusable pre-drive USD stage.
 # Runs by default once the USD scene exists and --robot-target is supplied
 # (RUN_USD=1 is itself the default; --skip_isaac disables it, same as Stage 11/12).
+ROBOT_COLLISION_DIR="${RUN_DIR}/robot_collision"
 if [[ "$RUN_USD" -eq 1 && -n "$ROBOT_TARGET" && "$START_FROM_STAGE" -le 15 ]]; then
-    stage_start "Stage 15: demo_robot_collide.py (robot_target=${ROBOT_TARGET}) -> ${OUTPUT_DIR}/robot_collide.mp4"
+    stage_start "Stage 15: demo_robot_collide.py (robot_target=${ROBOT_TARGET}) -> ${ROBOT_COLLISION_DIR}/robot_collide.mp4"
+    mkdir -p "$ROBOT_COLLISION_DIR"
     log_debug_config "stage15_demo_robot_collide" "${ISAACSIM_DIR}/demo_robot_collide.py" "$ISAACSIM_DIR" \
         --scene "${SHAPES_DIR}/glb/scene.usda" \
         --robot-target "$ROBOT_TARGET" \
-        --output "${OUTPUT_DIR}/robot_collide.mp4" \
-        --stage-output "${OUTPUT_DIR}/robot_collide_scene.usda"
+        --output "${ROBOT_COLLISION_DIR}/robot_collide.mp4" \
+        --stage-output "${ROBOT_COLLISION_DIR}/robot_collide_scene.usda"
     (
         cd "$ISAACSIM_DIR"
         uv run demo_robot_collide.py \
             --scene "${SHAPES_DIR}/glb/scene.usda" \
             --robot-target "$ROBOT_TARGET" \
-            --output "${OUTPUT_DIR}/robot_collide.mp4" \
-            --stage-output "${OUTPUT_DIR}/robot_collide_scene.usda"
-    ) > "${OUTPUT_DIR}/robot_collide.log" 2>&1
-    mirror_log "${OUTPUT_DIR}/robot_collide.log"
+            --output "${ROBOT_COLLISION_DIR}/robot_collide.mp4" \
+            --stage-output "${ROBOT_COLLISION_DIR}/robot_collide_scene.usda"
+    ) > "${ROBOT_COLLISION_DIR}/robot_collide.log" 2>&1
+    mirror_log "${ROBOT_COLLISION_DIR}/robot_collide.log"
     stage_end
 else
     log "Stage 15: skipped (no --robot-target, --skip_isaac, or --start-from-stage ${START_FROM_STAGE})"
