@@ -2,7 +2,7 @@
 # End-to-end pipeline: VGGT-Omega pose/depth prediction -> [optional COB-GS 3D segmentation] -> GenRecon reconstruction -> GLB bake.
 #
 # Usage:
-#   ./run_full_pipeline.sh <image_folder> <scene_name> [--simplify_threshold N] [--texture_size N] [--num_imgs_per_scene N] [--skip-frames N] [--no-align-to-gravity] [--rotate-horizontal-deg N] [--classes a,b,c] [--run_glb] [--use-trellis] [--skip_isaac] [--collision_approximation convexDecomposition|convexHull|boundingCube] [--friction-table-path PATH] [--ollama-model NAME] [--start-from-stage N] [--stop-after-stage N] [--max_chunks_per_group N] [--max_inflated_voxels N] [--depth_conf_thres N] [--depth_edge_rtol N] [--fix_num_voxels N] [--robot-target LABEL] [--skip_floater_removal] [--floater_search_padding_factor N] [--floater_containment_frac N] [--floater_max_faces N]
+#   ./run_full_pipeline.sh <image_folder> <scene_name> [--simplify_threshold N] [--texture_size N] [--num_imgs_per_scene N] [--skip-frames N] [--no-align-to-gravity] [--rotate-horizontal-deg N] [--classes a,b,c] [--run_glb] [--use-trellis] [--skip_isaac] [--collision_approximation convexDecomposition|convexHull|boundingCube] [--friction-table-path PATH] [--ollama-model NAME] [--start-from-stage N] [--stop-after-stage N] [--max_chunks_per_group N] [--max_inflated_voxels N] [--depth_conf_thres N] [--depth_edge_rtol N] [--fix_num_voxels N] [--robot-target LABEL] [--skip_floater_removal] [--floater_search_padding_factor N] [--floater_containment_frac N] [--floater_max_faces N] [--vggt-conf-thres N]
 #
 # Note: gravity alignment is ON by default; pass --no-align-to-gravity to disable it.
 #
@@ -68,9 +68,10 @@ RUN_FLOATER_REMOVAL=1
 FLOATER_SEARCH_PADDING_FACTOR=0.2
 FLOATER_CONTAINMENT_FRAC=0.95
 FLOATER_MAX_FACES=5000
+VGGT_CONF_THRES="20"
 
 if [[ $# -lt 2 ]]; then
-    echo "Usage: $0 <image_folder> <scene_name> [--simplify_threshold N] [--texture_size N] [--num_imgs_per_scene N] [--skip-frames N] [--no-align-to-gravity] [--rotate-horizontal-deg N] [--classes a,b,c] [--run_glb] [--use-trellis] [--skip_isaac] [--collision_approximation convexDecomposition|convexHull|boundingCube] [--friction-table-path PATH] [--ollama-model NAME] [--start-from-stage N] [--stop-after-stage N] [--max_chunks_per_group N] [--max_inflated_voxels N] [--depth_conf_thres N] [--depth_edge_rtol N] [--fix_num_voxels N] [--robot-target LABEL] [--skip_floater_removal] [--floater_search_padding_factor N] [--floater_containment_frac N] [--floater_max_faces N]" >&2
+    echo "Usage: $0 <image_folder> <scene_name> [--simplify_threshold N] [--texture_size N] [--num_imgs_per_scene N] [--skip-frames N] [--no-align-to-gravity] [--rotate-horizontal-deg N] [--classes a,b,c] [--run_glb] [--use-trellis] [--skip_isaac] [--collision_approximation convexDecomposition|convexHull|boundingCube] [--friction-table-path PATH] [--ollama-model NAME] [--start-from-stage N] [--stop-after-stage N] [--max_chunks_per_group N] [--max_inflated_voxels N] [--depth_conf_thres N] [--depth_edge_rtol N] [--fix_num_voxels N] [--robot-target LABEL] [--skip_floater_removal] [--floater_search_padding_factor N] [--floater_containment_frac N] [--floater_max_faces N] [--vggt-conf-thres N]" >&2
     exit 1
 fi
 
@@ -106,6 +107,7 @@ while [[ $# -gt 0 ]]; do
         --floater_search_padding_factor) FLOATER_SEARCH_PADDING_FACTOR="$2"; shift 2 ;;
         --floater_containment_frac) FLOATER_CONTAINMENT_FRAC="$2"; shift 2 ;;
         --floater_max_faces) FLOATER_MAX_FACES="$2"; shift 2 ;;
+        --vggt-conf-thres) VGGT_CONF_THRES="$2"; shift 2 ;;
         *) echo "Unknown argument: $1" >&2; exit 1 ;;
     esac
 done
@@ -221,9 +223,25 @@ if [[ "$START_FROM_STAGE" -le 0 ]]; then
         VGGT_GRAVITY_ARGS+=(--rotate-horizontal-deg "$ROTATE_HORIZONTAL_DEG")
     fi
 
+    # --vggt-conf-thres passes through to demo_rerun.py's --conf-thres, which
+    # governs the confidence-percentile filter applied to BOTH the exported
+    # points3D.txt/.ply and the rerun-viewer preview. demo_rerun.py's own
+    # CLI default (50.0) discards half of every exported point cloud by
+    # construction (it's a percentile, not an absolute threshold), and since
+    # low confidence skews toward scene periphery/boundaries, that
+    # disproportionately shrinks spatial coverage rather than just density.
+    # Default here is lowered to 20.0 (matching visual_util.filter_points's
+    # own default) after an A/B export on the same scene showed it roughly
+    # doubles the exported point cloud's bounding-box volume; raise it back
+    # toward 50 if the looser threshold lets in too much noise.
+    VGGT_CONF_THRES_ARGS=()
+    if [[ -n "$VGGT_CONF_THRES" ]]; then
+        VGGT_CONF_THRES_ARGS=(--conf-thres "$VGGT_CONF_THRES")
+    fi
+
     log_debug_config "stage0_vggt_export" "${VGGT_OMEGA_DIR}/demo_rerun.py" "$VGGT_OMEGA_DIR" \
         "$IMAGE_FOLDER" --checkpoint "$VGGT_CHECKPOINT" --export-for-3dgs "$EXPORT_DIR" \
-        "${VGGT_SKIP_FRAMES_ARGS[@]}" "${VGGT_GRAVITY_ARGS[@]}"
+        "${VGGT_SKIP_FRAMES_ARGS[@]}" "${VGGT_GRAVITY_ARGS[@]}" "${VGGT_CONF_THRES_ARGS[@]}"
 
     (
         cd "$VGGT_OMEGA_DIR"
@@ -231,7 +249,8 @@ if [[ "$START_FROM_STAGE" -le 0 ]]; then
             --checkpoint "$VGGT_CHECKPOINT" \
             --export-for-3dgs "$EXPORT_DIR" \
             "${VGGT_SKIP_FRAMES_ARGS[@]}" \
-            "${VGGT_GRAVITY_ARGS[@]}"
+            "${VGGT_GRAVITY_ARGS[@]}" \
+            "${VGGT_CONF_THRES_ARGS[@]}"
     ) > "$VGGT_LOG" 2>&1 &
     VGGT_PID=$!
 

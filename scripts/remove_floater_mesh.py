@@ -152,7 +152,11 @@ def main():
 
     if not floater_indices:
         logger.info(f"{args.object_ply}: no floaters found (examined {len(components)} components).")
-        write_cropped_ply(args.out_ply, vertex_data, faces)
+        # PlyData.read() memory-maps mesh_ply by default; when out_ply is the same
+        # path (the normal Stage 8 chaining case), writing in place truncates the
+        # file out from under that mmap. compact_mesh()/write below force a real
+        # copy first so it's safe to overwrite the source file.
+        write_cropped_ply(args.out_ply, np.array(vertex_data), faces.copy())
         return
 
     floater_set = set(floater_indices)
