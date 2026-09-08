@@ -2,7 +2,7 @@
 # End-to-end pipeline: VGGT-Omega pose/depth prediction -> [optional COB-GS 3D segmentation] -> GenRecon reconstruction -> GLB bake.
 #
 # Usage:
-#   ./run_full_pipeline.sh <image_folder> <scene_name> [--simplify_threshold N] [--texture_size N] [--num_imgs_per_scene N] [--skip-frames N] [--no-align-to-gravity] [--rotate-horizontal-deg N] [--classes a,b,c] [--run_glb] [--use-trellis] [--skip_isaac] [--collision_approximation convexDecomposition|convexHull|boundingCube] [--friction-table-path PATH] [--ollama-model NAME] [--start-from-stage N] [--stop-after-stage N] [--max_chunks_per_group N] [--max_inflated_voxels N] [--depth_conf_thres N] [--depth_edge_rtol N] [--fix_num_voxels N] [--robot-target LABEL]
+#   ./run_full_pipeline.sh <image_folder> <scene_name> [--simplify_threshold N] [--texture_size N] [--num_imgs_per_scene N] [--skip-frames N] [--no-align-to-gravity] [--rotate-horizontal-deg N] [--classes a,b,c] [--run_glb] [--use-trellis] [--skip_isaac] [--collision_approximation convexDecomposition|convexHull|boundingCube] [--friction-table-path PATH] [--ollama-model NAME] [--start-from-stage N] [--stop-after-stage N] [--max_chunks_per_group N] [--max_inflated_voxels N] [--depth_conf_thres N] [--depth_edge_rtol N] [--fix_num_voxels N] [--robot-target LABEL] [--skip_floater_removal] [--floater_search_padding_factor N] [--floater_containment_frac N] [--floater_max_faces N]
 #
 # Note: gravity alignment is ON by default; pass --no-align-to-gravity to disable it.
 #
@@ -64,9 +64,13 @@ DEPTH_CONF_THRES=50.0
 DEPTH_EDGE_RTOL=0.03
 FIX_NUM_VOXELS=16
 ROBOT_TARGET=""
+RUN_FLOATER_REMOVAL=1
+FLOATER_SEARCH_PADDING_FACTOR=0.2
+FLOATER_CONTAINMENT_FRAC=0.95
+FLOATER_MAX_FACES=5000
 
 if [[ $# -lt 2 ]]; then
-    echo "Usage: $0 <image_folder> <scene_name> [--simplify_threshold N] [--texture_size N] [--num_imgs_per_scene N] [--skip-frames N] [--no-align-to-gravity] [--rotate-horizontal-deg N] [--classes a,b,c] [--run_glb] [--use-trellis] [--skip_isaac] [--collision_approximation convexDecomposition|convexHull|boundingCube] [--friction-table-path PATH] [--ollama-model NAME] [--start-from-stage N] [--stop-after-stage N] [--max_chunks_per_group N] [--max_inflated_voxels N] [--depth_conf_thres N] [--depth_edge_rtol N] [--fix_num_voxels N] [--robot-target LABEL]" >&2
+    echo "Usage: $0 <image_folder> <scene_name> [--simplify_threshold N] [--texture_size N] [--num_imgs_per_scene N] [--skip-frames N] [--no-align-to-gravity] [--rotate-horizontal-deg N] [--classes a,b,c] [--run_glb] [--use-trellis] [--skip_isaac] [--collision_approximation convexDecomposition|convexHull|boundingCube] [--friction-table-path PATH] [--ollama-model NAME] [--start-from-stage N] [--stop-after-stage N] [--max_chunks_per_group N] [--max_inflated_voxels N] [--depth_conf_thres N] [--depth_edge_rtol N] [--fix_num_voxels N] [--robot-target LABEL] [--skip_floater_removal] [--floater_search_padding_factor N] [--floater_containment_frac N] [--floater_max_faces N]" >&2
     exit 1
 fi
 
@@ -98,6 +102,10 @@ while [[ $# -gt 0 ]]; do
         --depth_edge_rtol) DEPTH_EDGE_RTOL="$2"; shift 2 ;;
         --fix_num_voxels) FIX_NUM_VOXELS="$2"; shift 2 ;;
         --robot-target) ROBOT_TARGET="$2"; shift 2 ;;
+        --skip_floater_removal) RUN_FLOATER_REMOVAL=0; shift 1 ;;
+        --floater_search_padding_factor) FLOATER_SEARCH_PADDING_FACTOR="$2"; shift 2 ;;
+        --floater_containment_frac) FLOATER_CONTAINMENT_FRAC="$2"; shift 2 ;;
+        --floater_max_faces) FLOATER_MAX_FACES="$2"; shift 2 ;;
         *) echo "Unknown argument: $1" >&2; exit 1 ;;
     esac
 done
@@ -526,6 +534,16 @@ check_stop_after_stage 7
 # run had every class excluded from generation, so background_mesh.ply no
 # longer contains real object geometry to crop; --remainder_out_ply still
 # always chains off background_mesh.ply.
+#
+# Immediately after each class's crop, remove_floater_mesh.py does a second
+# cascading pass over background_mesh.ply: it builds a deliberately enlarged
+# convex hull around that class's point cloud (padding scaled to the
+# object's own bbox size via --search_padding_factor) and strips out any
+# small disconnected mesh component (capped at --max_floater_faces) whose
+# vertices are almost entirely inside that hull -- these are floaters left
+# behind by the tight object crop (e.g. hallucinated double-walled skin).
+# The single largest connected component is always kept untouched. Disabled
+# via --skip_floater_removal.
 OBJECT_SOURCE_MESH="${OUTPUT_DIR}/object_source_mesh.ply"
 if [[ -n "$CLASSES" && "$START_FROM_STAGE" -le 8 ]]; then
     stage_start "Stage 8: cascading per-object mesh extraction -> ${SHAPES_DIR}"
@@ -534,11 +552,12 @@ if [[ -n "$CLASSES" && "$START_FROM_STAGE" -le 8 ]]; then
     for obj_ply in "$SHAPES_DIR"/*.ply; do
         obj_name="$(basename "$obj_ply")"
         # Skip mesh.ply/background.ply plus anything matching this stage's own
-        # <label>_mesh.ply output naming -- a stale one from a previous run
-        # (Stage 7 doesn't wipe SHAPES_DIR before re-copying raw point clouds)
-        # would otherwise get globbed as a brand-new "object" here, producing a
-        # spurious <label>_mesh_mesh.ply crop and a duplicate USD asset later.
-        [[ "$obj_name" == "mesh.ply" || "$obj_name" == "background.ply" || "$obj_name" == *_mesh.ply ]] && continue
+        # <label>_mesh.ply / <label>_floaters.ply output naming -- a stale one
+        # from a previous run (Stage 7 doesn't wipe SHAPES_DIR before re-copying
+        # raw point clouds) would otherwise get globbed as a brand-new "object"
+        # here, producing a spurious <label>_mesh_mesh.ply crop and a duplicate
+        # USD asset later.
+        [[ "$obj_name" == "mesh.ply" || "$obj_name" == "background.ply" || "$obj_name" == *_mesh.ply || "$obj_name" == *_floaters.ply ]] && continue
         label="${obj_name%.ply}"
         log_debug_config "stage8_extract_object_mesh_${label}" "${GENRECON_DIR}/scripts/extract_object_mesh.py" "$GENRECON_DIR" \
             --mesh_ply "$BACKGROUND_MESH" \
@@ -557,6 +576,26 @@ if [[ -n "$CLASSES" && "$START_FROM_STAGE" -le 8 ]]; then
             --colmap_dir "${SCENE_DIR}/colmap" \
             --masks_dir "${COBGS_MASK_DIR}/${label}/mask_bin" \
             >> "${OUTPUT_DIR}/reconstruct.log" 2>&1
+
+        if [[ "$RUN_FLOATER_REMOVAL" -eq 1 ]]; then
+            log_debug_config "stage8_remove_floater_mesh_${label}" "${GENRECON_DIR}/scripts/remove_floater_mesh.py" "$GENRECON_DIR" \
+                --mesh_ply "$BACKGROUND_MESH" \
+                --object_ply "$obj_ply" \
+                --out_ply "$BACKGROUND_MESH" \
+                --floaters_out_ply "${SHAPES_DIR}/${label}_floaters.ply" \
+                --search_padding_factor "$FLOATER_SEARCH_PADDING_FACTOR" \
+                --containment_frac "$FLOATER_CONTAINMENT_FRAC" \
+                --max_floater_faces "$FLOATER_MAX_FACES"
+            uv run python -u scripts/remove_floater_mesh.py \
+                --mesh_ply "$BACKGROUND_MESH" \
+                --object_ply "$obj_ply" \
+                --out_ply "$BACKGROUND_MESH" \
+                --floaters_out_ply "${SHAPES_DIR}/${label}_floaters.ply" \
+                --search_padding_factor "$FLOATER_SEARCH_PADDING_FACTOR" \
+                --containment_frac "$FLOATER_CONTAINMENT_FRAC" \
+                --max_floater_faces "$FLOATER_MAX_FACES" \
+                >> "${OUTPUT_DIR}/reconstruct.log" 2>&1
+        fi
     done
     mirror_log "${OUTPUT_DIR}/reconstruct.log"
     stage_end
