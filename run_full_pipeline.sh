@@ -2,7 +2,7 @@
 # End-to-end pipeline: VGGT-Omega pose/depth prediction -> [optional COB-GS 3D segmentation] -> GenRecon reconstruction -> GLB bake.
 #
 # Usage:
-#   ./run_full_pipeline.sh <image_folder> <scene_name> [--simplify_threshold N] [--texture_size N] [--num_imgs_per_scene N] [--skip-frames N] [--no-align-to-gravity] [--rotate-horizontal-deg N] [--classes a,b,c] [--run_glb] [--use-trellis] [--skip_isaac] [--collision_approximation convexDecomposition|convexHull|boundingCube] [--friction-table-path PATH] [--ollama-model NAME] [--start-from-stage N] [--stop-after-stage N] [--max_chunks_per_group N] [--max_inflated_voxels N] [--depth_conf_thres N] [--depth_edge_rtol N] [--fix_num_voxels N] [--robot-target LABEL] [--skip_floater_removal] [--floater_search_padding_factor N] [--floater_containment_frac N] [--floater_max_faces N] [--vggt-conf-thres N]
+#   ./run_full_pipeline.sh <image_folder> <scene_name> [--simplify_threshold N] [--texture_size N] [--num_imgs_per_scene N] [--skip-frames N] [--no-align-to-gravity] [--rotate-horizontal-deg N] [--classes a,b,c] [--run_glb] [--use-trellis (default: on)] [--no-use-trellis] [--skip_isaac] [--collision_approximation convexDecomposition|convexHull|boundingCube] [--friction-table-path PATH] [--ollama-model NAME] [--start-from-stage N] [--stop-after-stage N] [--max_chunks_per_group N] [--max_inflated_voxels N] [--depth_conf_thres N] [--depth_edge_rtol N] [--fix_num_voxels N] [--robot-target LABEL] [--skip_floater_removal] [--floater_search_padding_factor N] [--floater_containment_frac N] [--floater_max_faces N] [--vggt-conf-thres N] [--skip_hull_consistency_check]
 #
 # Note: gravity alignment is ON by default; pass --no-align-to-gravity to disable it.
 #
@@ -47,7 +47,7 @@ TEXTURE_SIZE=2048
 NUM_IMGS_PER_SCENE=32
 VGGT_EXPORT_TIMEOUT=1800
 RUN_GLB=0
-USE_TRELLIS=0
+USE_TRELLIS=1
 RUN_USD=1
 COLLISION_APPROXIMATION="convexDecomposition"
 FRICTION_TABLE_PATH="${GENRECON_DIR}/configs/materials/friction_table.example.yaml"
@@ -65,13 +65,14 @@ DEPTH_EDGE_RTOL=0.03
 FIX_NUM_VOXELS=16
 ROBOT_TARGET=""
 RUN_FLOATER_REMOVAL=1
+SKIP_HULL_CONSISTENCY_CHECK=0
 FLOATER_SEARCH_PADDING_FACTOR=0.2
 FLOATER_CONTAINMENT_FRAC=0.95
 FLOATER_MAX_FACES=5000
 VGGT_CONF_THRES="20"
 
 if [[ $# -lt 2 ]]; then
-    echo "Usage: $0 <image_folder> <scene_name> [--simplify_threshold N] [--texture_size N] [--num_imgs_per_scene N] [--skip-frames N] [--no-align-to-gravity] [--rotate-horizontal-deg N] [--classes a,b,c] [--run_glb] [--use-trellis] [--skip_isaac] [--collision_approximation convexDecomposition|convexHull|boundingCube] [--friction-table-path PATH] [--ollama-model NAME] [--start-from-stage N] [--stop-after-stage N] [--max_chunks_per_group N] [--max_inflated_voxels N] [--depth_conf_thres N] [--depth_edge_rtol N] [--fix_num_voxels N] [--robot-target LABEL] [--skip_floater_removal] [--floater_search_padding_factor N] [--floater_containment_frac N] [--floater_max_faces N] [--vggt-conf-thres N]" >&2
+    echo "Usage: $0 <image_folder> <scene_name> [--simplify_threshold N] [--texture_size N] [--num_imgs_per_scene N] [--skip-frames N] [--no-align-to-gravity] [--rotate-horizontal-deg N] [--classes a,b,c] [--run_glb] [--use-trellis (default: on)] [--no-use-trellis] [--skip_isaac] [--collision_approximation convexDecomposition|convexHull|boundingCube] [--friction-table-path PATH] [--ollama-model NAME] [--start-from-stage N] [--stop-after-stage N] [--max_chunks_per_group N] [--max_inflated_voxels N] [--depth_conf_thres N] [--depth_edge_rtol N] [--fix_num_voxels N] [--robot-target LABEL] [--skip_floater_removal] [--floater_search_padding_factor N] [--floater_containment_frac N] [--floater_max_faces N] [--vggt-conf-thres N] [--skip_hull_consistency_check]" >&2
     exit 1
 fi
 
@@ -91,6 +92,7 @@ while [[ $# -gt 0 ]]; do
         --classes) CLASSES="$2"; shift 2 ;;
         --run_glb) RUN_GLB=1; shift 1 ;;
         --use-trellis) USE_TRELLIS=1; shift 1 ;;
+        --no-use-trellis) USE_TRELLIS=0; shift 1 ;;
         --skip_isaac) RUN_USD=0; shift 1 ;;
         --collision_approximation) COLLISION_APPROXIMATION="$2"; shift 2 ;;
         --friction-table-path) FRICTION_TABLE_PATH="$2"; shift 2 ;;
@@ -104,6 +106,7 @@ while [[ $# -gt 0 ]]; do
         --fix_num_voxels) FIX_NUM_VOXELS="$2"; shift 2 ;;
         --robot-target) ROBOT_TARGET="$2"; shift 2 ;;
         --skip_floater_removal) RUN_FLOATER_REMOVAL=0; shift 1 ;;
+        --skip_hull_consistency_check) SKIP_HULL_CONSISTENCY_CHECK=1; shift 1 ;;
         --floater_search_padding_factor) FLOATER_SEARCH_PADDING_FACTOR="$2"; shift 2 ;;
         --floater_containment_frac) FLOATER_CONTAINMENT_FRAC="$2"; shift 2 ;;
         --floater_max_faces) FLOATER_MAX_FACES="$2"; shift 2 ;;
@@ -117,9 +120,12 @@ if [[ ! -d "$IMAGE_FOLDER" ]]; then
     exit 1
 fi
 
+# TRELLIS.2 is per-class, so it's a no-op without --classes -- USE_TRELLIS
+# defaults to on, which would otherwise break every whole-scene (no
+# --classes) invocation, so silently drop it here instead of erroring.
 if [[ "$USE_TRELLIS" -eq 1 && -z "$CLASSES" ]]; then
-    echo "--use-trellis requires --classes (TRELLIS.2 reconstruction is per-class)." >&2
-    exit 1
+    echo "Note: --classes not set, so TRELLIS.2 reconstruction (enabled by default) does not apply to this run." >&2
+    USE_TRELLIS=0
 fi
 
 RUN_DIR="${GENRECON_DIR}/runs/${SCENE_NAME}"
@@ -319,12 +325,18 @@ if [[ -n "$CLASSES" ]]; then
         # is only ever a directory label here (--classes is always set, so it never
         # feeds the detection caption) -- so both --flat_output and a fixed --text
         # avoid redundantly repeating the scene name in the output path.
+        HULL_CONSISTENCY_ARGS=()
+        if [[ "$SKIP_HULL_CONSISTENCY_CHECK" -eq 1 ]]; then
+            HULL_CONSISTENCY_ARGS+=(--skip_hull_consistency_check)
+        fi
+
         log_debug_config "stage1_cobgs_segmentation" "${COBGS_DIR}/main_light.py" "$COBGS_DIR" \
             --scene "$SCENE_NAME" --text "classes" \
             --classes "$CLASSES" --dataset_root dataset --dataset_type tum_rgbd \
             --output_root "${OUTPUT_DIR}/segmentation_raw" --resolution -1 --skip_visualize \
             --flat_output --depth_dir "${EXPORT_DIR}/depth" \
-            --depth_conf_thres "$DEPTH_CONF_THRES" --depth_edge_rtol "$DEPTH_EDGE_RTOL"
+            --depth_conf_thres "$DEPTH_CONF_THRES" --depth_edge_rtol "$DEPTH_EDGE_RTOL" \
+            "${HULL_CONSISTENCY_ARGS[@]}"
 
         (
             cd "$COBGS_DIR"
@@ -332,7 +344,8 @@ if [[ -n "$CLASSES" ]]; then
                 --classes "$CLASSES" --dataset_root dataset --dataset_type tum_rgbd \
                 --output_root "${OUTPUT_DIR}/segmentation_raw" --resolution -1 --skip_visualize \
                 --flat_output --depth_dir "${EXPORT_DIR}/depth" \
-                --depth_conf_thres "$DEPTH_CONF_THRES" --depth_edge_rtol "$DEPTH_EDGE_RTOL"
+                --depth_conf_thres "$DEPTH_CONF_THRES" --depth_edge_rtol "$DEPTH_EDGE_RTOL" \
+                "${HULL_CONSISTENCY_ARGS[@]}"
         ) > "$SEG_LOG" 2>&1
         mirror_log "$SEG_LOG"
 
@@ -697,8 +710,20 @@ if [[ "$RUN_USD" -eq 1 ]]; then
         if [[ "$USE_TRELLIS" -eq 1 ]]; then
             IFS=',' read -ra USE_TRELLIS_CLASSES <<< "$CLASSES"
             for label in "${USE_TRELLIS_CLASSES[@]}"; do
+                # trellis2_meshes/<label> keeps the raw --classes spelling (spaces
+                # and all -- staged straight from labels.json's class names by
+                # stage_trellis2_inputs.py), but every scene-side artifact
+                # (shapes/<label>_mesh.ply from Stage 8, glb/<label>/ from
+                # mesh_to_glb.py above) uses labels.json's *sanitized* directory
+                # name (spaces/slashes -> underscores, see detect_and_segment.py's
+                # sanitize_label). A multi-word class name must use each spelling
+                # against the artifact that actually uses it, or the scene-crop/
+                # out_glb lookups below silently miss and TRELLIS substitution
+                # never applies to that class.
+                sanitized_label="${label// /_}"
+                sanitized_label="${sanitized_label//\//_}"
                 TRELLIS_LABEL_GLB="${RUN_DIR}/trellis2_meshes/${label}/mesh.glb"
-                SCENE_CROP_PLY="${SHAPES_DIR}/${label}_mesh.ply"
+                SCENE_CROP_PLY="${SHAPES_DIR}/${sanitized_label}_mesh.ply"
                 if [[ ! -f "$TRELLIS_LABEL_GLB" ]]; then
                     log "Stage 10: --use-trellis: no TRELLIS.2 mesh for '${label}' at ${TRELLIS_LABEL_GLB}, keeping scene-crop glb."
                     continue
@@ -707,14 +732,14 @@ if [[ "$RUN_USD" -eq 1 ]]; then
                     log "Stage 10: --use-trellis: no scene crop for '${label}' at ${SCENE_CROP_PLY}, keeping scene-crop glb."
                     continue
                 fi
-                log_debug_config "stage10_align_trellis2_mesh_${label}" "${GENRECON_DIR}/scripts/align_trellis2_mesh_to_scene.py" "$GENRECON_DIR" \
+                log_debug_config "stage10_align_trellis2_mesh_${sanitized_label}" "${GENRECON_DIR}/scripts/align_trellis2_mesh_to_scene.py" "$GENRECON_DIR" \
                     --trellis_glb "$TRELLIS_LABEL_GLB" \
                     --scene_mesh_ply "$SCENE_CROP_PLY" \
-                    --out_glb "${SHAPES_DIR}/glb/${label}/mesh.glb"
+                    --out_glb "${SHAPES_DIR}/glb/${sanitized_label}/mesh.glb"
                 uv run python -u scripts/align_trellis2_mesh_to_scene.py \
                     --trellis_glb "$TRELLIS_LABEL_GLB" \
                     --scene_mesh_ply "$SCENE_CROP_PLY" \
-                    --out_glb "${SHAPES_DIR}/glb/${label}/mesh.glb" \
+                    --out_glb "${SHAPES_DIR}/glb/${sanitized_label}/mesh.glb" \
                     >> "${OUTPUT_DIR}/mesh_to_glb.log" 2>&1
             done
             mirror_log "${OUTPUT_DIR}/mesh_to_glb.log"

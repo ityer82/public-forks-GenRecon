@@ -1,0 +1,65 @@
+# Material-pair friction reference table, sourced from Engineering ToolBox's
+# "Friction - Coefficients for Common Materials and Surfaces" page:
+# https://www.engineeringtoolbox.com/friction-coefficients-d_778.html
+#
+# genrecon/utils/friction_table.py filters this list down to entries pairing with the
+# pipeline's fixed default floor material (DEFAULT_FLOOR_MATERIAL, currently "hardwood"),
+# and the LangGraph agent in genrecon/utils/friction_agent.py picks the closest match to
+# a scene's class label from among them.
+#
+# COVERAGE GAP: this source's wood/oak rows are dominated by other wood, metal, stone,
+# leather, brick, concrete and ice -- it has NO direct wood-vs-plastic, wood-vs-rubber,
+# wood-vs-glass, wood-vs-ceramic, wood-vs-cardboard, or wood-vs-fabric measurement. Those
+# material categories are intentionally left OUT of this table rather than fabricated --
+# a class label the agent infers as one of them will correctly find no candidate and fall
+# back to the pipeline's global --static-friction/--dynamic-friction default (with a
+# logged warning), exactly as designed for an unmatched material. If you need real
+# coefficients for those pairs, add rows from a more targeted tribology source.
+#
+# Where the source lists a range instead of a single value, the midpoint is used. Where
+# the source lists only a static coefficient (no kinetic/sliding value for that pair),
+# the static value is reused for dynamic_friction as a conservative estimate -- called
+# out explicitly in that entry's `notes`, not presented as an independently measured
+# kinetic value.
+
+- material_a: wood
+  material_b: hardwood
+  static_friction: 0.62
+  dynamic_friction: 0.48
+  source: "Oak on oak, parallel to grain -- Engineering ToolBox, 'Friction - Coefficients for Common Materials and Surfaces'"
+  notes: "Hardwood floor approximated as oak-on-oak, parallel-grain contact."
+- material_a: leather
+  material_b: hardwood
+  static_friction: 0.61
+  dynamic_friction: 0.52
+  source: "Leather on oak -- Engineering ToolBox, 'Friction - Coefficients for Common Materials and Surfaces'"
+- material_a: metal
+  material_b: hardwood
+  static_friction: 0.4
+  dynamic_friction: 0.4
+  source: "Wood on clean metal (static range 0.2-0.6, midpoint used) -- Engineering ToolBox, 'Friction - Coefficients for Common Materials and Surfaces'"
+  notes: "Source gives no kinetic value for this pair; static value reused as a conservative dynamic-friction estimate."
+- material_a: concrete
+  material_b: hardwood
+  static_friction: 0.62
+  dynamic_friction: 0.62
+  source: "Wood on concrete -- Engineering ToolBox, 'Friction - Coefficients for Common Materials and Surfaces'"
+  notes: "Source gives no kinetic value for this pair; static value reused as a conservative dynamic-friction estimate."
+- material_a: brick
+  material_b: hardwood
+  static_friction: 0.6
+  dynamic_friction: 0.6
+  source: "Wood on brick -- Engineering ToolBox, 'Friction - Coefficients for Common Materials and Surfaces'"
+  notes: "Source gives no kinetic value for this pair; static value reused as a conservative dynamic-friction estimate."
+- material_a: stone
+  material_b: hardwood
+  static_friction: 0.3
+  dynamic_friction: 0.3
+  source: "Wood on stone (static range 0.2-0.4, midpoint used) -- Engineering ToolBox, 'Friction - Coefficients for Common Materials and Surfaces'"
+  notes: "Source gives no kinetic value for this pair; static value reused as a conservative dynamic-friction estimate."
+- material_a: ice
+  material_b: hardwood
+  static_friction: 0.05
+  dynamic_friction: 0.05
+  source: "Ice on wood -- Engineering ToolBox, 'Friction - Coefficients for Common Materials and Surfaces'"
+  notes: "Source gives no kinetic value for this pair; static value reused as a conservative dynamic-friction estimate."
