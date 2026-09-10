@@ -129,9 +129,7 @@ fi
 
 RUN_DIR="${GENRECON_DIR}/runs/${SCENE_NAME}"
 EXPORT_DIR="${RUN_DIR}/vggt_export"
-SEG_DIR="${RUN_DIR}/vggt_export_after_segmentation"
 SCENE_DIR="${RUN_DIR}/genrecon_input"
-FULL_SCENE_DIR="${RUN_DIR}/genrecon_input_full"
 OUTPUT_DIR="${RUN_DIR}/genrecon_output"
 
 mkdir -p "$EXPORT_DIR" "$OUTPUT_DIR"
@@ -299,10 +297,11 @@ fi
 check_stop_after_stage 0
 
 # ── Stage 1 (optional): GroundedSAM2-based 3D segmentation ──
-# When --classes is set, only the background reaches GenRecon: foreground
-# points are dropped from the sparse point cloud (chunk layout may shift as
-# a result, since GenRecon derives chunk placement from points3D.txt) and
-# foreground pixels are masked out of every RGB frame.
+# GenRecon always conditions on VGGT-Omega's original images and point cloud
+# (staged unmodified in Stage 4) -- class exclusion happens later, at
+# generation time, via Stage 5's --exclude_masks_root voxel carving, which
+# reads this stage's per-class point clouds/masks directly rather than
+# requiring pre-masked/filtered input.
 if [[ -n "$CLASSES" ]]; then
     SEG_LOG="${OUTPUT_DIR}/segmentation.log"
     COBGS_MASK_DIR="${OUTPUT_DIR}/segmentation_raw/masks/classes"
@@ -340,30 +339,9 @@ if [[ -n "$CLASSES" ]]; then
             log "Expected segmentation labels.json not found at ${COBGS_MASK_DIR}/labels.json" >&2
             exit 1
         fi
-
-        log "Stage 1: applying segmentation masks -> ${SEG_DIR}"
-        mkdir -p "${SEG_DIR}/masked_rgb" "${SEG_DIR}/filtered_colmap"
-        ln -sfn "${EXPORT_DIR}/sparse/0/cameras.txt" "${SEG_DIR}/filtered_colmap/cameras.txt"
-        ln -sfn "${EXPORT_DIR}/sparse/0/images.txt" "${SEG_DIR}/filtered_colmap/images.txt"
-
-        cd "$GENRECON_DIR"
-        log_debug_config "stage1_apply_segmentation_mask" "${GENRECON_DIR}/scripts/apply_segmentation_mask.py" "$GENRECON_DIR" \
-            --images_dir "${EXPORT_DIR}/images" \
-            --masks_root "$COBGS_MASK_DIR" \
-            --background_ply "${COBGS_MASK_DIR}/background/point_cloud/background.ply" \
-            --out_rgb_dir "${SEG_DIR}/masked_rgb" \
-            --out_points3d "${SEG_DIR}/filtered_colmap/points3D.txt"
-        uv run python -u scripts/apply_segmentation_mask.py \
-            --images_dir "${EXPORT_DIR}/images" \
-            --masks_root "$COBGS_MASK_DIR" \
-            --background_ply "${COBGS_MASK_DIR}/background/point_cloud/background.ply" \
-            --out_rgb_dir "${SEG_DIR}/masked_rgb" \
-            --out_points3d "${SEG_DIR}/filtered_colmap/points3D.txt" \
-            >> "$SEG_LOG" 2>&1
-        mirror_log "$SEG_LOG"
         stage_end
     else
-        log "Stage 1: skipped (--start-from-stage ${START_FROM_STAGE}), assuming existing segmentation at ${SEG_DIR}"
+        log "Stage 1: skipped (--start-from-stage ${START_FROM_STAGE}), assuming existing segmentation at ${OUTPUT_DIR}/segmentation_raw"
     fi
     check_stop_after_stage 1
 
@@ -417,24 +395,16 @@ if [[ -n "$CLASSES" ]]; then
     check_stop_after_stage 3
 fi
 
-# ── Stage 4: stage GenRecon scene dir(s) ──
-# When --classes is set, also stages FULL_SCENE_DIR pointing at the *unmasked*
-# export (images + full, object-inclusive point cloud) -- used by Stage 5's
-# second, unexcluded reconstruct_scene.py run as the source for real per-object
-# meshes, since the primary (masked) run's mesh.ply no longer contains them.
+# ── Stage 4: stage GenRecon scene dir ──
+# Always points at the original VGGT-Omega export (full images + full point
+# cloud) -- both Stage 5 reconstruct_scene.py passes (primary excluded run
+# and secondary unexcluded run for real per-object meshes) read this same
+# dir, differing only in whether --exclude_masks_root is applied.
 if [[ "$START_FROM_STAGE" -le 4 ]]; then
     stage_start "Stage 4: staging ${SCENE_DIR}"
     mkdir -p "$SCENE_DIR"
-    if [[ -n "$CLASSES" ]]; then
-        ln -sfn "${SEG_DIR}/masked_rgb" "${SCENE_DIR}/rgb"
-        ln -sfn "${SEG_DIR}/filtered_colmap" "${SCENE_DIR}/colmap"
-        mkdir -p "$FULL_SCENE_DIR"
-        ln -sfn "${EXPORT_DIR}/images" "${FULL_SCENE_DIR}/rgb"
-        ln -sfn "${EXPORT_DIR}/sparse/0" "${FULL_SCENE_DIR}/colmap"
-    else
-        ln -sfn "${EXPORT_DIR}/images" "${SCENE_DIR}/rgb"
-        ln -sfn "${EXPORT_DIR}/sparse/0" "${SCENE_DIR}/colmap"
-    fi
+    ln -sfn "${EXPORT_DIR}/images" "${SCENE_DIR}/rgb"
+    ln -sfn "${EXPORT_DIR}/sparse/0" "${SCENE_DIR}/colmap"
     stage_end
 else
     log "Stage 4: skipped (--start-from-stage ${START_FROM_STAGE}), assuming existing ${SCENE_DIR}"
@@ -460,16 +430,17 @@ if [[ "$START_FROM_STAGE" -le 5 ]]; then
     fi
 
     # Excludes each segmented class's object from generation itself (voxel-level
-    # carving before shape/texture SLat sampling), instead of relying on the
-    # black-masked/point-dropped input alone -- GenRecon is generative and will
-    # otherwise "resurrect" plausible geometry into the masked region. Also runs
-    # a second, unexcluded reconstruction over FULL_SCENE_DIR's unmasked images
-    # (--unmasked_path), sharing the primary run's chunk geometry/world frame,
-    # so Stage 8 has a real (non-hallucinated) source mesh to crop each object
-    # from -- the primary run's mesh.ply no longer contains them.
+    # carving before shape/texture SLat sampling) -- GenRecon conditions on the
+    # original, unmasked images/point cloud (SCENE_DIR), and this carving is
+    # what keeps it from "resurrecting" plausible geometry into the excluded
+    # region, rather than relying on pre-masked input. Also runs a second,
+    # unexcluded reconstruction over the same SCENE_DIR (--unmasked_path),
+    # sharing the primary run's chunk geometry/world frame, so Stage 8 has a
+    # real (non-hallucinated) source mesh to crop each object from -- the
+    # primary run's mesh.ply no longer contains them.
     RECON_EXCLUDE_ARGS=()
     if [[ -n "$CLASSES" ]]; then
-        RECON_EXCLUDE_ARGS=(--exclude_masks_root "$COBGS_MASK_DIR" --unmasked_path "$FULL_SCENE_DIR")
+        RECON_EXCLUDE_ARGS=(--exclude_masks_root "$COBGS_MASK_DIR" --unmasked_path "$SCENE_DIR")
     fi
 
     log_debug_config "stage5_reconstruct_scene" "${GENRECON_DIR}/reconstruct_scene.py" "$GENRECON_DIR" \
