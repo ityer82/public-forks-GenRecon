@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# End-to-end pipeline: VGGT-Omega pose/depth prediction -> [optional COB-GS 3D segmentation] -> GenRecon reconstruction -> GLB bake.
+# End-to-end pipeline: VGGT-Omega pose/depth prediction -> [optional GroundedSAM2 3D segmentation] -> GenRecon reconstruction -> GLB bake.
+# VGGT-Omega and the segmentation stage both now run from in-repo code (vggt/, segmentation/).
 #
 # Usage:
-#   ./run_full_pipeline.sh <image_folder> <scene_name> [--simplify_threshold N] [--texture_size N] [--num_imgs_per_scene N] [--skip-frames N] [--no-align-to-gravity] [--rotate-horizontal-deg N] [--classes a,b,c] [--run_glb] [--use-trellis (default: on)] [--no-use-trellis] [--skip_isaac] [--collision_approximation convexDecomposition|convexHull|boundingCube] [--friction-table-path PATH] [--ollama-model NAME] [--start-from-stage N] [--stop-after-stage N] [--max_chunks_per_group N] [--max_inflated_voxels N] [--depth_conf_thres N] [--depth_edge_rtol N] [--fix_num_voxels N] [--robot-target LABEL] [--skip_floater_removal] [--floater_search_padding_factor N] [--floater_containment_frac N] [--floater_max_faces N] [--vggt-conf-thres N] [--skip_hull_consistency_check]
+#   ./run_full_pipeline.sh <image_folder> <scene_name> [--simplify_threshold N] [--texture_size N] [--num_imgs_per_scene N] [--skip-frames N] [--no-align-to-gravity] [--rotate-horizontal-deg N] [--classes a,b,c] [--run_glb] [--use-trellis (default: on)] [--no-use-trellis] [--skip_isaac] [--collision_approximation convexDecomposition|convexHull|boundingCube] [--friction-table-path PATH] [--ollama-model NAME] [--start-from-stage N] [--stop-after-stage N] [--max_chunks_per_group N] [--max_inflated_voxels N] [--depth_conf_thres N] [--depth_edge_rtol N] [--fix_num_chunks N] [--robot-target LABEL] [--skip_floater_removal] [--floater_search_padding_factor N] [--floater_containment_frac N] [--floater_max_faces N] [--vggt-conf-thres N] [--skip_hull_consistency_check]
 #
 # Note: gravity alignment is ON by default; pass --no-align-to-gravity to disable it.
 #
@@ -17,11 +18,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GENRECON_DIR="$SCRIPT_DIR"
-VGGT_OMEGA_DIR="$(cd "$GENRECON_DIR/../vggt-omega" && pwd)"
-COBGS_DIR="$(cd "$GENRECON_DIR/../COB-GS" && pwd)"
 TRELLIS2_DIR="$(cd "$GENRECON_DIR/../trellis2" && pwd)"
 ISAACSIM_DIR="$(cd "$GENRECON_DIR/../IsaacSim" && pwd)"
-VGGT_CHECKPOINT="${VGGT_OMEGA_DIR}/vggt_omega_1b_512.pt"
+VGGT_CHECKPOINT="${GENRECON_DIR}/checkpoints/vggt_omega/ckpts/vggt_omega_1b_512.pt"
 
 # ── CUDA toolkit selection for git-dependency builds (e.g. nvdiffrec-render) ──
 # uv's isolated build env compiles that package's native extension with nvcc,
@@ -62,7 +61,7 @@ MAX_CHUNKS_PER_GROUP=""
 MAX_INFLATED_VOXELS=""
 DEPTH_CONF_THRES=50.0
 DEPTH_EDGE_RTOL=0.03
-FIX_NUM_VOXELS=16
+FIX_NUM_CHUNKS=16
 ROBOT_TARGET=""
 RUN_FLOATER_REMOVAL=1
 SKIP_HULL_CONSISTENCY_CHECK=0
@@ -72,7 +71,7 @@ FLOATER_MAX_FACES=5000
 VGGT_CONF_THRES="20"
 
 if [[ $# -lt 2 ]]; then
-    echo "Usage: $0 <image_folder> <scene_name> [--simplify_threshold N] [--texture_size N] [--num_imgs_per_scene N] [--skip-frames N] [--no-align-to-gravity] [--rotate-horizontal-deg N] [--classes a,b,c] [--run_glb] [--use-trellis (default: on)] [--no-use-trellis] [--skip_isaac] [--collision_approximation convexDecomposition|convexHull|boundingCube] [--friction-table-path PATH] [--ollama-model NAME] [--start-from-stage N] [--stop-after-stage N] [--max_chunks_per_group N] [--max_inflated_voxels N] [--depth_conf_thres N] [--depth_edge_rtol N] [--fix_num_voxels N] [--robot-target LABEL] [--skip_floater_removal] [--floater_search_padding_factor N] [--floater_containment_frac N] [--floater_max_faces N] [--vggt-conf-thres N] [--skip_hull_consistency_check]" >&2
+    echo "Usage: $0 <image_folder> <scene_name> [--simplify_threshold N] [--texture_size N] [--num_imgs_per_scene N] [--skip-frames N] [--no-align-to-gravity] [--rotate-horizontal-deg N] [--classes a,b,c] [--run_glb] [--use-trellis (default: on)] [--no-use-trellis] [--skip_isaac] [--collision_approximation convexDecomposition|convexHull|boundingCube] [--friction-table-path PATH] [--ollama-model NAME] [--start-from-stage N] [--stop-after-stage N] [--max_chunks_per_group N] [--max_inflated_voxels N] [--depth_conf_thres N] [--depth_edge_rtol N] [--fix_num_chunks N] [--robot-target LABEL] [--skip_floater_removal] [--floater_search_padding_factor N] [--floater_containment_frac N] [--floater_max_faces N] [--vggt-conf-thres N] [--skip_hull_consistency_check]" >&2
     exit 1
 fi
 
@@ -103,7 +102,7 @@ while [[ $# -gt 0 ]]; do
         --max_inflated_voxels) MAX_INFLATED_VOXELS="$2"; shift 2 ;;
         --depth_conf_thres) DEPTH_CONF_THRES="$2"; shift 2 ;;
         --depth_edge_rtol) DEPTH_EDGE_RTOL="$2"; shift 2 ;;
-        --fix_num_voxels) FIX_NUM_VOXELS="$2"; shift 2 ;;
+        --fix_num_chunks) FIX_NUM_CHUNKS="$2"; shift 2 ;;
         --robot-target) ROBOT_TARGET="$2"; shift 2 ;;
         --skip_floater_removal) RUN_FLOATER_REMOVAL=0; shift 1 ;;
         --skip_hull_consistency_check) SKIP_HULL_CONSISTENCY_CHECK=1; shift 1 ;;
@@ -193,8 +192,8 @@ check_stop_after_stage() {
 declare -A LOG_LINE_OFFSET
 
 # Appends whatever's been newly written to $1 since the last call for that
-# file into pipeline.log. Needed because external subprocesses (COB-GS,
-# VGGT-Omega, TRELLIS2, IsaacSim) don't log through the shared loguru logger,
+# file into pipeline.log. Needed because external subprocesses (the
+# segmentation stage, VGGT-Omega, TRELLIS2, IsaacSim) don't log through the shared loguru logger,
 # so their per-stage log files (segmentation.log, reconstruct.log, ...) would
 # otherwise never make it into the unified pipeline.log.
 mirror_log() {
@@ -245,13 +244,12 @@ if [[ "$START_FROM_STAGE" -le 0 ]]; then
         VGGT_CONF_THRES_ARGS=(--conf-thres "$VGGT_CONF_THRES")
     fi
 
-    log_debug_config "stage0_vggt_export" "${VGGT_OMEGA_DIR}/demo_rerun.py" "$VGGT_OMEGA_DIR" \
+    log_debug_config "stage0_vggt_export" "${GENRECON_DIR}/vggt/demo_rerun.py" "$GENRECON_DIR" \
         "$IMAGE_FOLDER" --checkpoint "$VGGT_CHECKPOINT" --export-for-3dgs "$EXPORT_DIR" \
         "${VGGT_SKIP_FRAMES_ARGS[@]}" "${VGGT_GRAVITY_ARGS[@]}" "${VGGT_CONF_THRES_ARGS[@]}"
 
     (
-        cd "$VGGT_OMEGA_DIR"
-        uv run python -u demo_rerun.py "$IMAGE_FOLDER" \
+        uv run python -u vggt/demo_rerun.py "$IMAGE_FOLDER" \
             --checkpoint "$VGGT_CHECKPOINT" \
             --export-for-3dgs "$EXPORT_DIR" \
             "${VGGT_SKIP_FRAMES_ARGS[@]}" \
@@ -300,7 +298,7 @@ else
 fi
 check_stop_after_stage 0
 
-# ── Stage 1 (optional): COB-GS 3D segmentation ──
+# ── Stage 1 (optional): GroundedSAM2-based 3D segmentation ──
 # When --classes is set, only the background reaches GenRecon: foreground
 # points are dropped from the sparse point cloud (chunk layout may shift as
 # a result, since GenRecon derives chunk placement from points3D.txt) and
@@ -310,16 +308,7 @@ if [[ -n "$CLASSES" ]]; then
     COBGS_MASK_DIR="${OUTPUT_DIR}/segmentation_raw/masks/classes"
 
     if [[ "$START_FROM_STAGE" -le 1 ]]; then
-        stage_start "Stage 1: COB-GS segmentation (classes: ${CLASSES})"
-
-        # grounded_sam2_stable_tracking.py hardcodes its input image path per
-        # --dataset_type (ignoring --dataset_root), so the export must also live
-        # at this fixed location relative to COBGS_DIR.
-        COBGS_SCENE_DATASET_DIR="${COBGS_DIR}/dataset/${SCENE_NAME}"
-        mkdir -p "$COBGS_SCENE_DATASET_DIR"
-        ln -sfn "${EXPORT_DIR}/images" "${COBGS_SCENE_DATASET_DIR}/images"
-        mkdir -p "${COBGS_SCENE_DATASET_DIR}/sparse"
-        ln -sfn "${EXPORT_DIR}/sparse/0" "${COBGS_SCENE_DATASET_DIR}/sparse/0"
+        stage_start "Stage 1: segmentation (classes: ${CLASSES})"
 
         # --output_root is already scene-specific (it's under runs/<scene>/), and --text
         # is only ever a directory label here (--classes is always set, so it never
@@ -330,27 +319,25 @@ if [[ -n "$CLASSES" ]]; then
             HULL_CONSISTENCY_ARGS+=(--skip_hull_consistency_check)
         fi
 
-        log_debug_config "stage1_cobgs_segmentation" "${COBGS_DIR}/main_light.py" "$COBGS_DIR" \
+        log_debug_config "stage1_segmentation" "${GENRECON_DIR}/segmentation/main_light.py" "$GENRECON_DIR" \
             --scene "$SCENE_NAME" --text "classes" \
-            --classes "$CLASSES" --dataset_root dataset --dataset_type tum_rgbd \
-            --output_root "${OUTPUT_DIR}/segmentation_raw" --resolution -1 --skip_visualize \
+            --classes "$CLASSES" --dataset_root "$EXPORT_DIR" \
+            --output_root "${OUTPUT_DIR}/segmentation_raw" --resolution -1 \
             --flat_output --depth_dir "${EXPORT_DIR}/depth" \
             --depth_conf_thres "$DEPTH_CONF_THRES" --depth_edge_rtol "$DEPTH_EDGE_RTOL" \
             "${HULL_CONSISTENCY_ARGS[@]}"
 
-        (
-            cd "$COBGS_DIR"
-            uv run python -u main_light.py --scene "$SCENE_NAME" --text "classes" \
-                --classes "$CLASSES" --dataset_root dataset --dataset_type tum_rgbd \
-                --output_root "${OUTPUT_DIR}/segmentation_raw" --resolution -1 --skip_visualize \
-                --flat_output --depth_dir "${EXPORT_DIR}/depth" \
-                --depth_conf_thres "$DEPTH_CONF_THRES" --depth_edge_rtol "$DEPTH_EDGE_RTOL" \
-                "${HULL_CONSISTENCY_ARGS[@]}"
-        ) > "$SEG_LOG" 2>&1
+        uv run python -u segmentation/main_light.py --scene "$SCENE_NAME" --text "classes" \
+            --classes "$CLASSES" --dataset_root "$EXPORT_DIR" \
+            --output_root "${OUTPUT_DIR}/segmentation_raw" --resolution -1 \
+            --flat_output --depth_dir "${EXPORT_DIR}/depth" \
+            --depth_conf_thres "$DEPTH_CONF_THRES" --depth_edge_rtol "$DEPTH_EDGE_RTOL" \
+            "${HULL_CONSISTENCY_ARGS[@]}" \
+            > "$SEG_LOG" 2>&1
         mirror_log "$SEG_LOG"
 
         if [[ ! -f "${COBGS_MASK_DIR}/labels.json" ]]; then
-            log "Expected COB-GS labels.json not found at ${COBGS_MASK_DIR}/labels.json" >&2
+            log "Expected segmentation labels.json not found at ${COBGS_MASK_DIR}/labels.json" >&2
             exit 1
         fi
 
@@ -468,8 +455,8 @@ if [[ "$START_FROM_STAGE" -le 5 ]]; then
     if [[ -n "$MAX_INFLATED_VOXELS" ]]; then
         RECON_VRAM_ARGS+=(--max_inflated_voxels "$MAX_INFLATED_VOXELS")
     fi
-    if [[ -n "$FIX_NUM_VOXELS" ]]; then
-        RECON_VRAM_ARGS+=(--fix_num_chunks "$FIX_NUM_VOXELS")
+    if [[ -n "$FIX_NUM_CHUNKS" ]]; then
+        RECON_VRAM_ARGS+=(--fix_num_chunks "$FIX_NUM_CHUNKS")
     fi
 
     # Excludes each segmented class's object from generation itself (voxel-level

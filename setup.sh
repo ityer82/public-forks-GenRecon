@@ -1,5 +1,5 @@
 # Read Arguments
-TEMP=`getopt -o h --long help,new-env,basic,flash-attn,cumesh,o-voxel,flexgemm,nvdiffrast,nvdiffrec -n 'setup.sh' -- "$@"`
+TEMP=`getopt -o h --long help,new-env,basic,flash-attn,cumesh,o-voxel,flexgemm,nvdiffrast,nvdiffrec,segmentation -n 'setup.sh' -- "$@"`
 
 eval set -- "$TEMP"
 
@@ -12,6 +12,7 @@ OVOXEL=false
 FLEXGEMM=false
 NVDIFFRAST=false
 NVDIFFREC=false
+SEGMENTATION=false
 ERROR=false
 
 
@@ -30,6 +31,7 @@ while true ; do
         --flexgemm) FLEXGEMM=true ; shift ;;
         --nvdiffrast) NVDIFFRAST=true ; shift ;;
         --nvdiffrec) NVDIFFREC=true ; shift ;;
+        --segmentation) SEGMENTATION=true ; shift ;;
         --) shift ; break ;;
         *) ERROR=true ; break ;;
     esac
@@ -52,6 +54,7 @@ if [ "$HELP" = true ] ; then
     echo "  --flexgemm              Install flexgemm"
     echo "  --nvdiffrast            Install nvdiffrast"
     echo "  --nvdiffrec             Install nvdiffrec"
+    echo "  --segmentation          Download SAM2/GroundingDINO checkpoints for the segmentation stage"
     return
 fi
 
@@ -136,4 +139,9 @@ if [ "$OVOXEL" = true ] ; then
     mkdir -p /tmp/extensions
     cp -r o-voxel /tmp/extensions/o-voxel
     pip install /tmp/extensions/o-voxel --no-build-isolation
+fi
+
+if [ "$SEGMENTATION" = true ] ; then
+    bash "$WORKDIR/checkpoints/sam2/download_ckpts.sh"
+    bash "$WORKDIR/checkpoints/groundingdino/download_ckpts.sh"
 fi

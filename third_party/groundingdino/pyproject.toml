@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=62.3.0,<75.9", "torch"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "groundingdino"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "torch",
+    "torchvision",
+    "addict",
+    "yapf",
+    "pycocotools",
+]
