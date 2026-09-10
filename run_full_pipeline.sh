@@ -192,6 +192,7 @@ opt_arg() {
     local -n _arr="$1"
     local flag="$2" value="$3"
     [[ -n "$value" ]] && _arr+=("$flag" "$value")
+    return 0
 }
 
 declare -A LOG_LINE_OFFSET
