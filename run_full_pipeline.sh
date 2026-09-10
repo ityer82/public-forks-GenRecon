@@ -465,16 +465,27 @@ fi
 check_stop_after_stage 5
 
 # ── Stage 6: reprojection validation ──
+# Renders novel views against the scene BEFORE foreground-object removal:
+# when --classes is set, Stage 5's secondary unexcluded run wrote
+# object_source_mesh.ply (same chunk geometry/world frame as mesh.ply, but
+# without the voxel-level carving of segmented objects), so that's used
+# here instead of the excluded mesh.ply. Without --classes there's no
+# exclusion to begin with, so mesh.ply already is the pre-removal scene.
+if [[ -n "$CLASSES" ]]; then
+    REPROJECTION_MESH_PLY="${OUTPUT_DIR}/object_source_mesh.ply"
+else
+    REPROJECTION_MESH_PLY="${OUTPUT_DIR}/mesh.ply"
+fi
 if [[ "$START_FROM_STAGE" -le 6 ]]; then
     stage_start "Stage 6: render_reprojection_validation.py"
     log_debug_config "stage6_render_reprojection_validation" "${GENRECON_DIR}/scripts/render_reprojection_validation.py" "$GENRECON_DIR" \
-        --mesh_ply "${OUTPUT_DIR}/mesh.ply" \
+        --mesh_ply "$REPROJECTION_MESH_PLY" \
         --colmap_dir "${SCENE_DIR}/colmap" \
         --images_dir "${SCENE_DIR}/rgb" \
         --out_synth_dir "${OUTPUT_DIR}/synth_views" \
         --out_compare_dir "${OUTPUT_DIR}/compare_views"
     uv run python -u scripts/render_reprojection_validation.py \
-        --mesh_ply "${OUTPUT_DIR}/mesh.ply" \
+        --mesh_ply "$REPROJECTION_MESH_PLY" \
         --colmap_dir "${SCENE_DIR}/colmap" \
         --images_dir "${SCENE_DIR}/rgb" \
         --out_synth_dir "${OUTPUT_DIR}/synth_views" \
