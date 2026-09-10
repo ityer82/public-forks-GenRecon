@@ -10,14 +10,13 @@
 # Example:
 #   ./run_full_pipeline.sh /home/gabis/Work/GitHub/COB-GS/dataset/food2/images food2_vggt
 #   ./run_full_pipeline.sh /home/gabis/Work/GitHub/COB-GS/dataset/food2/images food2_vggt --run_glb
-#   ./run_full_pipeline.sh /home/gabis/Work/GitHub/COB-GS/dataset/food2/images food2_vggt --align-to-gravity --rotate-horizontal-deg 90
+#   ./run_full_pipeline.sh /home/gabis/Work/GitHub/COB-GS/dataset/food2/images food2_vggt --rotate-horizontal-deg 90
 #   ./run_full_pipeline.sh /home/gabis/Work/GitHub/COB-GS/dataset/food2/images food2_vggt --classes "person,chair,bag"
 #   ./run_full_pipeline.sh /home/gabis/Work/GitHub/COB-GS/dataset/food2/images food2_vggt --classes "person,chair,bag" --use-trellis
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-GENRECON_DIR="$SCRIPT_DIR"
+GENRECON_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TRELLIS2_DIR="$(cd "$GENRECON_DIR/../trellis2" && pwd)"
 ISAACSIM_DIR="$(cd "$GENRECON_DIR/../IsaacSim" && pwd)"
 VGGT_CHECKPOINT="${GENRECON_DIR}/checkpoints/vggt_omega/ckpts/vggt_omega_1b_512.pt"
@@ -85,7 +84,6 @@ while [[ $# -gt 0 ]]; do
         --texture_size) TEXTURE_SIZE="$2"; shift 2 ;;
         --num_imgs_per_scene) NUM_IMGS_PER_SCENE="$2"; shift 2 ;;
         --skip-frames) SKIP_FRAMES="$2"; shift 2 ;;
-        --align-to-gravity) ALIGN_TO_GRAVITY=1; shift 1 ;;
         --no-align-to-gravity) ALIGN_TO_GRAVITY=0; shift 1 ;;
         --rotate-horizontal-deg) ROTATE_HORIZONTAL_DEG="$2"; shift 2 ;;
         --classes) CLASSES="$2"; shift 2 ;;
@@ -187,6 +185,15 @@ check_stop_after_stage() {
     fi
 }
 
+# Appends `flag value` to the named array, but only when value is non-empty --
+# collapses the repeated `if [[ -n "$X" ]]; then ARR+=(--flag "$X"); fi` idiom
+# used throughout the per-stage argument building below.
+opt_arg() {
+    local -n _arr="$1"
+    local flag="$2" value="$3"
+    [[ -n "$value" ]] && _arr+=("$flag" "$value")
+}
+
 declare -A LOG_LINE_OFFSET
 
 # Appends whatever's been newly written to $1 since the last call for that
@@ -203,6 +210,35 @@ mirror_log() {
         tail -n "+$((prev + 1))" "$log_file" >> "$PIPELINE_LOG"
     fi
     LOG_LINE_OFFSET[$log_file]=$total
+}
+
+# Runs an in-repo python stage (uv run python -u <script> args...), logging a
+# replayable debugpy launch config first and mirroring its output into the
+# unified pipeline log afterwards. `redir` is "new" to truncate log_file or
+# "append" to keep appending to a log file shared with other stages.
+run_py_step() {
+    local name="$1" script="$2" log_file="$3" redir="$4"; shift 4
+    log_debug_config "$name" "${GENRECON_DIR}/${script}" "$GENRECON_DIR" "$@"
+    if [[ "$redir" == append ]]; then
+        uv run python -u "$script" "$@" >> "$log_file" 2>&1
+    else
+        uv run python -u "$script" "$@" > "$log_file" 2>&1
+    fi
+    mirror_log "$log_file"
+}
+
+# Same as run_py_step, but for stages that live in a sibling repo (TRELLIS.2,
+# IsaacSim) and run from that repo's own directory with its own `uv run`
+# invocation (e.g. "uv run --no-sync generate.py", "uv run convert_asset.py").
+run_external_step() {
+    local name="$1" script="$2" cwd="$3" log_file="$4" redir="$5" runner="$6"; shift 6
+    log_debug_config "$name" "$script" "$cwd" "$@"
+    if [[ "$redir" == append ]]; then
+        ( cd "$cwd" && $runner "$@" ) >> "$log_file" 2>&1
+    else
+        ( cd "$cwd" && $runner "$@" ) > "$log_file" 2>&1
+    fi
+    mirror_log "$log_file"
 }
 
 PIPELINE_T0=$(date +%s)
@@ -238,9 +274,7 @@ if [[ "$START_FROM_STAGE" -le 0 ]]; then
     # doubles the exported point cloud's bounding-box volume; raise it back
     # toward 50 if the looser threshold lets in too much noise.
     VGGT_CONF_THRES_ARGS=()
-    if [[ -n "$VGGT_CONF_THRES" ]]; then
-        VGGT_CONF_THRES_ARGS=(--conf-thres "$VGGT_CONF_THRES")
-    fi
+    opt_arg VGGT_CONF_THRES_ARGS --conf-thres "$VGGT_CONF_THRES"
 
     log_debug_config "stage0_vggt_export" "${GENRECON_DIR}/vggt/demo_rerun.py" "$GENRECON_DIR" \
         "$IMAGE_FOLDER" --checkpoint "$VGGT_CHECKPOINT" --export-for-3dgs "$EXPORT_DIR" \
@@ -318,22 +352,13 @@ if [[ -n "$CLASSES" ]]; then
             HULL_CONSISTENCY_ARGS+=(--skip_hull_consistency_check)
         fi
 
-        log_debug_config "stage1_segmentation" "${GENRECON_DIR}/segmentation/main_light.py" "$GENRECON_DIR" \
-            --scene "$SCENE_NAME" --text "classes" \
+        SEG_ARGS=(--scene "$SCENE_NAME" --text "classes" \
             --classes "$CLASSES" --dataset_root "$EXPORT_DIR" \
             --output_root "${OUTPUT_DIR}/segmentation_raw" --resolution -1 \
             --flat_output --depth_dir "${EXPORT_DIR}/depth" \
             --depth_conf_thres "$DEPTH_CONF_THRES" --depth_edge_rtol "$DEPTH_EDGE_RTOL" \
-            "${HULL_CONSISTENCY_ARGS[@]}"
-
-        uv run python -u segmentation/main_light.py --scene "$SCENE_NAME" --text "classes" \
-            --classes "$CLASSES" --dataset_root "$EXPORT_DIR" \
-            --output_root "${OUTPUT_DIR}/segmentation_raw" --resolution -1 \
-            --flat_output --depth_dir "${EXPORT_DIR}/depth" \
-            --depth_conf_thres "$DEPTH_CONF_THRES" --depth_edge_rtol "$DEPTH_EDGE_RTOL" \
-            "${HULL_CONSISTENCY_ARGS[@]}" \
-            > "$SEG_LOG" 2>&1
-        mirror_log "$SEG_LOG"
+            "${HULL_CONSISTENCY_ARGS[@]}")
+        run_py_step "stage1_segmentation" "segmentation/main_light.py" "$SEG_LOG" new "${SEG_ARGS[@]}"
 
         if [[ ! -f "${COBGS_MASK_DIR}/labels.json" ]]; then
             log "Expected segmentation labels.json not found at ${COBGS_MASK_DIR}/labels.json" >&2
@@ -351,14 +376,9 @@ if [[ -n "$CLASSES" ]]; then
     # it, for use by image-conditioned generators (e.g. TRELLIS.2 generate.py).
     if [[ "$START_FROM_STAGE" -le 2 ]]; then
         stage_start "Stage 2: RGBA mask export -> ${COBGS_MASK_DIR}/<class>/mask_rgba"
-        log_debug_config "stage2_export_rgba_masks" "${GENRECON_DIR}/scripts/export_rgba_masks.py" "$GENRECON_DIR" \
+        run_py_step "stage2_export_rgba_masks" "scripts/export_rgba_masks.py" "$SEG_LOG" append \
             --images_dir "${EXPORT_DIR}/images" \
             --masks_root "$COBGS_MASK_DIR"
-        uv run python -u scripts/export_rgba_masks.py \
-            --images_dir "${EXPORT_DIR}/images" \
-            --masks_root "$COBGS_MASK_DIR" \
-            >> "$SEG_LOG" 2>&1
-        mirror_log "$SEG_LOG"
         stage_end
     else
         log "Stage 2: skipped (--start-from-stage ${START_FROM_STAGE})"
@@ -370,27 +390,18 @@ if [[ -n "$CLASSES" ]]; then
         stage_start "Stage 3: TRELLIS.2 reconstruction -> ${RUN_DIR}/trellis2_meshes"
         TRELLIS2_INPUT_DIR="${RUN_DIR}/trellis2_input"
         TRELLIS2_OUTPUT_DIR="${RUN_DIR}/trellis2_meshes"
-        log_debug_config "stage3_stage_trellis2_inputs" "${GENRECON_DIR}/scripts/stage_trellis2_inputs.py" "$GENRECON_DIR" \
+        run_py_step "stage3_stage_trellis2_inputs" "scripts/stage_trellis2_inputs.py" "$SEG_LOG" append \
             --masks_root "$COBGS_MASK_DIR" \
             --out_dir "$TRELLIS2_INPUT_DIR"
-        uv run python -u scripts/stage_trellis2_inputs.py \
-            --masks_root "$COBGS_MASK_DIR" \
-            --out_dir "$TRELLIS2_INPUT_DIR" \
-            >> "$SEG_LOG" 2>&1
 
-        log_debug_config "stage3_trellis2_generate" "${TRELLIS2_DIR}/generate.py" "$TRELLIS2_DIR" \
+        run_external_step "stage3_trellis2_generate" "${TRELLIS2_DIR}/generate.py" "$TRELLIS2_DIR" \
+            "$SEG_LOG" append "uv run --no-sync generate.py" \
             --input "$TRELLIS2_INPUT_DIR" \
             --output-dir "$TRELLIS2_OUTPUT_DIR" \
             --resolution 512 --no-preview
-        (
-            cd "$TRELLIS2_DIR"
-            uv run --no-sync generate.py \
-                --input "$TRELLIS2_INPUT_DIR" \
-                --output-dir "$TRELLIS2_OUTPUT_DIR" \
-                --resolution 512 --no-preview
-        ) >> "$SEG_LOG" 2>&1
-        mirror_log "$SEG_LOG"
         stage_end
+    else
+        log "Stage 3: skipped (no --use-trellis, or --start-from-stage ${START_FROM_STAGE})"
     fi
     check_stop_after_stage 3
 fi
@@ -419,15 +430,9 @@ if [[ "$START_FROM_STAGE" -le 5 ]]; then
     stage_start "Stage 5: reconstruct_scene.py"
 
     RECON_VRAM_ARGS=()
-    if [[ -n "$MAX_CHUNKS_PER_GROUP" ]]; then
-        RECON_VRAM_ARGS+=(--max_chunks_per_group "$MAX_CHUNKS_PER_GROUP")
-    fi
-    if [[ -n "$MAX_INFLATED_VOXELS" ]]; then
-        RECON_VRAM_ARGS+=(--max_inflated_voxels "$MAX_INFLATED_VOXELS")
-    fi
-    if [[ -n "$FIX_NUM_CHUNKS" ]]; then
-        RECON_VRAM_ARGS+=(--fix_num_chunks "$FIX_NUM_CHUNKS")
-    fi
+    opt_arg RECON_VRAM_ARGS --max_chunks_per_group "$MAX_CHUNKS_PER_GROUP"
+    opt_arg RECON_VRAM_ARGS --max_inflated_voxels "$MAX_INFLATED_VOXELS"
+    opt_arg RECON_VRAM_ARGS --fix_num_chunks "$FIX_NUM_CHUNKS"
 
     # Excludes each segmented class's object from generation itself (voxel-level
     # carving before shape/texture SLat sampling) -- GenRecon conditions on the
@@ -443,21 +448,13 @@ if [[ "$START_FROM_STAGE" -le 5 ]]; then
         RECON_EXCLUDE_ARGS=(--exclude_masks_root "$COBGS_MASK_DIR" --unmasked_path "$SCENE_DIR")
     fi
 
-    log_debug_config "stage5_reconstruct_scene" "${GENRECON_DIR}/reconstruct_scene.py" "$GENRECON_DIR" \
-        --mode Iphone --path "$SCENE_DIR" --output_path "$OUTPUT_DIR" \
+    RECON_ARGS=(--mode Iphone --path "$SCENE_DIR" --output_path "$OUTPUT_DIR" \
         --ss_ckpt checkpoints/sparse_structure/ckpts/sparse_structure.pt \
         --shape_ckpt checkpoints/shape_slat/ckpts/shape_slat.pt \
         --tex_ckpt checkpoints/texture_slat/ckpts/texture_slat.pt \
         --num_imgs_per_scene "$NUM_IMGS_PER_SCENE" --colmap_subdir colmap \
-        "${RECON_VRAM_ARGS[@]}" "${RECON_EXCLUDE_ARGS[@]}"
-    uv run python -u reconstruct_scene.py --mode Iphone --path "$SCENE_DIR" --output_path "$OUTPUT_DIR" \
-        --ss_ckpt checkpoints/sparse_structure/ckpts/sparse_structure.pt \
-        --shape_ckpt checkpoints/shape_slat/ckpts/shape_slat.pt \
-        --tex_ckpt checkpoints/texture_slat/ckpts/texture_slat.pt \
-        --num_imgs_per_scene "$NUM_IMGS_PER_SCENE" --colmap_subdir colmap \
-        "${RECON_VRAM_ARGS[@]}" "${RECON_EXCLUDE_ARGS[@]}" \
-        > "${OUTPUT_DIR}/reconstruct.log" 2>&1
-    mirror_log "${OUTPUT_DIR}/reconstruct.log"
+        "${RECON_VRAM_ARGS[@]}" "${RECON_EXCLUDE_ARGS[@]}")
+    run_py_step "stage5_reconstruct_scene" "reconstruct_scene.py" "${OUTPUT_DIR}/reconstruct.log" new "${RECON_ARGS[@]}"
     stage_end
 else
     log "Stage 5: skipped (--start-from-stage ${START_FROM_STAGE})"
@@ -478,20 +475,13 @@ else
 fi
 if [[ "$START_FROM_STAGE" -le 6 ]]; then
     stage_start "Stage 6: render_reprojection_validation.py"
-    log_debug_config "stage6_render_reprojection_validation" "${GENRECON_DIR}/scripts/render_reprojection_validation.py" "$GENRECON_DIR" \
+    run_py_step "stage6_render_reprojection_validation" "scripts/render_reprojection_validation.py" \
+        "${OUTPUT_DIR}/reprojection_validation.log" new \
         --mesh_ply "$REPROJECTION_MESH_PLY" \
         --colmap_dir "${SCENE_DIR}/colmap" \
         --images_dir "${SCENE_DIR}/rgb" \
         --out_synth_dir "${OUTPUT_DIR}/synth_views" \
         --out_compare_dir "${OUTPUT_DIR}/compare_views"
-    uv run python -u scripts/render_reprojection_validation.py \
-        --mesh_ply "$REPROJECTION_MESH_PLY" \
-        --colmap_dir "${SCENE_DIR}/colmap" \
-        --images_dir "${SCENE_DIR}/rgb" \
-        --out_synth_dir "${OUTPUT_DIR}/synth_views" \
-        --out_compare_dir "${OUTPUT_DIR}/compare_views" \
-        > "${OUTPUT_DIR}/reprojection_validation.log" 2>&1
-    mirror_log "${OUTPUT_DIR}/reprojection_validation.log"
     stage_end
 else
     log "Stage 6: skipped (--start-from-stage ${START_FROM_STAGE})"
@@ -560,7 +550,8 @@ if [[ -n "$CLASSES" && "$START_FROM_STAGE" -le 8 ]]; then
         # USD asset later.
         [[ "$obj_name" == "mesh.ply" || "$obj_name" == "background.ply" || "$obj_name" == *_mesh.ply || "$obj_name" == *_floaters.ply ]] && continue
         label="${obj_name%.ply}"
-        log_debug_config "stage8_extract_object_mesh_${label}" "${GENRECON_DIR}/scripts/extract_object_mesh.py" "$GENRECON_DIR" \
+        run_py_step "stage8_extract_object_mesh_${label}" "scripts/extract_object_mesh.py" \
+            "${OUTPUT_DIR}/reconstruct.log" append \
             --mesh_ply "$BACKGROUND_MESH" \
             --object_mesh_ply "$OBJECT_SOURCE_MESH" \
             --object_ply "$obj_ply" \
@@ -568,18 +559,10 @@ if [[ -n "$CLASSES" && "$START_FROM_STAGE" -le 8 ]]; then
             --remainder_out_ply "$BACKGROUND_MESH" \
             --colmap_dir "${SCENE_DIR}/colmap" \
             --masks_dir "${COBGS_MASK_DIR}/${label}/mask_bin"
-        uv run python -u scripts/extract_object_mesh.py \
-            --mesh_ply "$BACKGROUND_MESH" \
-            --object_mesh_ply "$OBJECT_SOURCE_MESH" \
-            --object_ply "$obj_ply" \
-            --out_ply "${SHAPES_DIR}/${label}_mesh.ply" \
-            --remainder_out_ply "$BACKGROUND_MESH" \
-            --colmap_dir "${SCENE_DIR}/colmap" \
-            --masks_dir "${COBGS_MASK_DIR}/${label}/mask_bin" \
-            >> "${OUTPUT_DIR}/reconstruct.log" 2>&1
 
         if [[ "$RUN_FLOATER_REMOVAL" -eq 1 ]]; then
-            log_debug_config "stage8_remove_floater_mesh_${label}" "${GENRECON_DIR}/scripts/remove_floater_mesh.py" "$GENRECON_DIR" \
+            run_py_step "stage8_remove_floater_mesh_${label}" "scripts/remove_floater_mesh.py" \
+                "${OUTPUT_DIR}/reconstruct.log" append \
                 --mesh_ply "$BACKGROUND_MESH" \
                 --object_ply "$obj_ply" \
                 --out_ply "$BACKGROUND_MESH" \
@@ -587,19 +570,11 @@ if [[ -n "$CLASSES" && "$START_FROM_STAGE" -le 8 ]]; then
                 --search_padding_factor "$FLOATER_SEARCH_PADDING_FACTOR" \
                 --containment_frac "$FLOATER_CONTAINMENT_FRAC" \
                 --max_floater_faces "$FLOATER_MAX_FACES"
-            uv run python -u scripts/remove_floater_mesh.py \
-                --mesh_ply "$BACKGROUND_MESH" \
-                --object_ply "$obj_ply" \
-                --out_ply "$BACKGROUND_MESH" \
-                --floaters_out_ply "${SHAPES_DIR}/${label}_floaters.ply" \
-                --search_padding_factor "$FLOATER_SEARCH_PADDING_FACTOR" \
-                --containment_frac "$FLOATER_CONTAINMENT_FRAC" \
-                --max_floater_faces "$FLOATER_MAX_FACES" \
-                >> "${OUTPUT_DIR}/reconstruct.log" 2>&1
         fi
     done
-    mirror_log "${OUTPUT_DIR}/reconstruct.log"
     stage_end
+else
+    log "Stage 8: skipped (no --classes, or --start-from-stage ${START_FROM_STAGE})"
 fi
 check_stop_after_stage 8
 
@@ -614,34 +589,23 @@ check_stop_after_stage 8
 # the floor removed, chaining the same way Stage 8's per-class crops do.
 if [[ -n "$CLASSES" && "$START_FROM_STAGE" -le 9 ]]; then
     stage_start "Stage 9: extract_floor_mesh.py -> ${SHAPES_DIR}/floor_mesh.ply"
-    log_debug_config "stage9_extract_floor_mesh" "${GENRECON_DIR}/scripts/extract_floor_mesh.py" "$GENRECON_DIR" \
+    run_py_step "stage9_extract_floor_mesh" "scripts/extract_floor_mesh.py" \
+        "${OUTPUT_DIR}/reconstruct.log" append \
         --mesh_ply "${SHAPES_DIR}/background_mesh.ply" \
         --out_ply "${SHAPES_DIR}/floor_mesh.ply" \
         --remainder_out_ply "${SHAPES_DIR}/background_mesh.ply"
-    uv run python -u scripts/extract_floor_mesh.py \
-        --mesh_ply "${SHAPES_DIR}/background_mesh.ply" \
-        --out_ply "${SHAPES_DIR}/floor_mesh.ply" \
-        --remainder_out_ply "${SHAPES_DIR}/background_mesh.ply" \
-        >> "${OUTPUT_DIR}/reconstruct.log" 2>&1
-    mirror_log "${OUTPUT_DIR}/reconstruct.log"
 
     # Friction inference: a LangGraph agent (local Ollama LLM) maps each detected class
     # label to a mu(material, floor) friction coefficient looked up from
     # --friction-table-path's YAML reference table, so Stage 11 (convert_asset.py) can
     # author true per-object friction instead of one global value for every asset.
     stage_start "Stage 9: infer_friction_assignments.py -> ${SHAPES_DIR}/friction_assignments.json"
-    log_debug_config "stage9_infer_friction_assignments" "${GENRECON_DIR}/scripts/infer_friction_assignments.py" "$GENRECON_DIR" \
+    run_py_step "stage9_infer_friction_assignments" "scripts/infer_friction_assignments.py" \
+        "${OUTPUT_DIR}/reconstruct.log" append \
         --labels_json "${COBGS_MASK_DIR}/labels.json" \
         --friction_table "$FRICTION_TABLE_PATH" \
         --out_json "${SHAPES_DIR}/friction_assignments.json" \
         --ollama_model "$OLLAMA_MODEL"
-    uv run python -u scripts/infer_friction_assignments.py \
-        --labels_json "${COBGS_MASK_DIR}/labels.json" \
-        --friction_table "$FRICTION_TABLE_PATH" \
-        --out_json "${SHAPES_DIR}/friction_assignments.json" \
-        --ollama_model "$OLLAMA_MODEL" \
-        >> "${OUTPUT_DIR}/reconstruct.log" 2>&1
-    mirror_log "${OUTPUT_DIR}/reconstruct.log"
     stage_end
 else
     log "Stage 9: skipped (no --classes, or --start-from-stage ${START_FROM_STAGE})"
@@ -658,14 +622,9 @@ if [[ "$RUN_USD" -eq 1 ]]; then
         else
             stage_start "Stage 10: mesh_to_glb.py -> ${SHAPES_DIR}/glb"
         fi
-        log_debug_config "stage10_mesh_to_glb" "${GENRECON_DIR}/scripts/mesh_to_glb.py" "$GENRECON_DIR" \
+        run_py_step "stage10_mesh_to_glb" "scripts/mesh_to_glb.py" "${OUTPUT_DIR}/mesh_to_glb.log" new \
             --shapes_dir "$SHAPES_DIR" \
             --out_dir "${SHAPES_DIR}/glb"
-        uv run python -u scripts/mesh_to_glb.py \
-            --shapes_dir "$SHAPES_DIR" \
-            --out_dir "${SHAPES_DIR}/glb" \
-            > "${OUTPUT_DIR}/mesh_to_glb.log" 2>&1
-        mirror_log "${OUTPUT_DIR}/mesh_to_glb.log"
 
         # --use-trellis: swap the crop-based glb produced above for the
         # TRELLIS.2 reconstruction, rescaled/translated (no rotation search)
@@ -701,17 +660,12 @@ if [[ "$RUN_USD" -eq 1 ]]; then
                     log "Stage 10: --use-trellis: no scene crop for '${label}' at ${SCENE_CROP_PLY}, keeping scene-crop glb."
                     continue
                 fi
-                log_debug_config "stage10_align_trellis2_mesh_${sanitized_label}" "${GENRECON_DIR}/scripts/align_trellis2_mesh_to_scene.py" "$GENRECON_DIR" \
+                run_py_step "stage10_align_trellis2_mesh_${sanitized_label}" "scripts/align_trellis2_mesh_to_scene.py" \
+                    "${OUTPUT_DIR}/mesh_to_glb.log" append \
                     --trellis_glb "$TRELLIS_LABEL_GLB" \
                     --scene_mesh_ply "$SCENE_CROP_PLY" \
                     --out_glb "${SHAPES_DIR}/glb/${sanitized_label}/mesh.glb"
-                uv run python -u scripts/align_trellis2_mesh_to_scene.py \
-                    --trellis_glb "$TRELLIS_LABEL_GLB" \
-                    --scene_mesh_ply "$SCENE_CROP_PLY" \
-                    --out_glb "${SHAPES_DIR}/glb/${sanitized_label}/mesh.glb" \
-                    >> "${OUTPUT_DIR}/mesh_to_glb.log" 2>&1
             done
-            mirror_log "${OUTPUT_DIR}/mesh_to_glb.log"
         fi
         stage_end
     else
@@ -728,18 +682,11 @@ if [[ "$RUN_USD" -eq 1 ]]; then
         if [[ -n "$CLASSES" && -f "${SHAPES_DIR}/friction_assignments.json" ]]; then
             CONVERT_ASSET_FRICTION_ARGS=(--friction-table "${SHAPES_DIR}/friction_assignments.json" --friction-combine-mode max)
         fi
-        log_debug_config "stage11_convert_asset" "${ISAACSIM_DIR}/convert_asset.py" "$ISAACSIM_DIR" \
+        run_external_step "stage11_convert_asset" "${ISAACSIM_DIR}/convert_asset.py" "$ISAACSIM_DIR" \
+            "${OUTPUT_DIR}/convert_asset.log" new "uv run convert_asset.py" \
             --input "${SHAPES_DIR}/glb" \
             --collision-approximation "$COLLISION_APPROXIMATION" \
             "${CONVERT_ASSET_FRICTION_ARGS[@]}"
-        (
-            cd "$ISAACSIM_DIR"
-            uv run convert_asset.py \
-                --input "${SHAPES_DIR}/glb" \
-                --collision-approximation "$COLLISION_APPROXIMATION" \
-                "${CONVERT_ASSET_FRICTION_ARGS[@]}"
-        ) > "${OUTPUT_DIR}/convert_asset.log" 2>&1
-        mirror_log "${OUTPUT_DIR}/convert_asset.log"
         stage_end
     else
         log "Stage 11: skipped (--start-from-stage ${START_FROM_STAGE})"
@@ -748,18 +695,11 @@ if [[ "$RUN_USD" -eq 1 ]]; then
 
     if [[ "$START_FROM_STAGE" -le 12 ]]; then
         stage_start "Stage 12: compose_isaac_scene.py -> ${SHAPES_DIR}/glb/scene.usda"
-        log_debug_config "stage12_compose_isaac_scene" "${ISAACSIM_DIR}/compose_isaac_scene.py" "$ISAACSIM_DIR" \
+        run_external_step "stage12_compose_isaac_scene" "${ISAACSIM_DIR}/compose_isaac_scene.py" "$ISAACSIM_DIR" \
+            "${OUTPUT_DIR}/compose_isaac_scene.log" new "uv run compose_isaac_scene.py" \
             --input "${SHAPES_DIR}/glb" \
             --output "${SHAPES_DIR}/glb/scene.usda" \
             --background-label background
-        (
-            cd "$ISAACSIM_DIR"
-            uv run compose_isaac_scene.py \
-                --input "${SHAPES_DIR}/glb" \
-                --output "${SHAPES_DIR}/glb/scene.usda" \
-                --background-label background
-        ) > "${OUTPUT_DIR}/compose_isaac_scene.log" 2>&1
-        mirror_log "${OUTPUT_DIR}/compose_isaac_scene.log"
         stage_end
     else
         log "Stage 12: skipped (--start-from-stage ${START_FROM_STAGE})"
@@ -769,20 +709,12 @@ fi
 
 if [[ "$RUN_GLB" -eq 1 && "$START_FROM_STAGE" -le 13 ]]; then
     stage_start "Stage 13: chunked_to_glb.py (simplify_threshold=${SIMPLIFY_THRESHOLD}, texture_size=${TEXTURE_SIZE})"
-    log_debug_config "stage13_chunked_to_glb" "${GENRECON_DIR}/chunked_to_glb.py" "$GENRECON_DIR" \
+    run_py_step "stage13_chunked_to_glb" "chunked_to_glb.py" "${OUTPUT_DIR}/glb.log" new \
         --inputs "${OUTPUT_DIR}/to_glb_inputs.pt" \
         --chunk_inputs "${OUTPUT_DIR}/chunk_inputs.pt" \
         --output_dir "$OUTPUT_DIR" \
         --simplify_threshold "$SIMPLIFY_THRESHOLD" \
         --texture_size "$TEXTURE_SIZE"
-    uv run python -u chunked_to_glb.py \
-        --inputs "${OUTPUT_DIR}/to_glb_inputs.pt" \
-        --chunk_inputs "${OUTPUT_DIR}/chunk_inputs.pt" \
-        --output_dir "$OUTPUT_DIR" \
-        --simplify_threshold "$SIMPLIFY_THRESHOLD" \
-        --texture_size "$TEXTURE_SIZE" \
-        > "${OUTPUT_DIR}/glb.log" 2>&1
-    mirror_log "${OUTPUT_DIR}/glb.log"
     stage_end
 
     log "Done: ${OUTPUT_DIR}/scene.glb"
@@ -803,20 +735,13 @@ fi
 FINAL_OBJECTS_DIR="${RUN_DIR}/final_objects"
 if [[ -n "$CLASSES" && "$START_FROM_STAGE" -le 14 ]]; then
     stage_start "Stage 14: organizing final objects -> ${FINAL_OBJECTS_DIR}"
-    log_debug_config "stage14_organize_final_objects" "${GENRECON_DIR}/scripts/organize_final_objects.py" "$GENRECON_DIR" \
+    run_py_step "stage14_organize_final_objects" "scripts/organize_final_objects.py" \
+        "${OUTPUT_DIR}/reconstruct.log" append \
         --shapes_dir "$SHAPES_DIR" \
         --segmentation_raw_dir "${OUTPUT_DIR}/segmentation_raw" \
         --trellis2_input_dir "${RUN_DIR}/trellis2_input" \
         --trellis2_meshes_dir "${RUN_DIR}/trellis2_meshes" \
         --out_dir "$FINAL_OBJECTS_DIR"
-    uv run python -u scripts/organize_final_objects.py \
-        --shapes_dir "$SHAPES_DIR" \
-        --segmentation_raw_dir "${OUTPUT_DIR}/segmentation_raw" \
-        --trellis2_input_dir "${RUN_DIR}/trellis2_input" \
-        --trellis2_meshes_dir "${RUN_DIR}/trellis2_meshes" \
-        --out_dir "$FINAL_OBJECTS_DIR" \
-        >> "${OUTPUT_DIR}/reconstruct.log" 2>&1
-    mirror_log "${OUTPUT_DIR}/reconstruct.log"
     stage_end
 else
     log "Stage 14: skipped (no --classes, or --start-from-stage ${START_FROM_STAGE})"
@@ -832,20 +757,12 @@ ROBOT_COLLISION_DIR="${RUN_DIR}/robot_collision"
 if [[ "$RUN_USD" -eq 1 && -n "$ROBOT_TARGET" && "$START_FROM_STAGE" -le 15 ]]; then
     stage_start "Stage 15: demo_robot_collide.py (robot_target=${ROBOT_TARGET}) -> ${ROBOT_COLLISION_DIR}/robot_collide.mp4"
     mkdir -p "$ROBOT_COLLISION_DIR"
-    log_debug_config "stage15_demo_robot_collide" "${ISAACSIM_DIR}/demo_robot_collide.py" "$ISAACSIM_DIR" \
+    run_external_step "stage15_demo_robot_collide" "${ISAACSIM_DIR}/demo_robot_collide.py" "$ISAACSIM_DIR" \
+        "${ROBOT_COLLISION_DIR}/robot_collide.log" new "uv run demo_robot_collide.py" \
         --scene "${SHAPES_DIR}/glb/scene.usda" \
         --robot-target "$ROBOT_TARGET" \
         --output "${ROBOT_COLLISION_DIR}/robot_collide.mp4" \
         --stage-output "${ROBOT_COLLISION_DIR}/robot_collide_scene.usda"
-    (
-        cd "$ISAACSIM_DIR"
-        uv run demo_robot_collide.py \
-            --scene "${SHAPES_DIR}/glb/scene.usda" \
-            --robot-target "$ROBOT_TARGET" \
-            --output "${ROBOT_COLLISION_DIR}/robot_collide.mp4" \
-            --stage-output "${ROBOT_COLLISION_DIR}/robot_collide_scene.usda"
-    ) > "${ROBOT_COLLISION_DIR}/robot_collide.log" 2>&1
-    mirror_log "${ROBOT_COLLISION_DIR}/robot_collide.log"
     stage_end
 else
     log "Stage 15: skipped (no --robot-target, --skip_isaac, or --start-from-stage ${START_FROM_STAGE})"
