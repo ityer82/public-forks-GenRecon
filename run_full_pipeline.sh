@@ -3,7 +3,7 @@
 # VGGT-Omega and the segmentation stage both now run from in-repo code (vggt/, segmentation/).
 #
 # Usage:
-#   ./run_full_pipeline.sh <image_folder> <scene_name> [--simplify_threshold N] [--texture_size N] [--num_imgs_per_scene N] [--skip-frames N] [--no-align-to-gravity] [--rotate-horizontal-deg N] [--classes a,b,c] [--run_glb] [--use-trellis (default: on)] [--no-use-trellis] [--mesh-backend trellis2|mvsam3d] [--skip_isaac] [--collision_approximation convexDecomposition|convexHull|boundingCube] [--friction-table-path PATH] [--ollama-model NAME] [--start-from-stage N] [--stop-after-stage N] [--max_chunks_per_group N] [--max_inflated_voxels N] [--depth_conf_thres N] [--depth_edge_rtol N] [--fix_num_chunks N] [--robot-target LABEL] [--skip_floater_removal] [--floater_search_padding_factor N] [--floater_containment_frac N] [--floater_max_faces N] [--vggt-conf-thres N] [--skip_hull_consistency_check] [--pick_place_target LABEL] [--place-offset DX,DY,DZ]
+#   ./run_full_pipeline.sh <image_folder> <scene_name> [--simplify_threshold N] [--texture_size N] [--num_imgs_per_scene N] [--skip-frames N] [--no-align-to-gravity] [--rotate-horizontal-deg N] [--classes a,b,c] [--run_glb] [--use-trellis (default: on)] [--no-use-trellis] [--mesh-backend trellis2|mvsam3d] [--skip_isaac] [--collision_approximation convexDecomposition|convexHull|boundingCube] [--friction-table-path PATH] [--ollama-model NAME] [--start-from-stage N] [--stop-after-stage N] [--max_chunks_per_group N] [--max_inflated_voxels N] [--depth_conf_thres N] [--depth_edge_rtol N] [--fix_num_chunks N] [--robot-target LABEL] [--skip_floater_removal] [--floater_search_padding_factor N] [--floater_containment_frac N] [--floater_max_faces N] [--vggt-conf-thres N] [--skip_hull_consistency_check] [--pick_place_target LABEL] [--place-offset DX,DY,DZ] [--place-target LABEL] [--place-target-clearance N] [--gripper-open-width N] [--approach-side neg-x|pos-x|neg-y|pos-y]
 #
 # Note: gravity alignment is ON by default; pass --no-align-to-gravity to disable it.
 #
@@ -23,6 +23,7 @@
 #   ./run_full_pipeline.sh /home/gabis/Work/GitHub/COB-GS/dataset/food2/images food2_vggt --classes "person,chair,bag"
 #   ./run_full_pipeline.sh /home/gabis/Work/GitHub/COB-GS/dataset/food2/images food2_vggt --classes "person,chair,bag" --use-trellis
 #   ./run_full_pipeline.sh /home/gabis/Work/GitHub/COB-GS/dataset/food2/images food2_vggt --classes "banana" --pick_place_target banana
+#   ./run_full_pipeline.sh /home/gabis/Work/GitHub/COB-GS/dataset/food2/images food2_vggt --classes "banana,bowl" --pick_place_target banana --place-target bowl --gripper-open-width 0.08 --approach-side neg-y
 
 set -euo pipefail
 
@@ -78,6 +79,10 @@ FIX_NUM_CHUNKS=16
 ROBOT_TARGET=""
 PICK_PLACE_TARGET=""
 PLACE_OFFSET="0.3,0.0,0.0"
+PLACE_TARGET=""
+PLACE_TARGET_CLEARANCE="0.05"
+GRIPPER_OPEN_WIDTH="0.06"
+APPROACH_SIDE="neg-y"
 RUN_FLOATER_REMOVAL=1
 SKIP_HULL_CONSISTENCY_CHECK=0
 FLOATER_SEARCH_PADDING_FACTOR=0.2
@@ -86,7 +91,7 @@ FLOATER_MAX_FACES=5000
 VGGT_CONF_THRES="20"
 
 if [[ $# -lt 2 ]]; then
-    echo "Usage: $0 <image_folder> <scene_name> [--simplify_threshold N] [--texture_size N] [--num_imgs_per_scene N] [--skip-frames N] [--no-align-to-gravity] [--rotate-horizontal-deg N] [--classes a,b,c] [--run_glb] [--use-trellis (default: on)] [--no-use-trellis] [--mesh-backend trellis2|mvsam3d] [--skip_isaac] [--collision_approximation convexDecomposition|convexHull|boundingCube] [--friction-table-path PATH] [--ollama-model NAME] [--start-from-stage N] [--stop-after-stage N] [--max_chunks_per_group N] [--max_inflated_voxels N] [--depth_conf_thres N] [--depth_edge_rtol N] [--fix_num_chunks N] [--robot-target LABEL] [--skip_floater_removal] [--floater_search_padding_factor N] [--floater_containment_frac N] [--floater_max_faces N] [--vggt-conf-thres N] [--skip_hull_consistency_check] [--pick_place_target LABEL] [--place-offset DX,DY,DZ]" >&2
+    echo "Usage: $0 <image_folder> <scene_name> [--simplify_threshold N] [--texture_size N] [--num_imgs_per_scene N] [--skip-frames N] [--no-align-to-gravity] [--rotate-horizontal-deg N] [--classes a,b,c] [--run_glb] [--use-trellis (default: on)] [--no-use-trellis] [--mesh-backend trellis2|mvsam3d] [--skip_isaac] [--collision_approximation convexDecomposition|convexHull|boundingCube] [--friction-table-path PATH] [--ollama-model NAME] [--start-from-stage N] [--stop-after-stage N] [--max_chunks_per_group N] [--max_inflated_voxels N] [--depth_conf_thres N] [--depth_edge_rtol N] [--fix_num_chunks N] [--robot-target LABEL] [--skip_floater_removal] [--floater_search_padding_factor N] [--floater_containment_frac N] [--floater_max_faces N] [--vggt-conf-thres N] [--skip_hull_consistency_check] [--pick_place_target LABEL] [--place-offset DX,DY,DZ] [--place-target LABEL] [--place-target-clearance N] [--gripper-open-width N] [--approach-side neg-x|pos-x|neg-y|pos-y]" >&2
     exit 1
 fi
 
@@ -121,6 +126,10 @@ while [[ $# -gt 0 ]]; do
         --robot-target) ROBOT_TARGET="$2"; shift 2 ;;
         --pick_place_target) PICK_PLACE_TARGET="$2"; shift 2 ;;
         --place-offset) PLACE_OFFSET="$2"; shift 2 ;;
+        --place-target) PLACE_TARGET="$2"; shift 2 ;;
+        --place-target-clearance) PLACE_TARGET_CLEARANCE="$2"; shift 2 ;;
+        --gripper-open-width) GRIPPER_OPEN_WIDTH="$2"; shift 2 ;;
+        --approach-side) APPROACH_SIDE="$2"; shift 2 ;;
         --skip_floater_removal) RUN_FLOATER_REMOVAL=0; shift 1 ;;
         --skip_hull_consistency_check) SKIP_HULL_CONSISTENCY_CHECK=1; shift 1 ;;
         --floater_search_padding_factor) FLOATER_SEARCH_PADDING_FACTOR="$2"; shift 2 ;;
@@ -178,6 +187,34 @@ if [[ -n "$PICK_PLACE_TARGET" ]]; then
         echo "Note: --pick_place_target requires TRELLIS.2's per-object mesh; overriding --no-use-trellis to on for this run." >&2
         USE_TRELLIS=1
     fi
+fi
+
+# --place-target places the picked object above another --classes object (e.g. a bowl) instead of
+# at a fixed --place-offset -- it only makes sense alongside --pick_place_target, and the place
+# target must itself be one of --classes (so Stage P1-P3 produce a physics-ready mesh for it too).
+if [[ -n "$PLACE_TARGET" ]]; then
+    if [[ -z "$PICK_PLACE_TARGET" ]]; then
+        echo "--place-target requires --pick_place_target to be set." >&2
+        exit 1
+    fi
+    if [[ "$PLACE_TARGET" == "$PICK_PLACE_TARGET" ]]; then
+        echo "--place-target must differ from --pick_place_target ('${PICK_PLACE_TARGET}')." >&2
+        exit 1
+    fi
+    IFS=',' read -ra PLACE_TARGET_CLASSES_CHECK <<< "$CLASSES"
+    PLACE_TARGET_FOUND=0
+    for c in "${PLACE_TARGET_CLASSES_CHECK[@]}"; do
+        [[ "$c" == "$PLACE_TARGET" ]] && PLACE_TARGET_FOUND=1
+    done
+    if [[ "$PLACE_TARGET_FOUND" -eq 0 ]]; then
+        echo "--place-target '${PLACE_TARGET}' must exactly match one of the labels passed to --classes ('${CLASSES}')." >&2
+        exit 1
+    fi
+fi
+
+if [[ "$APPROACH_SIDE" != "neg-x" && "$APPROACH_SIDE" != "pos-x" && "$APPROACH_SIDE" != "neg-y" && "$APPROACH_SIDE" != "pos-y" ]]; then
+    echo "--approach-side must be one of neg-x, pos-x, neg-y, pos-y, got '${APPROACH_SIDE}'." >&2
+    exit 1
 fi
 
 RUN_DIR="${GENRECON_DIR}/runs/${SCENE_NAME}"
@@ -599,13 +636,21 @@ if [[ -n "$PICK_PLACE_TARGET" ]]; then
         --output "$PICK_PLACE_SCENE_USDA"
     stage_end
 
-    stage_start "Stage P4: demo_franka_pickplace.py (pick_target=${PICK_PLACE_TARGET}) -> ${PICK_PLACE_DIR}/pick_place.mp4"
-    IFS=',' read -ra PLACE_OFFSET_ARGS <<< "$PLACE_OFFSET"
+    if [[ -n "$PLACE_TARGET" ]]; then
+        stage_start "Stage P4: demo_franka_pickplace.py (pick_target=${PICK_PLACE_TARGET}, place_target=${PLACE_TARGET}) -> ${PICK_PLACE_DIR}/pick_place.mp4"
+        PLACE_ARGS=(--place-target "$PLACE_TARGET" --place-target-clearance "$PLACE_TARGET_CLEARANCE")
+    else
+        stage_start "Stage P4: demo_franka_pickplace.py (pick_target=${PICK_PLACE_TARGET}) -> ${PICK_PLACE_DIR}/pick_place.mp4"
+        IFS=',' read -ra PLACE_OFFSET_ARGS <<< "$PLACE_OFFSET"
+        PLACE_ARGS=(--place-offset "${PLACE_OFFSET_ARGS[@]}")
+    fi
     run_external_step "stageP4_demo_franka_pickplace" "${ISAACSIM_DIR}/demo_franka_pickplace.py" "$ISAACSIM_DIR" \
         "${PICK_PLACE_DIR}/pick_place.log" new "uv run demo_franka_pickplace.py" \
         --scene "$PICK_PLACE_SCENE_USDA" \
         --pick-target "$PICK_PLACE_TARGET" \
-        --place-offset "${PLACE_OFFSET_ARGS[@]}" \
+        "${PLACE_ARGS[@]}" \
+        --gripper-open-width "$GRIPPER_OPEN_WIDTH" \
+        --approach-side "$APPROACH_SIDE" \
         --output "${PICK_PLACE_DIR}/pick_place.mp4" \
         --stage-output "${PICK_PLACE_DIR}/pick_place_scene.usda"
     stage_end
