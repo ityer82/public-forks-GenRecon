@@ -59,7 +59,7 @@ NUM_IMGS_PER_SCENE=32
 VGGT_EXPORT_TIMEOUT=1800
 RUN_GLB=0
 USE_TRELLIS=1
-MESH_BACKEND="trellis2"
+MESH_BACKEND="mvsam3d"
 RUN_USD=1
 COLLISION_APPROXIMATION="convexDecomposition"
 FRICTION_TABLE_PATH="${GENRECON_DIR}/configs/materials/friction_table.example.yaml"
@@ -458,13 +458,13 @@ if [[ -n "$CLASSES" ]]; then
     check_stop_after_stage 2
 
     # ── Stage 3 (optional): per-class 3D reconstruction (TRELLIS.2 or MV-SAM3D) ──
-    # Output convention is shared regardless of backend: ${RUN_DIR}/trellis2_meshes/<label>/mesh.glb
+    # Output convention is shared regardless of backend: ${RUN_DIR}/image_to_3d_meshes/<label>/mesh.glb
     # -- so every downstream consumer (Stage 10 substitution, Stage 14 organize_final_objects,
     # the pick-place fast path P1-P4) needs no backend-specific handling.
-    TRELLIS2_OUTPUT_DIR="${RUN_DIR}/trellis2_meshes"
+    IMAGE_TO_3D_OUTPUT_DIR="${RUN_DIR}/image_to_3d_meshes"
     if [[ "$USE_TRELLIS" -eq 1 && "$START_FROM_STAGE" -le 3 ]]; then
         if [[ "$MESH_BACKEND" == "trellis2" ]]; then
-            stage_start "Stage 3: TRELLIS.2 reconstruction -> ${TRELLIS2_OUTPUT_DIR}"
+            stage_start "Stage 3: TRELLIS.2 reconstruction -> ${IMAGE_TO_3D_OUTPUT_DIR}"
             TRELLIS2_INPUT_DIR="${RUN_DIR}/trellis2_input"
             run_py_step "stage3_stage_trellis2_inputs" "scripts/stage_trellis2_inputs.py" "$SEG_LOG" append \
                 --masks_root "$COBGS_MASK_DIR" \
@@ -473,7 +473,7 @@ if [[ -n "$CLASSES" ]]; then
             run_external_step "stage3_trellis2_generate" "${TRELLIS2_DIR}/generate.py" "$TRELLIS2_DIR" \
                 "$SEG_LOG" append "uv run --no-sync generate.py" \
                 --input "$TRELLIS2_INPUT_DIR" \
-                --output-dir "$TRELLIS2_OUTPUT_DIR" \
+                --output-dir "$IMAGE_TO_3D_OUTPUT_DIR" \
                 --resolution 512 --no-preview
         else
             # MV-SAM3D backend: bridge genrecon's own VGGT depth/poses + Stage 1's
@@ -482,7 +482,7 @@ if [[ -n "$CLASSES" ]]; then
             # sharing genrecon's own uv venv), then transform each object's
             # canonical-space mesh into genrecon's world frame and drop it at the
             # same path TRELLIS.2 would have used.
-            stage_start "Stage 3: MV-SAM3D reconstruction -> ${TRELLIS2_OUTPUT_DIR}"
+            stage_start "Stage 3: MV-SAM3D reconstruction -> ${IMAGE_TO_3D_OUTPUT_DIR}"
             # basename must be scene-specific: run_inference_weighted.py derives its
             # visualization/<dataset_name>/... output dir from --input_path's basename
             # alone, so a generic name here would collide across different scenes.
@@ -505,7 +505,7 @@ if [[ -n "$CLASSES" ]]; then
                 "$SEG_LOG" append \
                 --dataset_name "$MVSAM3D_DATASET_NAME" \
                 --labels "$CLASSES" \
-                --out_dir "$TRELLIS2_OUTPUT_DIR" \
+                --out_dir "$IMAGE_TO_3D_OUTPUT_DIR" \
                 --visualization_dir "${MVSAM3D_VENDOR_DIR}/visualization"
         fi
         stage_end
@@ -547,7 +547,7 @@ if [[ -n "$PICK_PLACE_TARGET" ]]; then
     IFS=',' read -ra PICK_PLACE_CLASSES <<< "$CLASSES"
     pick_place_first_label=1
     for label in "${PICK_PLACE_CLASSES[@]}"; do
-        # Mirrors Stage 10's identical sanitization (spaces/slashes -> underscores): trellis2_meshes/
+        # Mirrors Stage 10's identical sanitization (spaces/slashes -> underscores): image_to_3d_meshes/
         # (staged by stage_trellis2_inputs.py) keeps the raw --classes spelling, but COBGS_MASK_DIR
         # (segmentation_raw/masks/classes, via labels.json's sanitize_label) and the scene-side glb
         # directory (and everything Stage P2/P3 derive from it, including the composed prim name)
@@ -557,7 +557,7 @@ if [[ -n "$PICK_PLACE_TARGET" ]]; then
         sanitized_label="${label// /_}"
         sanitized_label="${sanitized_label//\//_}"
         mkdir -p "${PICK_PLACE_GLB_DIR}/${sanitized_label}"
-        TRELLIS_LABEL_GLB="${RUN_DIR}/trellis2_meshes/${label}/mesh.glb"
+        TRELLIS_LABEL_GLB="${RUN_DIR}/image_to_3d_meshes/${label}/mesh.glb"
         LABEL_SCALE_REF_PLY="${COBGS_MASK_DIR}/${sanitized_label}/point_cloud/${sanitized_label}.ply"
         if [[ ! -f "$TRELLIS_LABEL_GLB" ]]; then
             log "Expected TRELLIS.2 mesh not found at ${TRELLIS_LABEL_GLB}" >&2
@@ -848,7 +848,7 @@ if [[ "$RUN_USD" -eq 1 ]]; then
         if [[ "$USE_TRELLIS" -eq 1 ]]; then
             IFS=',' read -ra USE_TRELLIS_CLASSES <<< "$CLASSES"
             for label in "${USE_TRELLIS_CLASSES[@]}"; do
-                # trellis2_meshes/<label> keeps the raw --classes spelling (spaces
+                # image_to_3d_meshes/<label> keeps the raw --classes spelling (spaces
                 # and all -- staged straight from labels.json's class names by
                 # stage_trellis2_inputs.py), but every scene-side artifact
                 # (shapes/<label>_mesh.ply from Stage 8, glb/<label>/ from
@@ -860,7 +860,7 @@ if [[ "$RUN_USD" -eq 1 ]]; then
                 # never applies to that class.
                 sanitized_label="${label// /_}"
                 sanitized_label="${sanitized_label//\//_}"
-                TRELLIS_LABEL_GLB="${RUN_DIR}/trellis2_meshes/${label}/mesh.glb"
+                TRELLIS_LABEL_GLB="${RUN_DIR}/image_to_3d_meshes/${label}/mesh.glb"
                 SCENE_CROP_PLY="${SHAPES_DIR}/${sanitized_label}_mesh.ply"
                 if [[ ! -f "$TRELLIS_LABEL_GLB" ]]; then
                     log "Stage 10: --use-trellis: no TRELLIS.2 mesh for '${label}' at ${TRELLIS_LABEL_GLB}, keeping scene-crop glb."
@@ -953,7 +953,7 @@ if [[ -n "$CLASSES" && "$START_FROM_STAGE" -le 14 ]]; then
         --shapes_dir "$SHAPES_DIR" \
         --segmentation_raw_dir "${OUTPUT_DIR}/segmentation_raw" \
         --trellis2_input_dir "${RUN_DIR}/trellis2_input" \
-        --trellis2_meshes_dir "${RUN_DIR}/trellis2_meshes" \
+        --trellis2_meshes_dir "${RUN_DIR}/image_to_3d_meshes" \
         --out_dir "$FINAL_OBJECTS_DIR"
     stage_end
 else
