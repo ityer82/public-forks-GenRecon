@@ -3,9 +3,18 @@
 # VGGT-Omega and the segmentation stage both now run from in-repo code (vggt/, segmentation/).
 #
 # Usage:
-#   ./run_full_pipeline.sh <image_folder> <scene_name> [--simplify_threshold N] [--texture_size N] [--num_imgs_per_scene N] [--skip-frames N] [--no-align-to-gravity] [--rotate-horizontal-deg N] [--classes a,b,c] [--run_glb] [--use-trellis (default: on)] [--no-use-trellis] [--skip_isaac] [--collision_approximation convexDecomposition|convexHull|boundingCube] [--friction-table-path PATH] [--ollama-model NAME] [--start-from-stage N] [--stop-after-stage N] [--max_chunks_per_group N] [--max_inflated_voxels N] [--depth_conf_thres N] [--depth_edge_rtol N] [--fix_num_chunks N] [--robot-target LABEL] [--skip_floater_removal] [--floater_search_padding_factor N] [--floater_containment_frac N] [--floater_max_faces N] [--vggt-conf-thres N] [--skip_hull_consistency_check]
+#   ./run_full_pipeline.sh <image_folder> <scene_name> [--simplify_threshold N] [--texture_size N] [--num_imgs_per_scene N] [--skip-frames N] [--no-align-to-gravity] [--rotate-horizontal-deg N] [--classes a,b,c] [--run_glb] [--use-trellis (default: on)] [--no-use-trellis] [--skip_isaac] [--collision_approximation convexDecomposition|convexHull|boundingCube] [--friction-table-path PATH] [--ollama-model NAME] [--start-from-stage N] [--stop-after-stage N] [--max_chunks_per_group N] [--max_inflated_voxels N] [--depth_conf_thres N] [--depth_edge_rtol N] [--fix_num_chunks N] [--robot-target LABEL] [--skip_floater_removal] [--floater_search_padding_factor N] [--floater_containment_frac N] [--floater_max_faces N] [--vggt-conf-thres N] [--skip_hull_consistency_check] [--pick_place_target LABEL] [--place-offset DX,DY,DZ]
 #
 # Note: gravity alignment is ON by default; pass --no-align-to-gravity to disable it.
+#
+# Note: --pick_place_target LABEL is a fast-path alternative to the full scene reconstruction --
+# once segmentation + TRELLIS.2 (Stages 1-3) produce a per-object mesh for every label in --classes,
+# it skips the GenRecon scene reconstruction/GLB bake entirely (Stages 4-14) and instead converts
+# every --classes object (not just LABEL) + a synthetic ground plane to a minimal physics-ready USD
+# scene -- each object independently rescaled/positioned into the shared real-world scene frame, so
+# their relative poses match the actual scanned scene -- then runs a Franka pick-and-place demo that
+# manipulates only LABEL. Mutually exclusive with --robot-target, which needs the full reconstructed
+# scene.
 #
 # Example:
 #   ./run_full_pipeline.sh /home/gabis/Work/GitHub/COB-GS/dataset/food2/images food2_vggt
@@ -13,6 +22,7 @@
 #   ./run_full_pipeline.sh /home/gabis/Work/GitHub/COB-GS/dataset/food2/images food2_vggt --rotate-horizontal-deg 90
 #   ./run_full_pipeline.sh /home/gabis/Work/GitHub/COB-GS/dataset/food2/images food2_vggt --classes "person,chair,bag"
 #   ./run_full_pipeline.sh /home/gabis/Work/GitHub/COB-GS/dataset/food2/images food2_vggt --classes "person,chair,bag" --use-trellis
+#   ./run_full_pipeline.sh /home/gabis/Work/GitHub/COB-GS/dataset/food2/images food2_vggt --classes "banana" --pick_place_target banana
 
 set -euo pipefail
 
@@ -62,6 +72,8 @@ DEPTH_CONF_THRES=50.0
 DEPTH_EDGE_RTOL=0.03
 FIX_NUM_CHUNKS=16
 ROBOT_TARGET=""
+PICK_PLACE_TARGET=""
+PLACE_OFFSET="0.3,0.0,0.0"
 RUN_FLOATER_REMOVAL=1
 SKIP_HULL_CONSISTENCY_CHECK=0
 FLOATER_SEARCH_PADDING_FACTOR=0.2
@@ -70,7 +82,7 @@ FLOATER_MAX_FACES=5000
 VGGT_CONF_THRES="20"
 
 if [[ $# -lt 2 ]]; then
-    echo "Usage: $0 <image_folder> <scene_name> [--simplify_threshold N] [--texture_size N] [--num_imgs_per_scene N] [--skip-frames N] [--no-align-to-gravity] [--rotate-horizontal-deg N] [--classes a,b,c] [--run_glb] [--use-trellis (default: on)] [--no-use-trellis] [--skip_isaac] [--collision_approximation convexDecomposition|convexHull|boundingCube] [--friction-table-path PATH] [--ollama-model NAME] [--start-from-stage N] [--stop-after-stage N] [--max_chunks_per_group N] [--max_inflated_voxels N] [--depth_conf_thres N] [--depth_edge_rtol N] [--fix_num_chunks N] [--robot-target LABEL] [--skip_floater_removal] [--floater_search_padding_factor N] [--floater_containment_frac N] [--floater_max_faces N] [--vggt-conf-thres N] [--skip_hull_consistency_check]" >&2
+    echo "Usage: $0 <image_folder> <scene_name> [--simplify_threshold N] [--texture_size N] [--num_imgs_per_scene N] [--skip-frames N] [--no-align-to-gravity] [--rotate-horizontal-deg N] [--classes a,b,c] [--run_glb] [--use-trellis (default: on)] [--no-use-trellis] [--skip_isaac] [--collision_approximation convexDecomposition|convexHull|boundingCube] [--friction-table-path PATH] [--ollama-model NAME] [--start-from-stage N] [--stop-after-stage N] [--max_chunks_per_group N] [--max_inflated_voxels N] [--depth_conf_thres N] [--depth_edge_rtol N] [--fix_num_chunks N] [--robot-target LABEL] [--skip_floater_removal] [--floater_search_padding_factor N] [--floater_containment_frac N] [--floater_max_faces N] [--vggt-conf-thres N] [--skip_hull_consistency_check] [--pick_place_target LABEL] [--place-offset DX,DY,DZ]" >&2
     exit 1
 fi
 
@@ -102,6 +114,8 @@ while [[ $# -gt 0 ]]; do
         --depth_edge_rtol) DEPTH_EDGE_RTOL="$2"; shift 2 ;;
         --fix_num_chunks) FIX_NUM_CHUNKS="$2"; shift 2 ;;
         --robot-target) ROBOT_TARGET="$2"; shift 2 ;;
+        --pick_place_target) PICK_PLACE_TARGET="$2"; shift 2 ;;
+        --place-offset) PLACE_OFFSET="$2"; shift 2 ;;
         --skip_floater_removal) RUN_FLOATER_REMOVAL=0; shift 1 ;;
         --skip_hull_consistency_check) SKIP_HULL_CONSISTENCY_CHECK=1; shift 1 ;;
         --floater_search_padding_factor) FLOATER_SEARCH_PADDING_FACTOR="$2"; shift 2 ;;
@@ -123,6 +137,33 @@ fi
 if [[ "$USE_TRELLIS" -eq 1 && -z "$CLASSES" ]]; then
     echo "Note: --classes not set, so TRELLIS.2 reconstruction (enabled by default) does not apply to this run." >&2
     USE_TRELLIS=0
+fi
+
+# --pick_place_target is a fast-path alternative to the full scene reconstruction (see Stage P1-P4
+# below): it needs a TRELLIS.2 per-object mesh for the target class, and has no meaning alongside
+# --robot-target, which drives a mobile robot into an object inside the *full* reconstructed scene.
+if [[ -n "$PICK_PLACE_TARGET" ]]; then
+    if [[ -n "$ROBOT_TARGET" ]]; then
+        echo "--pick_place_target and --robot-target are mutually exclusive (one skips the full scene reconstruction, the other requires it)." >&2
+        exit 1
+    fi
+    if [[ -z "$CLASSES" ]]; then
+        echo "--pick_place_target requires --classes to include the same label." >&2
+        exit 1
+    fi
+    IFS=',' read -ra PICK_PLACE_CLASSES_CHECK <<< "$CLASSES"
+    PICK_PLACE_TARGET_FOUND=0
+    for c in "${PICK_PLACE_CLASSES_CHECK[@]}"; do
+        [[ "$c" == "$PICK_PLACE_TARGET" ]] && PICK_PLACE_TARGET_FOUND=1
+    done
+    if [[ "$PICK_PLACE_TARGET_FOUND" -eq 0 ]]; then
+        echo "--pick_place_target '${PICK_PLACE_TARGET}' must exactly match one of the labels passed to --classes ('${CLASSES}')." >&2
+        exit 1
+    fi
+    if [[ "$USE_TRELLIS" -eq 0 ]]; then
+        echo "Note: --pick_place_target requires TRELLIS.2's per-object mesh; overriding --no-use-trellis to on for this run." >&2
+        USE_TRELLIS=1
+    fi
 fi
 
 RUN_DIR="${GENRECON_DIR}/runs/${SCENE_NAME}"
@@ -405,6 +446,104 @@ if [[ -n "$CLASSES" ]]; then
         log "Stage 3: skipped (no --use-trellis, or --start-from-stage ${START_FROM_STAGE})"
     fi
     check_stop_after_stage 3
+fi
+
+# ── Stage P1-P4 (fast path, mutually exclusive with the rest of the pipeline): Franka
+# pick-and-place demo from the segmented object alone, skipping GenRecon scene reconstruction
+# entirely. Only TRELLIS.2's per-object mesh (Stage 3, already produced above) is needed -- no
+# background reconstruction, GLB bake, or per-object mesh cropping (Stages 4-14) applies here,
+# since there is no reconstructed scene to crop from.
+if [[ -n "$PICK_PLACE_TARGET" ]]; then
+    PICK_PLACE_DIR="${RUN_DIR}/pick_place"
+    PICK_PLACE_GLB_DIR="${PICK_PLACE_DIR}/glb"
+    PICK_PLACE_SCENE_USDA="${PICK_PLACE_GLB_DIR}/scene.usda"
+
+    # TRELLIS.2's mesh.glb is in its own object-centric canonical frame (longest bbox axis
+    # normalized to ~1.0, see align_trellis2_mesh_to_scene.py's docstring) -- it carries no
+    # real-world scale at all. The full pipeline's Stage 10 recovers scale/position by aligning
+    # against the object's real crop out of the reconstructed scene mesh (shapes/<label>_mesh.ply),
+    # which doesn't exist in this fast path (no scene reconstruction runs). Stage 1's segmented
+    # point cloud (COBGS_MASK_DIR/<label>/point_cloud/<label>.ply) is already in that same metric
+    # scene frame -- align_trellis2_mesh_to_scene.py's target-bbox loader only reads vertex
+    # positions, so it works identically as a scale/translation reference whether the PLY is a
+    # mesh or a raw point cloud.
+    #
+    # Every --classes label is aligned here, not just PICK_PLACE_TARGET: each label's TRELLIS.2
+    # mesh gets independently rescaled/translated into the same shared metric scene frame (via its
+    # own segmented point cloud as reference), so once composed (Stage P3) their relative poses
+    # match the real scanned scene -- compose_isaac_scene.py reads no separate pose file, it derives
+    # each asset's world position purely from the pivot baked in by convert_asset.py, so getting
+    # every object into this shared frame here is the only thing that makes that work. "background"
+    # is never one of --classes, so it's naturally excluded; there's no reconstructed background
+    # asset in this fast path to include even if it were.
+    stage_start "Stage P1: aligning TRELLIS.2 meshes for all --classes labels to scene scale -> ${PICK_PLACE_GLB_DIR}"
+    IFS=',' read -ra PICK_PLACE_CLASSES <<< "$CLASSES"
+    pick_place_first_label=1
+    for label in "${PICK_PLACE_CLASSES[@]}"; do
+        # Mirrors Stage 10's identical sanitization (spaces/slashes -> underscores): trellis2_meshes/
+        # (staged by stage_trellis2_inputs.py) keeps the raw --classes spelling, but COBGS_MASK_DIR
+        # (segmentation_raw/masks/classes, via labels.json's sanitize_label) and the scene-side glb
+        # directory (and everything Stage P2/P3 derive from it, including the composed prim name)
+        # both use the sanitized spelling -- a multi-word label (e.g. "white chair") must use each
+        # spelling against the artifact that actually uses it, or this lookup silently target the
+        # wrong (nonexistent) path.
+        sanitized_label="${label// /_}"
+        sanitized_label="${sanitized_label//\//_}"
+        mkdir -p "${PICK_PLACE_GLB_DIR}/${sanitized_label}"
+        TRELLIS_LABEL_GLB="${RUN_DIR}/trellis2_meshes/${label}/mesh.glb"
+        LABEL_SCALE_REF_PLY="${COBGS_MASK_DIR}/${sanitized_label}/point_cloud/${sanitized_label}.ply"
+        if [[ ! -f "$TRELLIS_LABEL_GLB" ]]; then
+            log "Expected TRELLIS.2 mesh not found at ${TRELLIS_LABEL_GLB}" >&2
+            exit 1
+        fi
+        if [[ ! -f "$LABEL_SCALE_REF_PLY" ]]; then
+            log "Expected segmented point cloud not found at ${LABEL_SCALE_REF_PLY}" >&2
+            exit 1
+        fi
+        pick_place_redir="append"
+        [[ "$pick_place_first_label" -eq 1 ]] && pick_place_redir="new"
+        run_py_step "stageP1_align_trellis2_mesh_${sanitized_label}" "scripts/align_trellis2_mesh_to_scene.py" \
+            "${PICK_PLACE_DIR}/align_trellis2_mesh.log" "$pick_place_redir" \
+            --trellis_glb "$TRELLIS_LABEL_GLB" \
+            --scene_mesh_ply "$LABEL_SCALE_REF_PLY" \
+            --out_glb "${PICK_PLACE_GLB_DIR}/${sanitized_label}/mesh.glb"
+        pick_place_first_label=0
+    done
+    stage_end
+
+    stage_start "Stage P2: convert_asset.py (collision_approximation=${COLLISION_APPROXIMATION}) -> ${PICK_PLACE_GLB_DIR}/<label>/asset.usd"
+    run_external_step "stageP2_convert_asset" "${ISAACSIM_DIR}/convert_asset.py" "$ISAACSIM_DIR" \
+        "${PICK_PLACE_DIR}/convert_asset.log" new "uv run convert_asset.py" \
+        --input "$PICK_PLACE_GLB_DIR" \
+        --collision-approximation "$COLLISION_APPROXIMATION"
+    stage_end
+
+    stage_start "Stage P3: compose_isaac_scene.py -> ${PICK_PLACE_SCENE_USDA}"
+    # No --background-label/--floor-label passed: neither asset exists in this fast path (there's no
+    # reconstructed background/floor mesh, by design -- see Stage P1's comment), and both flags just
+    # fail their (harmless) label lookups when absent -- compose_isaac_scene.py still composes every
+    # object plus its default synthetic ground plane, sized to sit under the lowest of all of them.
+    run_external_step "stageP3_compose_isaac_scene" "${ISAACSIM_DIR}/compose_isaac_scene.py" "$ISAACSIM_DIR" \
+        "${PICK_PLACE_DIR}/compose_isaac_scene.log" new "uv run compose_isaac_scene.py" \
+        --input "$PICK_PLACE_GLB_DIR" \
+        --output "$PICK_PLACE_SCENE_USDA"
+    stage_end
+
+    stage_start "Stage P4: demo_franka_pickplace.py (pick_target=${PICK_PLACE_TARGET}) -> ${PICK_PLACE_DIR}/pick_place.mp4"
+    IFS=',' read -ra PLACE_OFFSET_ARGS <<< "$PLACE_OFFSET"
+    run_external_step "stageP4_demo_franka_pickplace" "${ISAACSIM_DIR}/demo_franka_pickplace.py" "$ISAACSIM_DIR" \
+        "${PICK_PLACE_DIR}/pick_place.log" new "uv run demo_franka_pickplace.py" \
+        --scene "$PICK_PLACE_SCENE_USDA" \
+        --pick-target "$PICK_PLACE_TARGET" \
+        --place-offset "${PLACE_OFFSET_ARGS[@]}" \
+        --output "${PICK_PLACE_DIR}/pick_place.mp4" \
+        --stage-output "${PICK_PLACE_DIR}/pick_place_scene.usda"
+    stage_end
+
+    PIPELINE_ELAPSED=$(( $(date +%s) - PIPELINE_T0 ))
+    log "Pipeline finished for scene '${SCENE_NAME}' (pick-and-place fast path, total elapsed $(format_duration "$PIPELINE_ELAPSED"))"
+    log "Done: ${PICK_PLACE_DIR}/pick_place.mp4"
+    exit 0
 fi
 
 # ── Stage 4: stage GenRecon scene dir ──
