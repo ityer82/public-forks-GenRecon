@@ -3,7 +3,7 @@
 # VGGT-Omega and the segmentation stage both now run from in-repo code (vggt/, segmentation/).
 #
 # Usage:
-#   ./run_full_pipeline.sh <image_folder> <scene_name> [--simplify_threshold N] [--texture_size N] [--num_imgs_per_scene N] [--skip-frames N] [--no-align-to-gravity] [--rotate-horizontal-deg N] [--classes a,b,c] [--run_glb] [--use-trellis (default: on)] [--no-use-trellis] [--skip_isaac] [--collision_approximation convexDecomposition|convexHull|boundingCube] [--friction-table-path PATH] [--ollama-model NAME] [--start-from-stage N] [--stop-after-stage N] [--max_chunks_per_group N] [--max_inflated_voxels N] [--depth_conf_thres N] [--depth_edge_rtol N] [--fix_num_chunks N] [--robot-target LABEL] [--skip_floater_removal] [--floater_search_padding_factor N] [--floater_containment_frac N] [--floater_max_faces N] [--vggt-conf-thres N] [--skip_hull_consistency_check] [--pick_place_target LABEL] [--place-offset DX,DY,DZ]
+#   ./run_full_pipeline.sh <image_folder> <scene_name> [--simplify_threshold N] [--texture_size N] [--num_imgs_per_scene N] [--skip-frames N] [--no-align-to-gravity] [--rotate-horizontal-deg N] [--classes a,b,c] [--run_glb] [--use-trellis (default: on)] [--no-use-trellis] [--mesh-backend trellis2|mvsam3d] [--skip_isaac] [--collision_approximation convexDecomposition|convexHull|boundingCube] [--friction-table-path PATH] [--ollama-model NAME] [--start-from-stage N] [--stop-after-stage N] [--max_chunks_per_group N] [--max_inflated_voxels N] [--depth_conf_thres N] [--depth_edge_rtol N] [--fix_num_chunks N] [--robot-target LABEL] [--skip_floater_removal] [--floater_search_padding_factor N] [--floater_containment_frac N] [--floater_max_faces N] [--vggt-conf-thres N] [--skip_hull_consistency_check] [--pick_place_target LABEL] [--place-offset DX,DY,DZ]
 #
 # Note: gravity alignment is ON by default; pass --no-align-to-gravity to disable it.
 #
@@ -29,6 +29,9 @@ set -euo pipefail
 GENRECON_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 TRELLIS2_DIR="$(cd "$GENRECON_DIR/../trellis2" && pwd)"
 ISAACSIM_DIR="$(cd "$GENRECON_DIR/../IsaacSim" && pwd)"
+# MV-SAM3D's source (sam3d_objects/, notebook/, mvsam3d_scripts/, run_inference_weighted.py)
+# is vendored in-repo under mv_sam3d/ -- no sibling checkout needed for --mesh-backend mvsam3d.
+MVSAM3D_VENDOR_DIR="${GENRECON_DIR}/mv_sam3d"
 VGGT_CHECKPOINT="${GENRECON_DIR}/checkpoints/vggt_omega/ckpts/vggt_omega_1b_512.pt"
 
 # ── CUDA toolkit selection for git-dependency builds (e.g. nvdiffrec-render) ──
@@ -56,6 +59,7 @@ NUM_IMGS_PER_SCENE=32
 VGGT_EXPORT_TIMEOUT=1800
 RUN_GLB=0
 USE_TRELLIS=1
+MESH_BACKEND="trellis2"
 RUN_USD=1
 COLLISION_APPROXIMATION="convexDecomposition"
 FRICTION_TABLE_PATH="${GENRECON_DIR}/configs/materials/friction_table.example.yaml"
@@ -82,7 +86,7 @@ FLOATER_MAX_FACES=5000
 VGGT_CONF_THRES="20"
 
 if [[ $# -lt 2 ]]; then
-    echo "Usage: $0 <image_folder> <scene_name> [--simplify_threshold N] [--texture_size N] [--num_imgs_per_scene N] [--skip-frames N] [--no-align-to-gravity] [--rotate-horizontal-deg N] [--classes a,b,c] [--run_glb] [--use-trellis (default: on)] [--no-use-trellis] [--skip_isaac] [--collision_approximation convexDecomposition|convexHull|boundingCube] [--friction-table-path PATH] [--ollama-model NAME] [--start-from-stage N] [--stop-after-stage N] [--max_chunks_per_group N] [--max_inflated_voxels N] [--depth_conf_thres N] [--depth_edge_rtol N] [--fix_num_chunks N] [--robot-target LABEL] [--skip_floater_removal] [--floater_search_padding_factor N] [--floater_containment_frac N] [--floater_max_faces N] [--vggt-conf-thres N] [--skip_hull_consistency_check] [--pick_place_target LABEL] [--place-offset DX,DY,DZ]" >&2
+    echo "Usage: $0 <image_folder> <scene_name> [--simplify_threshold N] [--texture_size N] [--num_imgs_per_scene N] [--skip-frames N] [--no-align-to-gravity] [--rotate-horizontal-deg N] [--classes a,b,c] [--run_glb] [--use-trellis (default: on)] [--no-use-trellis] [--mesh-backend trellis2|mvsam3d] [--skip_isaac] [--collision_approximation convexDecomposition|convexHull|boundingCube] [--friction-table-path PATH] [--ollama-model NAME] [--start-from-stage N] [--stop-after-stage N] [--max_chunks_per_group N] [--max_inflated_voxels N] [--depth_conf_thres N] [--depth_edge_rtol N] [--fix_num_chunks N] [--robot-target LABEL] [--skip_floater_removal] [--floater_search_padding_factor N] [--floater_containment_frac N] [--floater_max_faces N] [--vggt-conf-thres N] [--skip_hull_consistency_check] [--pick_place_target LABEL] [--place-offset DX,DY,DZ]" >&2
     exit 1
 fi
 
@@ -102,6 +106,7 @@ while [[ $# -gt 0 ]]; do
         --run_glb) RUN_GLB=1; shift 1 ;;
         --use-trellis) USE_TRELLIS=1; shift 1 ;;
         --no-use-trellis) USE_TRELLIS=0; shift 1 ;;
+        --mesh-backend) MESH_BACKEND="$2"; shift 2 ;;
         --skip_isaac) RUN_USD=0; shift 1 ;;
         --collision_approximation) COLLISION_APPROXIMATION="$2"; shift 2 ;;
         --friction-table-path) FRICTION_TABLE_PATH="$2"; shift 2 ;;
@@ -135,8 +140,17 @@ fi
 # defaults to on, which would otherwise break every whole-scene (no
 # --classes) invocation, so silently drop it here instead of erroring.
 if [[ "$USE_TRELLIS" -eq 1 && -z "$CLASSES" ]]; then
-    echo "Note: --classes not set, so TRELLIS.2 reconstruction (enabled by default) does not apply to this run." >&2
+    echo "Note: --classes not set, so per-class mesh reconstruction (enabled by default) does not apply to this run." >&2
     USE_TRELLIS=0
+fi
+
+if [[ "$MESH_BACKEND" != "trellis2" && "$MESH_BACKEND" != "mvsam3d" ]]; then
+    echo "--mesh-backend must be 'trellis2' or 'mvsam3d', got '${MESH_BACKEND}'." >&2
+    exit 1
+fi
+if [[ "$MESH_BACKEND" == "mvsam3d" && ! -d "$MVSAM3D_VENDOR_DIR" ]]; then
+    echo "--mesh-backend mvsam3d requires the vendored MV-SAM3D source at ${MVSAM3D_VENDOR_DIR}." >&2
+    exit 1
 fi
 
 # --pick_place_target is a fast-path alternative to the full scene reconstruction (see Stage P1-P4
@@ -279,6 +293,22 @@ run_external_step() {
         ( cd "$cwd" && $runner "$@" ) >> "$log_file" 2>&1
     else
         ( cd "$cwd" && $runner "$@" ) > "$log_file" 2>&1
+    fi
+    mirror_log "$log_file"
+}
+
+# Like run_py_step, but cd's into a vendored subdir first -- needed only for
+# mv_sam3d/run_inference_weighted.py, which resolves checkpoints/ and
+# visualization/ relative to CWD rather than __file__. Still uses genrecon's
+# own shared root .venv (uv run from a subdirectory resolves to the same
+# project), unlike run_external_step's separate --no-sync sibling-repo venv.
+run_py_step_in_dir() {
+    local name="$1" script="$2" cwd="$3" log_file="$4" redir="$5"; shift 5
+    log_debug_config "$name" "${cwd}/${script}" "$cwd" "$@"
+    if [[ "$redir" == append ]]; then
+        ( cd "$cwd" && uv run python -u "$script" "$@" ) >> "$log_file" 2>&1
+    else
+        ( cd "$cwd" && uv run python -u "$script" "$@" ) > "$log_file" 2>&1
     fi
     mirror_log "$log_file"
 }
@@ -427,20 +457,57 @@ if [[ -n "$CLASSES" ]]; then
     fi
     check_stop_after_stage 2
 
-    # ── Stage 3 (optional): TRELLIS.2 3D reconstruction per class ──
+    # ── Stage 3 (optional): per-class 3D reconstruction (TRELLIS.2 or MV-SAM3D) ──
+    # Output convention is shared regardless of backend: ${RUN_DIR}/trellis2_meshes/<label>/mesh.glb
+    # -- so every downstream consumer (Stage 10 substitution, Stage 14 organize_final_objects,
+    # the pick-place fast path P1-P4) needs no backend-specific handling.
+    TRELLIS2_OUTPUT_DIR="${RUN_DIR}/trellis2_meshes"
     if [[ "$USE_TRELLIS" -eq 1 && "$START_FROM_STAGE" -le 3 ]]; then
-        stage_start "Stage 3: TRELLIS.2 reconstruction -> ${RUN_DIR}/trellis2_meshes"
-        TRELLIS2_INPUT_DIR="${RUN_DIR}/trellis2_input"
-        TRELLIS2_OUTPUT_DIR="${RUN_DIR}/trellis2_meshes"
-        run_py_step "stage3_stage_trellis2_inputs" "scripts/stage_trellis2_inputs.py" "$SEG_LOG" append \
-            --masks_root "$COBGS_MASK_DIR" \
-            --out_dir "$TRELLIS2_INPUT_DIR"
+        if [[ "$MESH_BACKEND" == "trellis2" ]]; then
+            stage_start "Stage 3: TRELLIS.2 reconstruction -> ${TRELLIS2_OUTPUT_DIR}"
+            TRELLIS2_INPUT_DIR="${RUN_DIR}/trellis2_input"
+            run_py_step "stage3_stage_trellis2_inputs" "scripts/stage_trellis2_inputs.py" "$SEG_LOG" append \
+                --masks_root "$COBGS_MASK_DIR" \
+                --out_dir "$TRELLIS2_INPUT_DIR"
 
-        run_external_step "stage3_trellis2_generate" "${TRELLIS2_DIR}/generate.py" "$TRELLIS2_DIR" \
-            "$SEG_LOG" append "uv run --no-sync generate.py" \
-            --input "$TRELLIS2_INPUT_DIR" \
-            --output-dir "$TRELLIS2_OUTPUT_DIR" \
-            --resolution 512 --no-preview
+            run_external_step "stage3_trellis2_generate" "${TRELLIS2_DIR}/generate.py" "$TRELLIS2_DIR" \
+                "$SEG_LOG" append "uv run --no-sync generate.py" \
+                --input "$TRELLIS2_INPUT_DIR" \
+                --output-dir "$TRELLIS2_OUTPUT_DIR" \
+                --resolution 512 --no-preview
+        else
+            # MV-SAM3D backend: bridge genrecon's own VGGT depth/poses + Stage 1's
+            # per-class masks directly (no DA3, no Stage 2 RGBA export needed), run
+            # MV-SAM3D's multi-object inference (vendored in-repo under mv_sam3d/,
+            # sharing genrecon's own uv venv), then transform each object's
+            # canonical-space mesh into genrecon's world frame and drop it at the
+            # same path TRELLIS.2 would have used.
+            stage_start "Stage 3: MV-SAM3D reconstruction -> ${TRELLIS2_OUTPUT_DIR}"
+            # basename must be scene-specific: run_inference_weighted.py derives its
+            # visualization/<dataset_name>/... output dir from --input_path's basename
+            # alone, so a generic name here would collide across different scenes.
+            MVSAM3D_INPUT_DIR="${RUN_DIR}/${SCENE_NAME}_mvsam3d_input"
+            MVSAM3D_DATASET_NAME="$(basename "$MVSAM3D_INPUT_DIR")"
+
+            run_py_step "stage3_import_from_genrecon" "mv_sam3d/mvsam3d_scripts/import_from_genrecon.py" \
+                "$SEG_LOG" append \
+                --genrecon_run "$RUN_DIR" \
+                --output_dir "$MVSAM3D_INPUT_DIR" \
+                --objects "$CLASSES"
+
+            run_py_step_in_dir "stage3_mvsam3d_inference" "run_inference_weighted.py" "$MVSAM3D_VENDOR_DIR" \
+                "$SEG_LOG" append \
+                --input_path "$MVSAM3D_INPUT_DIR" \
+                --mask_prompt "$CLASSES" \
+                --da3_output "${MVSAM3D_INPUT_DIR}/da3_output.npz"
+
+            run_py_step "stage3_collect_mvsam3d_outputs" "mv_sam3d/mvsam3d_scripts/collect_mvsam3d_outputs.py" \
+                "$SEG_LOG" append \
+                --dataset_name "$MVSAM3D_DATASET_NAME" \
+                --labels "$CLASSES" \
+                --out_dir "$TRELLIS2_OUTPUT_DIR" \
+                --visualization_dir "${MVSAM3D_VENDOR_DIR}/visualization"
+        fi
         stage_end
     else
         log "Stage 3: skipped (no --use-trellis, or --start-from-stage ${START_FROM_STAGE})"
@@ -502,11 +569,14 @@ if [[ -n "$PICK_PLACE_TARGET" ]]; then
         fi
         pick_place_redir="append"
         [[ "$pick_place_first_label" -eq 1 ]] && pick_place_redir="new"
+        ALIGN_ZUP_ARGS=()
+        [[ "$MESH_BACKEND" == "mvsam3d" ]] && ALIGN_ZUP_ARGS=(--no-zup-correction)
         run_py_step "stageP1_align_trellis2_mesh_${sanitized_label}" "scripts/align_trellis2_mesh_to_scene.py" \
             "${PICK_PLACE_DIR}/align_trellis2_mesh.log" "$pick_place_redir" \
             --trellis_glb "$TRELLIS_LABEL_GLB" \
             --scene_mesh_ply "$LABEL_SCALE_REF_PLY" \
-            --out_glb "${PICK_PLACE_GLB_DIR}/${sanitized_label}/mesh.glb"
+            --out_glb "${PICK_PLACE_GLB_DIR}/${sanitized_label}/mesh.glb" \
+            "${ALIGN_ZUP_ARGS[@]}"
         pick_place_first_label=0
     done
     stage_end
@@ -800,11 +870,14 @@ if [[ "$RUN_USD" -eq 1 ]]; then
                     log "Stage 10: --use-trellis: no scene crop for '${label}' at ${SCENE_CROP_PLY}, keeping scene-crop glb."
                     continue
                 fi
+                ALIGN_ZUP_ARGS=()
+                [[ "$MESH_BACKEND" == "mvsam3d" ]] && ALIGN_ZUP_ARGS=(--no-zup-correction)
                 run_py_step "stage10_align_trellis2_mesh_${sanitized_label}" "scripts/align_trellis2_mesh_to_scene.py" \
                     "${OUTPUT_DIR}/mesh_to_glb.log" append \
                     --trellis_glb "$TRELLIS_LABEL_GLB" \
                     --scene_mesh_ply "$SCENE_CROP_PLY" \
-                    --out_glb "${SHAPES_DIR}/glb/${sanitized_label}/mesh.glb"
+                    --out_glb "${SHAPES_DIR}/glb/${sanitized_label}/mesh.glb" \
+                    "${ALIGN_ZUP_ARGS[@]}"
             done
         fi
         stage_end

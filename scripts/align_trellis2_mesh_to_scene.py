@@ -66,15 +66,24 @@ def load_target_bbox(scene_mesh_ply: Path) -> tuple[np.ndarray, np.ndarray]:
 
 
 def align_trellis_mesh_to_scene(
-    trellis_glb: Path, scene_mesh_ply: Path
+    trellis_glb: Path, scene_mesh_ply: Path, apply_zup_correction: bool = True
 ) -> tuple[trimesh.Scene, np.ndarray, dict]:
-    """Returns (transformed scene, combined 4x4 transform, diagnostics dict)."""
+    """Returns (transformed scene, combined 4x4 transform, diagnostics dict).
+
+    apply_zup_correction=False skips the -90-deg-about-X correction: it's only
+    needed for TRELLIS2's fixed Y-up glTF export convention. A mesh that's
+    already been placed in the scene's real Z-up world frame with correct
+    orientation (e.g. MV-SAM3D's collect_mvsam3d_outputs.py output) must not
+    get this applied again -- it would introduce a spurious 90-deg rotation.
+    The scale+translation bbox-fit below is still applied either way.
+    """
     target_bbox_min, target_bbox_max = load_target_bbox(scene_mesh_ply)
     target_extent = _bbox_extent(target_bbox_min, target_bbox_max)
     target_center = (target_bbox_min + target_bbox_max) / 2.0
 
     scene = trimesh.load(trellis_glb, force="scene")
-    scene.apply_transform(ZUP_CORRECTION)
+    zup_correction = ZUP_CORRECTION if apply_zup_correction else np.eye(4)
+    scene.apply_transform(zup_correction)
 
     source_bbox_min, source_bbox_max = scene.bounds
     source_extent = _bbox_extent(source_bbox_min, source_bbox_max)
@@ -87,7 +96,7 @@ def align_trellis_mesh_to_scene(
     scale_translate[:3, 3] = target_center - scale * source_center
     scene.apply_transform(scale_translate)
 
-    combined_transform = scale_translate @ ZUP_CORRECTION
+    combined_transform = scale_translate @ zup_correction
     diagnostics = {
         "scale": scale,
         "target_bbox_min": target_bbox_min.tolist(),
@@ -110,9 +119,16 @@ def main():
         "--out_transform_json", type=Path, default=None,
         help="Defaults to <out_glb> with a .transform.json suffix.",
     )
+    parser.add_argument(
+        "--no-zup-correction", action="store_true",
+        help="Skip the -90-deg-about-X TRELLIS2-Y-up-glTF correction (e.g. for a mesh "
+        "already placed in the scene's real Z-up world frame, such as MV-SAM3D output).",
+    )
     args = parser.parse_args()
 
-    scene, transform, diagnostics = align_trellis_mesh_to_scene(args.trellis_glb, args.scene_mesh_ply)
+    scene, transform, diagnostics = align_trellis_mesh_to_scene(
+        args.trellis_glb, args.scene_mesh_ply, apply_zup_correction=not args.no_zup_correction
+    )
 
     args.out_glb.parent.mkdir(parents=True, exist_ok=True)
     if args.out_glb.suffix.lower() == ".ply":
