@@ -3,7 +3,7 @@
 # VGGT-Omega and the segmentation stage both now run from in-repo code (vggt/, segmentation/).
 #
 # Usage:
-#   ./run_full_pipeline.sh <image_folder> <scene_name> [--simplify_threshold N] [--texture_size N] [--num_imgs_per_scene N] [--skip-frames N] [--no-align-to-gravity] [--rotate-horizontal-deg N] [--classes a,b,c] [--run_glb] [--use-trellis (default: on)] [--no-use-trellis] [--mesh-backend trellis2|mvsam3d] [--skip_isaac] [--collision_approximation convexDecomposition|convexHull|boundingCube] [--friction-table-path PATH] [--ollama-model NAME] [--start-from-stage N] [--stop-after-stage N] [--max_chunks_per_group N] [--max_inflated_voxels N] [--depth_conf_thres N] [--depth_edge_rtol N] [--fix_num_chunks N] [--robot-target LABEL] [--skip_floater_removal] [--floater_search_padding_factor N] [--floater_containment_frac N] [--floater_max_faces N] [--vggt-conf-thres N] [--skip_hull_consistency_check] [--pick_place_target LABEL] [--place-offset DX,DY,DZ] [--place-target LABEL] [--place-target-clearance N] [--gripper-open-width N] [--approach-side neg-x|pos-x|neg-y|pos-y]
+#   ./run_full_pipeline.sh <image_folder> <scene_name> [--simplify_threshold N] [--texture_size N] [--num_imgs_per_scene N] [--skip-frames N] [--no-align-to-gravity] [--rotate-horizontal-deg N] [--classes a,b,c] [--run_glb] [--use-trellis (default: on)] [--no-use-trellis] [--mesh-backend trellis2|mvsam3d] [--skip_isaac] [--collision_approximation convexDecomposition|convexHull|boundingCube] [--friction-table-path PATH] [--ollama-model NAME] [--start-from-stage N] [--stop-after-stage N] [--max_chunks_per_group N] [--max_inflated_voxels N] [--depth_conf_thres N] [--depth_edge_rtol N] [--fix_num_chunks N] [--robot-target LABEL] [--skip_floater_removal] [--floater_search_padding_factor N] [--floater_containment_frac N] [--floater_max_faces N] [--vggt-conf-thres N] [--skip_hull_consistency_check] [--pick_place_target LABEL] [--place-offset DX,DY,DZ] [--place-target LABEL] [--place-target-clearance N] [--gripper-open-width N] [--approach-side neg-x|pos-x|neg-y|pos-y] [--ai-scene-agent] [--scene-agent-ollama-model NAME]
 #
 # Note: gravity alignment is ON by default; pass --no-align-to-gravity to disable it.
 #
@@ -15,6 +15,14 @@
 # their relative poses match the actual scanned scene -- then runs a Franka pick-and-place demo that
 # manipulates only LABEL. Mutually exclusive with --robot-target, which needs the full reconstructed
 # scene.
+#
+# --ai-scene-agent is an alternative to hand-picking --pick_place_target/--place-target/etc.: once
+# Stage 3 produces a mesh for every --classes label, it runs scripts/run_scene_agent.py, a LangGraph
+# agent (genrecon/utils/scene_agent.py) backed by a local Ollama model that interactively asks the
+# user what to pick, where to place it, which side the robot approaches from, and the scene's
+# lighting/camera framing, then writes runs/<scene>/pick_place/scene_spec.json and proceeds through
+# the same Stage P1-P4 fast path as a manually-specified --pick_place_target run. Mutually exclusive
+# with --pick_place_target (the agent determines the target).
 #
 # Example:
 #   ./run_full_pipeline.sh /home/gabis/Work/GitHub/COB-GS/dataset/food2/images food2_vggt
@@ -83,6 +91,16 @@ PLACE_TARGET=""
 PLACE_TARGET_CLEARANCE="0.05"
 GRIPPER_OPEN_WIDTH="0.06"
 APPROACH_SIDE="neg-y"
+AI_SCENE_AGENT=0
+SCENE_AGENT_OLLAMA_MODEL="qwen2.5:7b"
+START_DISTANCE=""
+DOME_LIGHT_INTENSITY=""
+DOME_LIGHT_COLOR=""
+DISTANT_LIGHT_INTENSITY=""
+DISTANT_LIGHT_ANGLE=""
+DISTANT_LIGHT_ROTATION_DEG=""
+CAMERA_MODE=""
+CAMERA_DISTANCE_MULTIPLIER=""
 RUN_FLOATER_REMOVAL=1
 SKIP_HULL_CONSISTENCY_CHECK=0
 FLOATER_SEARCH_PADDING_FACTOR=0.2
@@ -91,7 +109,7 @@ FLOATER_MAX_FACES=5000
 VGGT_CONF_THRES="20"
 
 if [[ $# -lt 2 ]]; then
-    echo "Usage: $0 <image_folder> <scene_name> [--simplify_threshold N] [--texture_size N] [--num_imgs_per_scene N] [--skip-frames N] [--no-align-to-gravity] [--rotate-horizontal-deg N] [--classes a,b,c] [--run_glb] [--use-trellis (default: on)] [--no-use-trellis] [--mesh-backend trellis2|mvsam3d] [--skip_isaac] [--collision_approximation convexDecomposition|convexHull|boundingCube] [--friction-table-path PATH] [--ollama-model NAME] [--start-from-stage N] [--stop-after-stage N] [--max_chunks_per_group N] [--max_inflated_voxels N] [--depth_conf_thres N] [--depth_edge_rtol N] [--fix_num_chunks N] [--robot-target LABEL] [--skip_floater_removal] [--floater_search_padding_factor N] [--floater_containment_frac N] [--floater_max_faces N] [--vggt-conf-thres N] [--skip_hull_consistency_check] [--pick_place_target LABEL] [--place-offset DX,DY,DZ] [--place-target LABEL] [--place-target-clearance N] [--gripper-open-width N] [--approach-side neg-x|pos-x|neg-y|pos-y]" >&2
+    echo "Usage: $0 <image_folder> <scene_name> [--simplify_threshold N] [--texture_size N] [--num_imgs_per_scene N] [--skip-frames N] [--no-align-to-gravity] [--rotate-horizontal-deg N] [--classes a,b,c] [--run_glb] [--use-trellis (default: on)] [--no-use-trellis] [--mesh-backend trellis2|mvsam3d] [--skip_isaac] [--collision_approximation convexDecomposition|convexHull|boundingCube] [--friction-table-path PATH] [--ollama-model NAME] [--start-from-stage N] [--stop-after-stage N] [--max_chunks_per_group N] [--max_inflated_voxels N] [--depth_conf_thres N] [--depth_edge_rtol N] [--fix_num_chunks N] [--robot-target LABEL] [--skip_floater_removal] [--floater_search_padding_factor N] [--floater_containment_frac N] [--floater_max_faces N] [--vggt-conf-thres N] [--skip_hull_consistency_check] [--pick_place_target LABEL] [--place-offset DX,DY,DZ] [--place-target LABEL] [--place-target-clearance N] [--gripper-open-width N] [--approach-side neg-x|pos-x|neg-y|pos-y] [--ai-scene-agent] [--scene-agent-ollama-model NAME]" >&2
     exit 1
 fi
 
@@ -130,6 +148,8 @@ while [[ $# -gt 0 ]]; do
         --place-target-clearance) PLACE_TARGET_CLEARANCE="$2"; shift 2 ;;
         --gripper-open-width) GRIPPER_OPEN_WIDTH="$2"; shift 2 ;;
         --approach-side) APPROACH_SIDE="$2"; shift 2 ;;
+        --ai-scene-agent) AI_SCENE_AGENT=1; shift 1 ;;
+        --scene-agent-ollama-model) SCENE_AGENT_OLLAMA_MODEL="$2"; shift 2 ;;
         --skip_floater_removal) RUN_FLOATER_REMOVAL=0; shift 1 ;;
         --skip_hull_consistency_check) SKIP_HULL_CONSISTENCY_CHECK=1; shift 1 ;;
         --floater_search_padding_factor) FLOATER_SEARCH_PADDING_FACTOR="$2"; shift 2 ;;
@@ -217,6 +237,27 @@ if [[ "$APPROACH_SIDE" != "neg-x" && "$APPROACH_SIDE" != "pos-x" && "$APPROACH_S
     exit 1
 fi
 
+# --ai-scene-agent replaces --pick_place_target/--place-target/etc.: the interactive agent decides
+# them instead, so passing --pick_place_target alongside it would be ambiguous about which wins.
+if [[ "$AI_SCENE_AGENT" -eq 1 ]]; then
+    if [[ -n "$PICK_PLACE_TARGET" ]]; then
+        echo "--ai-scene-agent and --pick_place_target are mutually exclusive (the agent decides the pick target interactively)." >&2
+        exit 1
+    fi
+    if [[ -n "$ROBOT_TARGET" ]]; then
+        echo "--ai-scene-agent and --robot-target are mutually exclusive (one skips the full scene reconstruction, the other requires it)." >&2
+        exit 1
+    fi
+    if [[ -z "$CLASSES" ]]; then
+        echo "--ai-scene-agent requires --classes (the objects it asks the user about)." >&2
+        exit 1
+    fi
+    if [[ "$USE_TRELLIS" -eq 0 ]]; then
+        echo "Note: --ai-scene-agent requires a per-object mesh for every --classes label; overriding --no-use-trellis to on for this run." >&2
+        USE_TRELLIS=1
+    fi
+fi
+
 RUN_DIR="${GENRECON_DIR}/runs/${SCENE_NAME}"
 EXPORT_DIR="${RUN_DIR}/vggt_export"
 SCENE_DIR="${RUN_DIR}/genrecon_input"
@@ -287,6 +328,17 @@ opt_arg() {
     return 0
 }
 
+# Same as opt_arg, but appends a single "--flag=value" token instead of two separate ones --
+# required when value can start with '-' (e.g. a negative rotation angle), which argparse
+# otherwise misparses as another option rather than this flag's value (see demo_franka_pickplace.py
+# --approach-side's docstring for the same class of bug).
+opt_arg_eq() {
+    local -n _arr="$1"
+    local flag="$2" value="$3"
+    [[ -n "$value" ]] && _arr+=("${flag}=${value}")
+    return 0
+}
+
 declare -A LOG_LINE_OFFSET
 
 # Appends whatever's been newly written to $1 since the last call for that
@@ -348,6 +400,16 @@ run_py_step_in_dir() {
         ( cd "$cwd" && uv run python -u "$script" "$@" ) > "$log_file" 2>&1
     fi
     mirror_log "$log_file"
+}
+
+# Like run_py_step, but for an interactive stage that needs a live terminal (stdin/stdout) instead
+# of log-file redirection -- used only by Stage P0's scripts/run_scene_agent.py, whose whole point
+# is a back-and-forth with the user. Logs a start/end marker via `log` so pipeline.log still records
+# that the stage ran, just not a live duplicate of the interactive transcript itself.
+run_py_step_interactive() {
+    local name="$1" script="$2"; shift 2
+    log_debug_config "$name" "${GENRECON_DIR}/${script}" "$GENRECON_DIR" "$@"
+    uv run python -u "$script" "$@"
 }
 
 PIPELINE_T0=$(date +%s)
@@ -552,6 +614,24 @@ if [[ -n "$CLASSES" ]]; then
     check_stop_after_stage 3
 fi
 
+# ── Stage P0 (only with --ai-scene-agent): interactive scene definition. Runs after Stage 3 so
+# every --classes label already has a real-world-scale mesh at image_to_3d_meshes/<label>/mesh.glb
+# for the agent to describe to the user. Sets PICK_PLACE_TARGET/PLACE_TARGET/etc. from the agent's
+# answers so the existing Stage P1-P4 gate below (unchanged) picks them up exactly as if the user
+# had passed --pick_place_target/--place-target directly.
+if [[ "$AI_SCENE_AGENT" -eq 1 ]]; then
+    stage_start "Stage P0: interactive scene agent (scripts/run_scene_agent.py, model=${SCENE_AGENT_OLLAMA_MODEL})"
+    SCENE_SPEC_JSON="${RUN_DIR}/pick_place/scene_spec.json"
+    run_py_step_interactive "stageP0_run_scene_agent" "scripts/run_scene_agent.py" \
+        --classes "$CLASSES" \
+        --mesh_dir "${RUN_DIR}/image_to_3d_meshes" \
+        --out_json "$SCENE_SPEC_JSON" \
+        --ollama_model "$SCENE_AGENT_OLLAMA_MODEL"
+    eval "$(uv run python -u scripts/scene_spec_to_env.py --spec "$SCENE_SPEC_JSON")"
+    log "Stage P0: agent chose pick_place_target=${PICK_PLACE_TARGET}, place_target=${PLACE_TARGET:-<offset ${PLACE_OFFSET}>}, approach_side=${APPROACH_SIDE}"
+    stage_end
+fi
+
 # ── Stage P1-P4 (fast path, mutually exclusive with the rest of the pipeline): Franka
 # pick-and-place demo from the segmented object alone, skipping GenRecon scene reconstruction
 # entirely. Only TRELLIS.2's per-object mesh (Stage 3, already produced above) is needed -- no
@@ -644,6 +724,18 @@ if [[ -n "$PICK_PLACE_TARGET" ]]; then
         IFS=',' read -ra PLACE_OFFSET_ARGS <<< "$PLACE_OFFSET"
         PLACE_ARGS=(--place-offset "${PLACE_OFFSET_ARGS[@]}")
     fi
+    # Lighting/camera args are only set when --ai-scene-agent ran Stage P0 -- left unset otherwise,
+    # so demo_franka_pickplace.py falls through to its own hardcoded defaults unchanged.
+    SCENE_AGENT_ARGS=()
+    opt_arg_eq SCENE_AGENT_ARGS --start-distance "$START_DISTANCE"
+    opt_arg_eq SCENE_AGENT_ARGS --dome-light-intensity "$DOME_LIGHT_INTENSITY"
+    opt_arg_eq SCENE_AGENT_ARGS --dome-light-color "$DOME_LIGHT_COLOR"
+    opt_arg_eq SCENE_AGENT_ARGS --distant-light-intensity "$DISTANT_LIGHT_INTENSITY"
+    opt_arg_eq SCENE_AGENT_ARGS --distant-light-angle "$DISTANT_LIGHT_ANGLE"
+    opt_arg_eq SCENE_AGENT_ARGS --distant-light-rotation-deg "$DISTANT_LIGHT_ROTATION_DEG"
+    opt_arg_eq SCENE_AGENT_ARGS --camera-mode "$CAMERA_MODE"
+    opt_arg_eq SCENE_AGENT_ARGS --camera-distance-multiplier "$CAMERA_DISTANCE_MULTIPLIER"
+
     run_external_step "stageP4_demo_franka_pickplace" "${ISAACSIM_DIR}/demo_franka_pickplace.py" "$ISAACSIM_DIR" \
         "${PICK_PLACE_DIR}/pick_place.log" new "uv run demo_franka_pickplace.py" \
         --scene "$PICK_PLACE_SCENE_USDA" \
@@ -652,7 +744,8 @@ if [[ -n "$PICK_PLACE_TARGET" ]]; then
         --gripper-open-width "$GRIPPER_OPEN_WIDTH" \
         --approach-side "$APPROACH_SIDE" \
         --output "${PICK_PLACE_DIR}/pick_place.mp4" \
-        --stage-output "${PICK_PLACE_DIR}/pick_place_scene.usda"
+        --stage-output "${PICK_PLACE_DIR}/pick_place_scene.usda" \
+        "${SCENE_AGENT_ARGS[@]}"
     stage_end
 
     PIPELINE_ELAPSED=$(( $(date +%s) - PIPELINE_T0 ))
