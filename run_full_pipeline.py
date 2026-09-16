@@ -257,6 +257,7 @@ def main(argv: list[str] | None = None) -> None:
                             mvsam3d_vendor_dir=MVSAM3D_VENDOR_DIR,
                             seg_log=seg_log,
                             log_mirror=log_mirror,
+                            cobgs_mask_dir=cobgs_mask_dir,
                         )
             else:
                 logger.info(f"Stage 3: skipped (no --use-trellis, or --start-from-stage {args.start_from_stage})")
