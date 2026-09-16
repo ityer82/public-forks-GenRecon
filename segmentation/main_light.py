@@ -47,6 +47,72 @@ def stage_done(mask_dir, multi_class):
     )
 
 
+def run_segmentation(
+    scene: str,
+    dataset_root: str,
+    output_root: str,
+    classes: str | None,
+    *,
+    text: str = "The truck",
+    resolution: int = -1,
+    pc_mask_threshold: float = 0.3,
+    depth_tolerance: float = 0.1,
+    depth_dir: str | None = None,
+    bg_assign_radius: float = 0.02,
+    voxel_size: float = 0.005,
+    depth_conf_thres: float = 50.0,
+    depth_edge_rtol: float = 0.03,
+    skip_mask: bool = False,
+    skip_pc_segment: bool = False,
+    skip_hull_consistency_check: bool = False,
+    read_from_drive: bool = False,
+    flat_output: bool = False,
+) -> None:
+    """Runs Stage 1 (2D mask extraction) and Stage 1.5 (point-cloud segmentation) for a scene.
+    Dispatches to detect_and_segment.py/segment_pointcloud.py as real subprocesses (the actual
+    CUDA-heavy GroundedSAM2 work) -- unchanged from the CLI's own behavior, just callable
+    directly with typed args instead of building argv by hand."""
+    output_path = output_root if flat_output else f"{output_root}/{scene}"
+    label = text
+    mask_dir = Path(output_path) / "masks" / label
+    py = ["uv", "run", "python"]
+    multi_class = classes is not None
+    classes_flag = ["--classes", classes] if multi_class else []
+
+    if not skip_mask:
+        run_stage(
+            "Stage 1: Mask extraction",
+            py + [str(SCRIPT_DIR / "detect_and_segment.py"),
+                  "--dataset_root", dataset_root, "--output", output_root, "--scene", scene,
+                  "--text", label, "--resolution", str(resolution), "--frame_idx", "0"] + classes_flag
+            + (["--flat_output"] if flat_output else []),
+            skip=stage1_done(mask_dir, multi_class),
+            skip_reason=mask_dir,
+            read_from_drive=read_from_drive,
+        )
+
+    if not skip_pc_segment:
+        if multi_class and not depth_dir:
+            raise ValueError("depth_dir is required for Stage 1.5 in class-based/open-world mode")
+        depth_flag = (["--depth_dir", depth_dir, "--bg_assign_radius", str(bg_assign_radius),
+                        "--voxel_size", str(voxel_size),
+                        "--depth_conf_thres", str(depth_conf_thres),
+                        "--depth_edge_rtol", str(depth_edge_rtol)]
+                       + (["--skip_hull_consistency_check"] if skip_hull_consistency_check else [])
+                       if multi_class else [])
+        run_stage(
+            "Stage 1.5: Point-cloud segmentation",
+            py + [str(SCRIPT_DIR / "segment_pointcloud.py"), "--dataset", dataset_root, "--output", output_path,
+                  "--text", label, "--pc_mask_threshold", str(pc_mask_threshold),
+                  "--depth_tolerance", str(depth_tolerance)] + classes_flag + depth_flag,
+            skip=stage_done(mask_dir, multi_class),
+            skip_reason=mask_dir,
+            read_from_drive=read_from_drive,
+        )
+
+    print("Pipeline complete.")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Lightweight GroundedSAM2 segmentation pipeline (mask extraction + point-cloud segmentation)")
     parser.add_argument("--scene", type=str, default="truck")
@@ -105,46 +171,29 @@ def main():
                               "by an external per-scene pipeline).")
     args = parser.parse_args()
 
-    dataset_path = args.dataset_root
-    output_path = args.output_root if args.flat_output else f"{args.output_root}/{args.scene}"
-    label = args.text
-    mask_dir = Path(output_path) / "masks" / label
-    py = ["uv", "run", "python"]
-    multi_class = args.classes is not None
-    classes_flag = ["--classes", args.classes] if multi_class else []
-
-    if not args.skip_mask:
-        run_stage(
-            "Stage 1: Mask extraction",
-            py + [str(SCRIPT_DIR / "detect_and_segment.py"),
-                  "--dataset_root", args.dataset_root, "--output", args.output_root, "--scene", args.scene,
-                  "--text", label, "--resolution", str(args.resolution), "--frame_idx", "0"] + classes_flag
-            + (["--flat_output"] if args.flat_output else []),
-            skip=stage1_done(mask_dir, multi_class),
-            skip_reason=mask_dir,
+    try:
+        run_segmentation(
+            args.scene,
+            args.dataset_root,
+            args.output_root,
+            args.classes,
+            text=args.text,
+            resolution=args.resolution,
+            pc_mask_threshold=args.pc_mask_threshold,
+            depth_tolerance=args.depth_tolerance,
+            depth_dir=args.depth_dir,
+            bg_assign_radius=args.bg_assign_radius,
+            voxel_size=args.voxel_size,
+            depth_conf_thres=args.depth_conf_thres,
+            depth_edge_rtol=args.depth_edge_rtol,
+            skip_mask=args.skip_mask,
+            skip_pc_segment=args.skip_pc_segment,
+            skip_hull_consistency_check=args.skip_hull_consistency_check,
             read_from_drive=args.read_from_drive,
+            flat_output=args.flat_output,
         )
-
-    if not args.skip_pc_segment:
-        if multi_class and not args.depth_dir:
-            parser.error("--depth_dir is required for Stage 1.5 in class-based/open-world mode")
-        depth_flag = (["--depth_dir", args.depth_dir, "--bg_assign_radius", str(args.bg_assign_radius),
-                        "--voxel_size", str(args.voxel_size),
-                        "--depth_conf_thres", str(args.depth_conf_thres),
-                        "--depth_edge_rtol", str(args.depth_edge_rtol)]
-                       + (["--skip_hull_consistency_check"] if args.skip_hull_consistency_check else [])
-                       if multi_class else [])
-        run_stage(
-            "Stage 1.5: Point-cloud segmentation",
-            py + [str(SCRIPT_DIR / "segment_pointcloud.py"), "--dataset", dataset_path, "--output", output_path,
-                  "--text", label, "--pc_mask_threshold", str(args.pc_mask_threshold),
-                  "--depth_tolerance", str(args.depth_tolerance)] + classes_flag + depth_flag,
-            skip=stage_done(mask_dir, multi_class),
-            skip_reason=mask_dir,
-            read_from_drive=args.read_from_drive,
-        )
-
-    print("Pipeline complete.")
+    except ValueError as e:
+        parser.error(str(e))
 
 
 if __name__ == "__main__":

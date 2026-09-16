@@ -244,6 +244,89 @@ def repair_object_mesh(
     return new_vertex, np.asarray(repaired_faces, dtype=np.int64)
 
 
+def extract_object_mesh(
+    mesh_ply: Path,
+    object_ply: Path,
+    out_ply: Path,
+    *,
+    object_mesh_ply: Path | None = None,
+    remainder_out_ply: Path | None = None,
+    hull_padding: float = 0.02,
+    colmap_dir: Path | None = None,
+    masks_dir: Path | None = None,
+    hull_padding_min: float = -0.01,
+    max_overshoot: float = 0.15,
+    search_iters: int = 8,
+    remainder_padding: float | None = None,
+    remainder_margin: float = 0.005,
+) -> bool:
+    """Crops `object_ply`'s object out of `mesh_ply` (or `object_mesh_ply` if given) into
+    `out_ply`, optionally also writing the complement to `remainder_out_ply`. Returns True on
+    success, False on a soft-fail (logs a warning, copies `mesh_ply` to `remainder_out_ply` if
+    given, and does not write `out_ply`) -- mirrors this module's CLI `skip()` behavior, which
+    the caller should treat leniently (log + continue to the next label), matching today's bash
+    orchestration which never checked this script's exit code either.
+    """
+
+    def skip(reason: str) -> bool:
+        logger.warning(f"Skipping {object_ply}: {reason}")
+        if remainder_out_ply is not None and remainder_out_ply != mesh_ply:
+            remainder_out_ply.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(mesh_ply, remainder_out_ply)
+        return False
+
+    points = load_object_points(object_ply)
+    if len(points) < 4:
+        return skip(f"only {len(points)} points, need >=4 to build a convex hull.")
+
+    padding = hull_padding
+    if colmap_dir is not None and masks_dir is not None:
+        cameras = parse_colmap_cameras(colmap_dir)
+        padding = search_hull_padding(
+            points, cameras, masks_dir, hull_padding_min, hull_padding, max_overshoot, search_iters,
+        )
+        logger.info(f"{object_ply}: stage-2 search chose hull_padding={padding:.4f} "
+                    f"(searched [{hull_padding_min}, {hull_padding}])")
+
+    try:
+        object_equations = padded_hull_equations(points, padding)
+    except QhullError as e:
+        return skip(f"convex hull construction failed ({e}).")
+
+    resolved_remainder_padding = remainder_padding if remainder_padding is not None else padding + remainder_margin
+    resolved_remainder_padding = max(resolved_remainder_padding, padding)
+    try:
+        remainder_equations = padded_hull_equations(points, resolved_remainder_padding)
+    except QhullError as e:
+        logger.warning(
+            f"{object_ply}: remainder-padding hull construction failed ({e}); "
+            "falling back to the object hull for the remainder cut too."
+        )
+        remainder_equations = object_equations
+        resolved_remainder_padding = padding
+
+    bbox_margin = max(resolved_remainder_padding, 0.0)
+    bbox_min = points.min(axis=0) - bbox_margin
+    bbox_max = points.max(axis=0) + bbox_margin
+    object_vertex, object_faces, remainder_vertex, remainder_faces = crop_mesh(
+        mesh_ply, object_equations, remainder_equations, bbox_min, bbox_max,
+        object_mesh_ply=object_mesh_ply,
+    )
+    if len(object_faces) == 0:
+        return skip("no mesh faces fell inside the padded hull.")
+
+    write_cropped_ply(out_ply, object_vertex, object_faces)
+    logger.info(f"Wrote {out_ply}: {len(object_vertex)} vertices, {len(object_faces)} faces.")
+
+    if remainder_out_ply is not None:
+        write_cropped_ply(remainder_out_ply, remainder_vertex, remainder_faces)
+        logger.info(
+            f"Wrote {remainder_out_ply}: {len(remainder_vertex)} vertices, "
+            f"{len(remainder_faces)} faces."
+        )
+    return True
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mesh_ply", type=Path, required=True)
@@ -323,75 +406,21 @@ def main():
     )
     args = parser.parse_args()
 
-    def skip(reason: str) -> None:
-        logger.warning(f"Skipping {args.object_ply}: {reason}")
-        if args.remainder_out_ply is not None and args.remainder_out_ply != args.mesh_ply:
-            args.remainder_out_ply.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(args.mesh_ply, args.remainder_out_ply)
-
-    points = load_object_points(args.object_ply)
-    if len(points) < 4:
-        skip(f"only {len(points)} points, need >=4 to build a convex hull.")
-        return
-
-    hull_padding = args.hull_padding
-    if args.colmap_dir is not None and args.masks_dir is not None:
-        cameras = parse_colmap_cameras(args.colmap_dir)
-        hull_padding = search_hull_padding(
-            points, cameras, args.masks_dir,
-            args.hull_padding_min, args.hull_padding, args.max_overshoot, args.search_iters,
-        )
-        logger.info(f"{args.object_ply}: stage-2 search chose hull_padding={hull_padding:.4f} "
-                    f"(searched [{args.hull_padding_min}, {args.hull_padding}])")
-
-    try:
-        object_equations = padded_hull_equations(points, hull_padding)
-    except QhullError as e:
-        skip(f"convex hull construction failed ({e}).")
-        return
-
-    remainder_padding = (
-        args.remainder_padding if args.remainder_padding is not None else hull_padding + args.remainder_margin
-    )
-    remainder_padding = max(remainder_padding, hull_padding)
-    try:
-        remainder_equations = padded_hull_equations(points, remainder_padding)
-    except QhullError as e:
-        logger.warning(
-            f"{args.object_ply}: remainder-padding hull construction failed ({e}); "
-            "falling back to the object hull for the remainder cut too."
-        )
-        remainder_equations = object_equations
-        remainder_padding = hull_padding
-
-    # The bbox is a conservative pre-filter for the exact half-space test below,
-    # so it must never shrink past the original points' bbox, and must cover
-    # the larger (remainder) hull to stay a safe superset for both tests.
-    bbox_margin = max(remainder_padding, 0.0)
-    bbox_min = points.min(axis=0) - bbox_margin
-    bbox_max = points.max(axis=0) + bbox_margin
-    object_vertex, object_faces, remainder_vertex, remainder_faces = crop_mesh(
-        args.mesh_ply, object_equations, remainder_equations, bbox_min, bbox_max,
+    extract_object_mesh(
+        args.mesh_ply,
+        args.object_ply,
+        args.out_ply,
         object_mesh_ply=args.object_mesh_ply,
+        remainder_out_ply=args.remainder_out_ply,
+        hull_padding=args.hull_padding,
+        colmap_dir=args.colmap_dir,
+        masks_dir=args.masks_dir,
+        hull_padding_min=args.hull_padding_min,
+        max_overshoot=args.max_overshoot,
+        search_iters=args.search_iters,
+        remainder_padding=args.remainder_padding,
+        remainder_margin=args.remainder_margin,
     )
-    if len(object_faces) == 0:
-        skip("no mesh faces fell inside the padded hull.")
-        return
-
-    # try:
-    #     object_vertex, object_faces = repair_object_mesh(object_vertex, object_faces)
-    # except Exception as e:
-    #     logger.warning(f"{args.object_ply}: mesh repair failed ({e}); writing the unrepaired crop instead.")
-
-    write_cropped_ply(args.out_ply, object_vertex, object_faces)
-    logger.info(f"Wrote {args.out_ply}: {len(object_vertex)} vertices, {len(object_faces)} faces.")
-
-    if args.remainder_out_ply is not None:
-        write_cropped_ply(args.remainder_out_ply, remainder_vertex, remainder_faces)
-        logger.info(
-            f"Wrote {args.remainder_out_ply}: {len(remainder_vertex)} vertices, "
-            f"{len(remainder_faces)} faces."
-        )
 
 
 if __name__ == "__main__":

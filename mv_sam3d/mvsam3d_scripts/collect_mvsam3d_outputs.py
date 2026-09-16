@@ -91,21 +91,18 @@ def transform_to_world(vertices: np.ndarray, params: dict) -> np.ndarray:
     return pts_world.astype(np.float32)
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--visualization_dir", default="visualization", help="MV-SAM3D's visualization/ dir")
-    parser.add_argument("--dataset_name", required=True, help="Name of the bridged input dir (input_path.name)")
-    parser.add_argument("--labels", required=True, help="Comma-separated raw class labels")
-    parser.add_argument("--out_dir", required=True, help="Where to write <label>/mesh.glb")
-    args = parser.parse_args()
-
-    visualization_dir = Path(args.visualization_dir)
-    out_dir = Path(args.out_dir)
-    labels = [x.strip() for x in args.labels.split(",") if x.strip()]
+def collect_mvsam3d_outputs(
+    visualization_dir: Path, dataset_name: str, labels: list[str], out_dir: Path
+) -> list[str]:
+    """Collects per-object result.glb + params.npz into <out_dir>/<label>/mesh.glb, transformed
+    into the input data's world frame. Returns the list of labels that failed/were missing
+    (empty on full success) instead of calling sys.exit(1), so a caller can decide policy."""
+    visualization_dir = Path(visualization_dir)
+    out_dir = Path(out_dir)
 
     failures = []
     for label in labels:
-        obj_dir = find_latest_object_dir(visualization_dir, args.dataset_name, label)
+        obj_dir = find_latest_object_dir(visualization_dir, dataset_name, label)
         if obj_dir is None:
             print(f"[collect_mvsam3d_outputs] WARNING: no result.glb found for label '{label}', skipping")
             failures.append(label)
@@ -130,6 +127,20 @@ def main():
 
     if failures:
         print(f"[collect_mvsam3d_outputs] Failed/missing labels: {failures}")
+    return failures
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--visualization_dir", default="visualization", help="MV-SAM3D's visualization/ dir")
+    parser.add_argument("--dataset_name", required=True, help="Name of the bridged input dir (input_path.name)")
+    parser.add_argument("--labels", required=True, help="Comma-separated raw class labels")
+    parser.add_argument("--out_dir", required=True, help="Where to write <label>/mesh.glb")
+    args = parser.parse_args()
+
+    labels = [x.strip() for x in args.labels.split(",") if x.strip()]
+    failures = collect_mvsam3d_outputs(Path(args.visualization_dir), args.dataset_name, labels, Path(args.out_dir))
+    if failures:
         sys.exit(1)
 
 

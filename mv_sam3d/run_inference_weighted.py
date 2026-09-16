@@ -45,9 +45,34 @@ import numpy as np
 import torch
 from loguru import logger
 
-# Import inference code
-sys.path.append("notebook")
-from inference import Inference
+# Absolute base dir for every path in this module that used to be written relative to
+# cwd (checkpoints/, visualization/, notebook/) -- required for in-process callers (e.g.
+# genrecon/pipeline/stages.py) that don't run with cwd=mv_sam3d/, unlike this script's
+# own historical `uv run python run_inference_weighted.py` invocation from mv_sam3d/.
+_MV_SAM3D_DIR = Path(__file__).resolve().parent
+
+# Import inference code. Absolute (not "notebook", a path relative to cwd) so this
+# resolves regardless of the caller's cwd.
+_NOTEBOOK_DIR = _MV_SAM3D_DIR / "notebook"
+sys.path.append(str(_NOTEBOOK_DIR))
+
+# Loaded via importlib under a private module name rather than `import inference`: genrecon's
+# own repo root has an unrelated top-level `inference` package (inference/get_chunks.py etc.,
+# see reconstruct_scene.py), and a bare `import inference` here would collide with it in
+# sys.modules whenever both this module and reconstruct_scene.py are imported in the same
+# process (as happens when genrecon/pipeline/stages.py runs both in-process) -- whichever one
+# is imported first "wins" and the other's `inference` lookups silently resolve to the wrong
+# module.
+import importlib.util as _importlib_util
+
+_inference_spec = _importlib_util.spec_from_file_location(
+    "mv_sam3d_notebook_inference", _NOTEBOOK_DIR / "inference.py"
+)
+_inference_module = _importlib_util.module_from_spec(_inference_spec)
+sys.modules[_inference_spec.name] = _inference_module
+_inference_spec.loader.exec_module(_inference_module)
+Inference = _inference_module.Inference
+
 from load_images_and_masks import load_images_and_masks_from_path
 
 from sam3d_objects.utils.cross_attention_logger import CrossAttentionLogger
@@ -1411,7 +1436,7 @@ def visualize_in_canonical_space(
         scale = float(scale)
     
     if output_path is None:
-        output_path = Path("visualization") / "canonical_view.glb"
+        output_path = _MV_SAM3D_DIR / "visualization" / "canonical_view.glb"
     output_path.parent.mkdir(parents=True, exist_ok=True)
     
     logger.info(f"[Canonical Viz] Creating visualization in Y-up canonical space (GLB standard)")
@@ -1636,7 +1661,7 @@ def visualize_latent_visibility(
         return None
     
     if output_path is None:
-        output_path = Path("visualization") / "latent_visibility.glb"
+        output_path = _MV_SAM3D_DIR / "visualization" / "latent_visibility.glb"
     
     output_path.parent.mkdir(parents=True, exist_ok=True)
     
@@ -1894,7 +1919,7 @@ def get_output_dir(
     Example:
         visualization/quike/box/quike_box_multiview_s1ea60_s2entropy_a60_20231205_123456/
     """
-    visualization_dir = Path("visualization")
+    visualization_dir = _MV_SAM3D_DIR / "visualization"
     
     # Level 1: Dataset name (last component of input_path)
     dataset_name = input_path.name if input_path.is_dir() else input_path.parent.name
@@ -2245,7 +2270,7 @@ def run_multiobject_inference(
     dir_name = f"{dir_name}_{timestamp}"
     
     # Create output directory
-    visualization_dir = Path("visualization")
+    visualization_dir = _MV_SAM3D_DIR / "visualization"
     multiobj_output_dir = visualization_dir / dataset_name / "multiobject" / dir_name
     multiobj_output_dir.mkdir(parents=True, exist_ok=True)
     
@@ -2585,7 +2610,7 @@ def run_weighted_inference(
             merge_da3_glb: Merge SAM3D output with DA3 scene
             overlay_pointmap: Overlay SAM3D on View 0 pointmap
     """
-    config_path = f"checkpoints/{model_tag}/pipeline.yaml"
+    config_path = str(_MV_SAM3D_DIR / "checkpoints" / model_tag / "pipeline.yaml")
     if not Path(config_path).exists():
         raise FileNotFoundError(f"Model config file not found: {config_path}")
     

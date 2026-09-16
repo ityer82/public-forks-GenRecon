@@ -140,6 +140,79 @@ def merge_meshes(
     return merged_vertex, merged_faces
 
 
+def extract_floor_mesh(
+    mesh_ply: Path,
+    out_ply: Path,
+    *,
+    remainder_out_ply: Path | None = None,
+    z_percentile: float = 10.0,
+    distance_threshold: float = 0.02,
+    num_iterations: int = 1000,
+    hull_padding: float = 0.02,
+    remainder_margin: float = 0.005,
+    seed: int | None = 0,
+) -> bool:
+    """Segments the flat floor region out of `mesh_ply` into `out_ply`, optionally writing the
+    complement to `remainder_out_ply` (may equal `mesh_ply`). Returns True on success, False on
+    a soft-fail (logs a warning, copies `mesh_ply` to `remainder_out_ply` if given) -- caller
+    should log + continue, matching today's bash leniency."""
+
+    def skip(reason: str) -> bool:
+        logger.warning(f"Skipping floor extraction for {mesh_ply}: {reason}")
+        if remainder_out_ply is not None and remainder_out_ply != mesh_ply:
+            remainder_out_ply.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(mesh_ply, remainder_out_ply)
+        return False
+
+    verts_xyz = _load_vertices(mesh_ply)
+
+    try:
+        normal, d, inlier_points = fit_floor_plane(
+            verts_xyz,
+            z_percentile=z_percentile,
+            distance_threshold=distance_threshold,
+            num_iterations=num_iterations,
+            seed=seed,
+        )
+    except RuntimeError as e:
+        return skip(str(e))
+
+    resolved_remainder_padding = hull_padding + remainder_margin
+    try:
+        object_equations = padded_hull_equations(inlier_points, hull_padding)
+        remainder_equations = padded_hull_equations(inlier_points, resolved_remainder_padding)
+    except QhullError as e:
+        return skip(f"convex hull construction over the floor-plane inliers failed ({e}).")
+
+    bbox_margin = resolved_remainder_padding
+    bbox_min = inlier_points.min(axis=0) - bbox_margin
+    bbox_max = inlier_points.max(axis=0) + bbox_margin
+
+    object_vertex, object_faces, remainder_vertex, remainder_faces = crop_mesh(
+        mesh_ply, object_equations, remainder_equations, bbox_min, bbox_max,
+    )
+    if len(object_faces) == 0:
+        return skip("no mesh faces fell inside the padded floor-plane hull.")
+
+    floor_vertex, floor_faces, discard_vertex, discard_faces = split_largest_component(object_vertex, object_faces)
+    remainder_vertex, remainder_faces = merge_meshes(remainder_vertex, remainder_faces, discard_vertex, discard_faces)
+    floor_vertex = flatten_to_plane(floor_vertex, normal, d)
+
+    write_cropped_ply(out_ply, floor_vertex, floor_faces)
+    logger.info(
+        f"Wrote {out_ply}: {len(floor_vertex)} vertices, {len(floor_faces)} faces "
+        f"(plane normal {normal}, d={d:.4f})."
+    )
+
+    if remainder_out_ply is not None:
+        write_cropped_ply(remainder_out_ply, remainder_vertex, remainder_faces)
+        logger.info(
+            f"Wrote {remainder_out_ply}: {len(remainder_vertex)} vertices, "
+            f"{len(remainder_faces)} faces."
+        )
+    return True
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--mesh_ply", type=Path, required=True)
@@ -166,61 +239,17 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
-    def skip(reason: str) -> None:
-        logger.warning(f"Skipping floor extraction for {args.mesh_ply}: {reason}")
-        if args.remainder_out_ply is not None and args.remainder_out_ply != args.mesh_ply:
-            args.remainder_out_ply.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(args.mesh_ply, args.remainder_out_ply)
-
-    verts_xyz = _load_vertices(args.mesh_ply)
-
-    try:
-        normal, d, inlier_points = fit_floor_plane(
-            verts_xyz,
-            z_percentile=args.z_percentile,
-            distance_threshold=args.distance_threshold,
-            num_iterations=args.num_iterations,
-            seed=args.seed,
-        )
-    except RuntimeError as e:
-        skip(str(e))
-        return
-
-    remainder_padding = args.hull_padding + args.remainder_margin
-    try:
-        object_equations = padded_hull_equations(inlier_points, args.hull_padding)
-        remainder_equations = padded_hull_equations(inlier_points, remainder_padding)
-    except QhullError as e:
-        skip(f"convex hull construction over the floor-plane inliers failed ({e}).")
-        return
-
-    bbox_margin = remainder_padding
-    bbox_min = inlier_points.min(axis=0) - bbox_margin
-    bbox_max = inlier_points.max(axis=0) + bbox_margin
-
-    object_vertex, object_faces, remainder_vertex, remainder_faces = crop_mesh(
-        args.mesh_ply, object_equations, remainder_equations, bbox_min, bbox_max,
+    extract_floor_mesh(
+        args.mesh_ply,
+        args.out_ply,
+        remainder_out_ply=args.remainder_out_ply,
+        z_percentile=args.z_percentile,
+        distance_threshold=args.distance_threshold,
+        num_iterations=args.num_iterations,
+        hull_padding=args.hull_padding,
+        remainder_margin=args.remainder_margin,
+        seed=args.seed,
     )
-    if len(object_faces) == 0:
-        skip("no mesh faces fell inside the padded floor-plane hull.")
-        return
-
-    floor_vertex, floor_faces, discard_vertex, discard_faces = split_largest_component(object_vertex, object_faces)
-    remainder_vertex, remainder_faces = merge_meshes(remainder_vertex, remainder_faces, discard_vertex, discard_faces)
-    floor_vertex = flatten_to_plane(floor_vertex, normal, d)
-
-    write_cropped_ply(args.out_ply, floor_vertex, floor_faces)
-    logger.info(
-        f"Wrote {args.out_ply}: {len(floor_vertex)} vertices, {len(floor_faces)} faces "
-        f"(plane normal {normal}, d={d:.4f})."
-    )
-
-    if args.remainder_out_ply is not None:
-        write_cropped_ply(args.remainder_out_ply, remainder_vertex, remainder_faces)
-        logger.info(
-            f"Wrote {args.remainder_out_ply}: {len(remainder_vertex)} vertices, "
-            f"{len(remainder_faces)} faces."
-        )
 
 
 if __name__ == "__main__":

@@ -143,19 +143,12 @@ def load_labels(segmentation_dir: Path) -> Dict[str, str]:
     return json.loads(labels_path.read_text())
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Import a genrecon run into MV-SAM3D's input format.")
-    parser.add_argument("--genrecon_run", required=True, help="Path to genrecon run dir, e.g. runs/kitchen_multi_object")
-    parser.add_argument("--output_dir", required=True, help="Output directory (becomes --input_path for MV-SAM3D)")
-    parser.add_argument(
-        "--objects",
-        default=None,
-        help="Comma-separated class names to export masks for (default: all classes in labels.json)",
-    )
-    args = parser.parse_args()
-
-    genrecon_run = Path(args.genrecon_run)
-    output_dir = Path(args.output_dir)
+def import_from_genrecon(genrecon_run: Path, output_dir: Path, objects: List[str] | None = None) -> None:
+    """Converts a completed genrecon run into MV-SAM3D's input format (a da3_output.npz plus
+    an images/masks directory). `objects` is a list of raw class names to export masks for
+    (default: all classes in labels.json)."""
+    genrecon_run = Path(genrecon_run)
+    output_dir = Path(output_dir)
     vggt_export = genrecon_run / "vggt_export"
     segmentation_dir = genrecon_run / "genrecon_output" / "segmentation_raw"
 
@@ -234,8 +227,8 @@ def main():
     # the output folder name, matching what --mask_prompt is later given) --
     # only the on-disk mask_bin lookup below needs the sanitized name.
     labels = load_labels(segmentation_dir)
-    if args.objects:
-        object_names = [o.strip() for o in args.objects.split(",") if o.strip()]
+    if objects:
+        object_names = [o.strip() for o in objects if o.strip()]
     else:
         object_names = list(labels.keys())
 
@@ -291,6 +284,21 @@ def main():
         f"  --mask_prompt {mask_prompt} \\\n"
         f"  --da3_output {da3_output_path}"
     )
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Import a genrecon run into MV-SAM3D's input format.")
+    parser.add_argument("--genrecon_run", required=True, help="Path to genrecon run dir, e.g. runs/kitchen_multi_object")
+    parser.add_argument("--output_dir", required=True, help="Output directory (becomes --input_path for MV-SAM3D)")
+    parser.add_argument(
+        "--objects",
+        default=None,
+        help="Comma-separated class names to export masks for (default: all classes in labels.json)",
+    )
+    args = parser.parse_args()
+
+    objects = [o.strip() for o in args.objects.split(",") if o.strip()] if args.objects else None
+    import_from_genrecon(Path(args.genrecon_run), Path(args.output_dir), objects)
 
 
 if __name__ == "__main__":

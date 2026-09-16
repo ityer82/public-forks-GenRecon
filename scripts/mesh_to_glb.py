@@ -23,24 +23,19 @@ import trimesh
 from genrecon.utils.logger import logger
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--shapes_dir", type=Path, required=True)
-    parser.add_argument(
-        "--out_dir",
-        type=Path,
-        default=None,
-        help="Defaults to <shapes_dir>/glb.",
-    )
-    args = parser.parse_args()
-    out_dir = args.out_dir if args.out_dir is not None else args.shapes_dir / "glb"
+def convert(shapes_dir: Path, out_dir: Path | None = None) -> None:
+    """Converts every <label>_mesh.ply under `shapes_dir` to <out_dir>/<label>/mesh.glb.
+    Skips (logs a warning, continues) empty-geometry or zero-face meshes -- caller should treat
+    these leniently, matching today's bash orchestration which never checked this script's exit
+    code either."""
+    out_dir = out_dir if out_dir is not None else shapes_dir / "glb"
 
     def skip(mesh_ply: Path, reason: str) -> None:
         logger.warning(f"Skipping {mesh_ply}: {reason}")
 
-    mesh_plys = sorted(args.shapes_dir.glob("*_mesh.ply"))
+    mesh_plys = sorted(shapes_dir.glob("*_mesh.ply"))
     if not mesh_plys:
-        logger.warning(f"No *_mesh.ply files found in {args.shapes_dir}.")
+        logger.warning(f"No *_mesh.ply files found in {shapes_dir}.")
         return
 
     for mesh_ply in mesh_plys:
@@ -59,6 +54,19 @@ def main():
         out_glb.parent.mkdir(parents=True, exist_ok=True)
         mesh.export(out_glb)
         logger.info(f"Wrote {out_glb}: {len(mesh.vertices)} vertices, {len(mesh.faces)} faces.")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--shapes_dir", type=Path, required=True)
+    parser.add_argument(
+        "--out_dir",
+        type=Path,
+        default=None,
+        help="Defaults to <shapes_dir>/glb.",
+    )
+    args = parser.parse_args()
+    convert(args.shapes_dir, args.out_dir)
 
 
 if __name__ == "__main__":

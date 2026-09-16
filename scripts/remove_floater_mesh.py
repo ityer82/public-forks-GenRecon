@@ -88,6 +88,77 @@ def merge_face_groups(faces: np.ndarray, face_groups: list[np.ndarray]) -> np.nd
     return faces[np.concatenate(face_groups)]
 
 
+def remove_floater_mesh(
+    mesh_ply: Path,
+    object_ply: Path,
+    out_ply: Path,
+    *,
+    floaters_out_ply: Path | None = None,
+    search_padding_factor: float = 0.2,
+    containment_frac: float = 0.95,
+    max_floater_faces: int = 5000,
+) -> bool:
+    """Removes small disconnected mesh floaters near `object_ply`'s object from `mesh_ply`,
+    writing the result to `out_ply` (may equal `mesh_ply`). Returns True on success, False on a
+    soft-fail (logs a warning, copies `mesh_ply` to `out_ply` unchanged if they differ) --
+    caller should log + continue, matching today's bash leniency."""
+
+    def skip(reason: str) -> bool:
+        logger.warning(f"Skipping floater removal for {object_ply}: {reason}")
+        if out_ply != mesh_ply:
+            out_ply.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(mesh_ply, out_ply)
+        return False
+
+    points = load_object_points(object_ply)
+    if len(points) < 4:
+        return skip(f"only {len(points)} points, need >=4 to build a convex hull.")
+
+    bbox_diagonal = float(np.linalg.norm(points.max(axis=0) - points.min(axis=0)))
+    padding = search_padding_factor * bbox_diagonal
+    try:
+        equations = padded_hull_equations(points, padding)
+    except QhullError as e:
+        return skip(f"convex hull construction failed ({e}).")
+
+    bbox_min = points.min(axis=0) - padding
+    bbox_max = points.max(axis=0) + padding
+
+    ply = PlyData.read(mesh_ply)
+    vertex_data = ply["vertex"].data
+    faces = np.stack(ply["face"]["vertex_indices"])
+    logger.info(f"{mesh_ply}: {len(vertex_data)} vertices, {len(faces)} faces before floater removal.")
+
+    components = find_components(vertex_data, faces)
+    floater_indices = find_floater_component_indices(
+        vertex_data, faces, components, equations, bbox_min, bbox_max,
+        containment_frac=containment_frac, max_floater_faces=max_floater_faces,
+    )
+
+    if not floater_indices:
+        logger.info(f"{object_ply}: no floaters found (examined {len(components)} components).")
+        write_cropped_ply(out_ply, np.array(vertex_data), faces.copy())
+        return True
+
+    floater_set = set(floater_indices)
+    floater_faces = merge_face_groups(faces, [components[i] for i in floater_indices])
+    kept_faces = merge_face_groups(faces, [c for i, c in enumerate(components) if i not in floater_set])
+
+    kept_vertex, kept_faces = compact_mesh(vertex_data, kept_faces)
+    write_cropped_ply(out_ply, kept_vertex, kept_faces)
+    logger.info(
+        f"{object_ply}: removed {len(floater_indices)}/{len(components)} components "
+        f"({len(floater_faces)} faces). Wrote {out_ply}: {len(kept_vertex)} vertices, "
+        f"{len(kept_faces)} faces."
+    )
+
+    if floaters_out_ply is not None:
+        floater_vertex, floater_faces = compact_mesh(vertex_data, floater_faces)
+        write_cropped_ply(floaters_out_ply, floater_vertex, floater_faces)
+        logger.info(f"Wrote {floaters_out_ply}: {len(floater_vertex)} vertices, {len(floater_faces)} faces.")
+    return True
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--mesh_ply", type=Path, required=True)
@@ -117,64 +188,15 @@ def main():
     )
     args = parser.parse_args()
 
-    def skip(reason: str) -> None:
-        logger.warning(f"Skipping floater removal for {args.object_ply}: {reason}")
-        if args.out_ply != args.mesh_ply:
-            args.out_ply.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(args.mesh_ply, args.out_ply)
-
-    points = load_object_points(args.object_ply)
-    if len(points) < 4:
-        skip(f"only {len(points)} points, need >=4 to build a convex hull.")
-        return
-
-    bbox_diagonal = float(np.linalg.norm(points.max(axis=0) - points.min(axis=0)))
-    padding = args.search_padding_factor * bbox_diagonal
-    try:
-        equations = padded_hull_equations(points, padding)
-    except QhullError as e:
-        skip(f"convex hull construction failed ({e}).")
-        return
-
-    bbox_min = points.min(axis=0) - padding
-    bbox_max = points.max(axis=0) + padding
-
-    ply = PlyData.read(args.mesh_ply)
-    vertex_data = ply["vertex"].data
-    faces = np.stack(ply["face"]["vertex_indices"])
-    logger.info(f"{args.mesh_ply}: {len(vertex_data)} vertices, {len(faces)} faces before floater removal.")
-
-    components = find_components(vertex_data, faces)
-    floater_indices = find_floater_component_indices(
-        vertex_data, faces, components, equations, bbox_min, bbox_max,
-        containment_frac=args.containment_frac, max_floater_faces=args.max_floater_faces,
+    remove_floater_mesh(
+        args.mesh_ply,
+        args.object_ply,
+        args.out_ply,
+        floaters_out_ply=args.floaters_out_ply,
+        search_padding_factor=args.search_padding_factor,
+        containment_frac=args.containment_frac,
+        max_floater_faces=args.max_floater_faces,
     )
-
-    if not floater_indices:
-        logger.info(f"{args.object_ply}: no floaters found (examined {len(components)} components).")
-        # PlyData.read() memory-maps mesh_ply by default; when out_ply is the same
-        # path (the normal Stage 8 chaining case), writing in place truncates the
-        # file out from under that mmap. compact_mesh()/write below force a real
-        # copy first so it's safe to overwrite the source file.
-        write_cropped_ply(args.out_ply, np.array(vertex_data), faces.copy())
-        return
-
-    floater_set = set(floater_indices)
-    floater_faces = merge_face_groups(faces, [components[i] for i in floater_indices])
-    kept_faces = merge_face_groups(faces, [c for i, c in enumerate(components) if i not in floater_set])
-
-    kept_vertex, kept_faces = compact_mesh(vertex_data, kept_faces)
-    write_cropped_ply(args.out_ply, kept_vertex, kept_faces)
-    logger.info(
-        f"{args.object_ply}: removed {len(floater_indices)}/{len(components)} components "
-        f"({len(floater_faces)} faces). Wrote {args.out_ply}: {len(kept_vertex)} vertices, "
-        f"{len(kept_faces)} faces."
-    )
-
-    if args.floaters_out_ply is not None:
-        floater_vertex, floater_faces = compact_mesh(vertex_data, floater_faces)
-        write_cropped_ply(args.floaters_out_ply, floater_vertex, floater_faces)
-        logger.info(f"Wrote {args.floaters_out_ply}: {len(floater_vertex)} vertices, {len(floater_faces)} faces.")
 
 
 if __name__ == "__main__":

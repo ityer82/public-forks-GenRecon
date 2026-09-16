@@ -232,6 +232,244 @@ def _build_exclude_equations(
     return exclude_equations
 
 
+def run_reconstruct_scene(
+    path: Path,
+    output_path: Path,
+    *,
+    ss_ckpt: Path,
+    shape_ckpt: Path,
+    tex_ckpt: Path,
+    num_imgs_per_scene: int,
+    colmap_subdir: str = "colmap",
+    pipeline: str = "512",
+    pipeline_config: Path | None = None,
+    seed: int = 42,
+    save_imgs: bool = False,
+    boundary_sensitive_slat: bool = True,
+    boundary_width_slat: int = 1,
+    min_overlap_factor: int = 4,
+    occ_threshold: float = -1.0,
+    chunk_size_factor: float | None = 1.11,
+    fix_num_chunks: int | None = None,
+    min_points_per_chunk: int | None = None,
+    skip_point_cleaning: bool = False,
+    stat_std_ratio: float | None = None,
+    radius_nb_points: int | None = None,
+    radius_m: float | None = None,
+    center_crop: bool = False,
+    proj_batch_voxels: int | None = None,
+    max_chunks_per_group: int | None = None,
+    max_inflated_voxels: int | None = None,
+    exclude_masks_root: Path | None = None,
+    unmasked_path: Path | None = None,
+) -> None:
+    """Iphone-mode-only entry point for reconstruct_scene.py's pipeline, callable directly with
+    typed kwargs instead of going through argparse -- this is the only mode
+    run_full_pipeline.py's in-process orchestration actually drives (bash always hardcoded
+    --mode Iphone). Other modes (Sage_gt, Scannet_*) remain available via this module's CLI
+    (main()/build_parser()), unaffected by this function.
+
+    Raises ValueError for bad argument combinations (in place of the CLI's parser.error calls,
+    which have no meaning outside an argparse.ArgumentParser). Tears down the CUDA-resident
+    pipeline object before returning (del + torch.cuda.empty_cache()), since this may run
+    in-process alongside other CUDA-heavy pipeline stages with no separate subprocess to reclaim
+    that memory automatically.
+    """
+    missing = [n for n, v in [("ss_ckpt", ss_ckpt), ("shape_ckpt", shape_ckpt), ("tex_ckpt", tex_ckpt)] if v is None]
+    if missing:
+        raise ValueError(f"{', '.join(missing)} required.")
+
+    _seed_everything(seed)
+
+    scene_path = Path(path)
+    out_path = Path(output_path)
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    args_dict = {
+        "mode": "Iphone",
+        "path": str(scene_path),
+        "output_path": str(out_path),
+        "ss_ckpt": str(ss_ckpt),
+        "shape_ckpt": str(shape_ckpt),
+        "tex_ckpt": str(tex_ckpt),
+        "pipeline": pipeline,
+        "pipeline_config": str(pipeline_config) if pipeline_config is not None else None,
+        "num_imgs_per_scene": num_imgs_per_scene,
+        "seed": seed,
+        "save_imgs": save_imgs,
+        "boundary_sensitive_slat": boundary_sensitive_slat,
+        "boundary_width_slat": boundary_width_slat,
+        "min_overlap_factor": min_overlap_factor,
+        "occ_threshold": occ_threshold,
+        "chunk_size_factor": chunk_size_factor,
+        "fix_num_chunks": fix_num_chunks,
+        "colmap_subdir": colmap_subdir,
+        "min_points_per_chunk": min_points_per_chunk,
+        "skip_point_cleaning": skip_point_cleaning,
+        "stat_std_ratio": stat_std_ratio,
+        "radius_nb_points": radius_nb_points,
+        "radius_m": radius_m,
+        "center_crop": center_crop,
+        "proj_batch_voxels": proj_batch_voxels,
+        "max_chunks_per_group": max_chunks_per_group,
+        "exclude_masks_root": str(exclude_masks_root) if exclude_masks_root is not None else None,
+        "max_inflated_voxels": max_inflated_voxels,
+        "unmasked_path": str(unmasked_path) if unmasked_path is not None else None,
+    }
+    with (out_path / "args.json").open("w", encoding="utf-8") as f:
+        json.dump(args_dict, f, indent=2, sort_keys=True)
+
+    pipeline_obj = FullSceneImagesTo3DPipeline.from_finetuned(
+        stage_models={
+            "sparse_structure_flow_model": str(ss_ckpt),
+            f"shape_slat_flow_model_{pipeline}": str(shape_ckpt),
+            f"tex_slat_flow_model_{pipeline}": str(tex_ckpt),
+        },
+        pipeline_config_file=str(pipeline_config) if pipeline_config is not None else None,
+    )
+    try:
+        if proj_batch_voxels is not None:
+            pipeline_obj.proj_batch_voxels = proj_batch_voxels
+        if max_chunks_per_group is not None:
+            pipeline_obj.max_chunks_per_group_override = max_chunks_per_group
+        if max_inflated_voxels is not None:
+            pipeline_obj.max_inflated_voxels_override = max_inflated_voxels
+        pipeline_obj.to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+
+        chunker_cls, selecter_cls, _default_transforms_json = MODES["Iphone"]
+        transforms_json = lambda p, sub=colmap_subdir: p / sub / "cameras.txt"
+
+        chunker_kwargs: dict = {"min_overlap_factor": min_overlap_factor}
+        if chunk_size_factor is not None:
+            chunker_kwargs["chunk_size_factor"] = chunk_size_factor
+        if fix_num_chunks is not None:
+            chunker_kwargs["fix_num_chunks"] = fix_num_chunks
+        chunker_kwargs["colmap_subdir"] = colmap_subdir
+        if stat_std_ratio is not None:
+            chunker_kwargs["stat_std_ratio"] = stat_std_ratio
+        if radius_nb_points is not None:
+            chunker_kwargs["radius_nb_points"] = radius_nb_points
+        if radius_m is not None:
+            chunker_kwargs["radius_m"] = radius_m
+        if min_points_per_chunk is not None:
+            chunker_kwargs["min_points_per_chunk"] = min_points_per_chunk
+        if skip_point_cleaning:
+            chunker_kwargs["skip_point_cleaning"] = True
+
+        chunk_source_path = Path(unmasked_path) if unmasked_path is not None else scene_path
+        _, m_o2c, m_c2o, rel_t = chunker_cls(**chunker_kwargs).get_chunks(chunk_source_path, out_path)
+
+        selecter_kwargs: dict = {"center_crop": center_crop}
+        sel = selecter_cls(**selecter_kwargs).get_images(
+            m_o2c,
+            transforms_json(scene_path),
+            num_imgs_per_scene,
+            out_path,
+            seed=seed,
+        )
+        rel_t_kept = [rel_t[i] for i in sel.chunk_indices]
+
+        exclude_equations = None
+        if exclude_masks_root is not None:
+            exclude_equations = _build_exclude_equations(
+                Path(exclude_masks_root),
+                scene_path / colmap_subdir,
+                m_o2c,
+                m_c2o,
+                sel.chunk_indices,
+            )
+
+        if save_imgs:
+            scene_dir = out_path / "scene"
+            scene_dir.mkdir(parents=True, exist_ok=True)
+            for view_idx, img in enumerate(sel.scene_images_1024):
+                arr = (img.permute(1, 2, 0).clamp(0, 1).cpu().numpy() * 255).astype(np.uint8)
+                Image.fromarray(arr).save(scene_dir / f"view_{view_idx:03d}.png")
+            for chunk_idx, img in zip(sel.chunk_indices, sel.cond2d_images_1024):
+                chunk_dir = out_path / f"chunk_{chunk_idx:03d}"
+                chunk_dir.mkdir(parents=True, exist_ok=True)
+                arr = (img.permute(1, 2, 0).clamp(0, 1).cpu().numpy() * 255).astype(np.uint8)
+                Image.fromarray(arr).save(chunk_dir / "cond2d.png")
+
+        ss_sampler_params: dict = {}
+        slat_sampler_params: dict = {}
+        if boundary_sensitive_slat:
+            slat_sampler_params = {"boundary_sensitive": True, "boundary_width": boundary_width_slat}
+
+        scene_mesh, coords_list = pipeline_obj.run(
+            sel,
+            rel_t_kept,
+            seed=seed,
+            pipeline_type=pipeline,
+            sparse_structure_sampler_params=ss_sampler_params,
+            shape_slat_sampler_params=slat_sampler_params,
+            tex_slat_sampler_params=slat_sampler_params,
+            occ_threshold=occ_threshold,
+            exclude_equations=exclude_equations,
+        )
+
+        coords_resolution = pipeline_obj.models[f"shape_slat_flow_model_{pipeline}"].resolution
+
+        chunk_size = m_c2o[0][0, 0].item()
+        chunk_center0 = m_c2o[0][:3, 3].to(scene_mesh.vertices.device, dtype=scene_mesh.vertices.dtype)
+        _save_plys(
+            out_path,
+            scene_mesh,
+            coords_list,
+            coords_resolution,
+            sel.chunk_indices,
+            mesh_transform=m_c2o[0],
+            coords_transform=lambda i: m_c2o[i],
+            label="\n PLY saved!",
+        )
+
+        _save_to_glb_inputs(
+            out_path,
+            scene_mesh,
+            vertices=scene_mesh.vertices * chunk_size + chunk_center0,
+            voxel_size=scene_mesh.voxel_size * chunk_size,
+            origin=[scene_mesh.origin[i].item() * chunk_size + chunk_center0[i].item() for i in range(3)],
+            label="",
+        )
+
+        chunk_inputs = {
+            "chunk_centers_world": torch.stack([m_c2o[i][:3, 3] for i in sel.chunk_indices]).detach().cpu(),
+            "chunk_size_world": chunk_size,
+            "chunk_indices": list(sel.chunk_indices),
+        }
+        torch.save(chunk_inputs, out_path / "chunk_inputs.pt")
+        logger.info(f"saved chunk metadata to {out_path / 'chunk_inputs.pt'}")
+
+        if unmasked_path is not None:
+            unmasked_scene_path = Path(unmasked_path)
+            sel_full = selecter_cls(**selecter_kwargs).get_images(
+                m_o2c,
+                transforms_json(unmasked_scene_path),
+                num_imgs_per_scene,
+                out_path,
+                seed=seed,
+            )
+            rel_t_kept_full = [rel_t[i] for i in sel_full.chunk_indices]
+            scene_mesh_full, _ = pipeline_obj.run(
+                sel_full,
+                rel_t_kept_full,
+                seed=seed,
+                pipeline_type=pipeline,
+                sparse_structure_sampler_params=ss_sampler_params,
+                shape_slat_sampler_params=slat_sampler_params,
+                tex_slat_sampler_params=slat_sampler_params,
+                occ_threshold=occ_threshold,
+                exclude_equations=None,
+            )
+            object_source_mesh_path = out_path / "object_source_mesh.ply"
+            save_mesh_to_original(object_source_mesh_path, scene_mesh_full, m_c2o[0])
+            logger.info(f"saved object-source mesh (unmasked run) to {object_source_mesh_path}")
+    finally:
+        del pipeline_obj
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", required=True, choices=list(MODES))

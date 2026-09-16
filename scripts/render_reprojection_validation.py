@@ -94,45 +94,71 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> None:
-    args = build_parser().parse_args()
-    args.out_synth_dir.mkdir(parents=True, exist_ok=True)
-    args.out_compare_dir.mkdir(parents=True, exist_ok=True)
+def run_reprojection_validation(
+    mesh_ply: Path,
+    colmap_dir: Path,
+    images_dir: Path,
+    out_synth_dir: Path,
+    out_compare_dir: Path,
+    *,
+    ssaa: int = 2,
+    chunk_size: int = 5_000_000,
+) -> None:
+    out_synth_dir.mkdir(parents=True, exist_ok=True)
+    out_compare_dir.mkdir(parents=True, exist_ok=True)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    mesh = load_colored_mesh(args.mesh_ply, device)
+    mesh = load_colored_mesh(mesh_ply, device)
     near, far = bbox_near_far(mesh)
     renderer = MeshRenderer(
         rendering_options={
             "near": near,
             "far": far,
-            "ssaa": args.ssaa,
-            "chunk_size": args.chunk_size or None,
+            "ssaa": ssaa,
+            "chunk_size": chunk_size or None,
         },
         device=device,
     )
 
-    cameras = parse_colmap_cameras(args.colmap_dir)
-    logger.info(f"{len(cameras)} camera(s) found in {args.colmap_dir}")
+    cameras = parse_colmap_cameras(colmap_dir)
+    logger.info(f"{len(cameras)} camera(s) found in {colmap_dir}")
 
     n_rendered, n_missing = 0, 0
-    for cam in cameras:
-        image_path = args.images_dir / cam["name"]
-        if not image_path.is_file():
-            logger.warning(f"skipping {cam['name']}: no matching original image")
-            n_missing += 1
-            continue
+    try:
+        for cam in cameras:
+            image_path = images_dir / cam["name"]
+            if not image_path.is_file():
+                logger.warning(f"skipping {cam['name']}: no matching original image")
+                n_missing += 1
+                continue
 
-        synth = render_view(renderer, mesh, cam)
-        Image.fromarray(synth).save(args.out_synth_dir / cam["name"])
+            synth = render_view(renderer, mesh, cam)
+            Image.fromarray(synth).save(out_synth_dir / cam["name"])
 
-        original = np.array(Image.open(image_path).convert("RGB"))
-        Image.fromarray(make_side_by_side(original, synth)).save(args.out_compare_dir / cam["name"])
-        n_rendered += 1
+            original = np.array(Image.open(image_path).convert("RGB"))
+            Image.fromarray(make_side_by_side(original, synth)).save(out_compare_dir / cam["name"])
+            n_rendered += 1
+    finally:
+        del renderer
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     logger.info(
-        f"rendered {n_rendered} view(s) -> {args.out_synth_dir} "
-        f"and {args.out_compare_dir} ({n_missing} skipped for missing originals)"
+        f"rendered {n_rendered} view(s) -> {out_synth_dir} "
+        f"and {out_compare_dir} ({n_missing} skipped for missing originals)"
+    )
+
+
+def main() -> None:
+    args = build_parser().parse_args()
+    run_reprojection_validation(
+        args.mesh_ply,
+        args.colmap_dir,
+        args.images_dir,
+        args.out_synth_dir,
+        args.out_compare_dir,
+        ssaa=args.ssaa,
+        chunk_size=args.chunk_size,
     )
 
 
