@@ -605,7 +605,8 @@ if [[ -n "$CLASSES" ]]; then
                 --dataset_name "$MVSAM3D_DATASET_NAME" \
                 --labels "$CLASSES" \
                 --out_dir "$IMAGE_TO_3D_OUTPUT_DIR" \
-                --visualization_dir "${MVSAM3D_VENDOR_DIR}/visualization"
+                --visualization_dir "${MVSAM3D_VENDOR_DIR}/visualization" \
+                --scene_pointcloud_dir "$COBGS_MASK_DIR"
         fi
         stage_end
     else
