@@ -35,10 +35,16 @@ import json
 from pathlib import Path
 
 import numpy as np
+import open3d as o3d
 import trimesh
 from plyfile import PlyData
 
 from genrecon.utils.logger import logger
+
+# Below this many surviving points, statistical outlier removal is considered
+# to have over-trimmed a sparse/degenerate point cloud -- fall back to the raw
+# bbox rather than risk a bogus/degenerate extent.
+MIN_FILTERED_POINTS = 10
 
 # glTF Y-up -> scene Z-up: (x, y, z) -> (x, -z, y), i.e. -90 deg about X.
 ZUP_CORRECTION = np.array(
@@ -58,11 +64,55 @@ def _bbox_extent(bbox_min: np.ndarray, bbox_max: np.ndarray) -> float:
     return extent
 
 
-def load_target_bbox(scene_mesh_ply: Path) -> tuple[np.ndarray, np.ndarray]:
+def remove_statistical_outliers(
+    xyz: np.ndarray, nb_neighbors: int = 20, std_ratio: float = 2.0
+) -> tuple[np.ndarray, dict]:
+    """Drops points whose mean distance to their `nb_neighbors` nearest
+    neighbors is more than `std_ratio` standard deviations above the point
+    cloud's global mean neighbor distance -- Open3D's standard statistical
+    outlier removal. Targets isolated stray points (e.g. mis-segmented COB-GS
+    points far from the object's real surface) rather than just per-axis
+    distribution tails.
+
+    Falls back to the raw, unfiltered points if too few survive (degenerate/
+    very sparse input) so a real object never collapses to an empty bbox.
+    """
+    diagnostics = {"raw_point_count": int(xyz.shape[0])}
+
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(xyz)
+    filtered_pcd, inlier_idx = pcd.remove_statistical_outlier(
+        nb_neighbors=nb_neighbors, std_ratio=std_ratio
+    )
+    filtered_xyz = xyz[inlier_idx]
+
+    if filtered_xyz.shape[0] < MIN_FILTERED_POINTS:
+        logger.warning(
+            f"Statistical outlier removal left only {filtered_xyz.shape[0]} of "
+            f"{xyz.shape[0]} points (< {MIN_FILTERED_POINTS}) -- falling back to "
+            "the raw, unfiltered point cloud for bbox estimation."
+        )
+        diagnostics["filtered_point_count"] = int(xyz.shape[0])
+        diagnostics["outlier_filter_fallback"] = True
+        return xyz, diagnostics
+
+    diagnostics["filtered_point_count"] = int(filtered_xyz.shape[0])
+    diagnostics["outlier_filter_fallback"] = False
+    return filtered_xyz, diagnostics
+
+
+def load_target_bbox(scene_mesh_ply: Path) -> tuple[np.ndarray, np.ndarray, dict]:
     ply = PlyData.read(scene_mesh_ply)
     vertex = ply["vertex"]
     xyz = np.stack([vertex["x"], vertex["y"], vertex["z"]], axis=1).astype(np.float64)
-    return xyz.min(axis=0), xyz.max(axis=0)
+
+    raw_bbox_min, raw_bbox_max = xyz.min(axis=0), xyz.max(axis=0)
+    filtered_xyz, diagnostics = remove_statistical_outliers(xyz)
+    diagnostics["raw_bbox_min"] = raw_bbox_min.tolist()
+    diagnostics["raw_bbox_max"] = raw_bbox_max.tolist()
+    diagnostics["raw_extent"] = float((raw_bbox_max - raw_bbox_min).max())
+
+    return filtered_xyz.min(axis=0), filtered_xyz.max(axis=0), diagnostics
 
 
 def align_trellis_mesh_to_scene(
@@ -77,7 +127,7 @@ def align_trellis_mesh_to_scene(
     get this applied again -- it would introduce a spurious 90-deg rotation.
     The scale+translation bbox-fit below is still applied either way.
     """
-    target_bbox_min, target_bbox_max = load_target_bbox(scene_mesh_ply)
+    target_bbox_min, target_bbox_max, bbox_diagnostics = load_target_bbox(scene_mesh_ply)
     target_extent = _bbox_extent(target_bbox_min, target_bbox_max)
     target_center = (target_bbox_min + target_bbox_max) / 2.0
 
@@ -98,6 +148,7 @@ def align_trellis_mesh_to_scene(
 
     combined_transform = scale_translate @ zup_correction
     diagnostics = {
+        **bbox_diagnostics,
         "scale": scale,
         "target_bbox_min": target_bbox_min.tolist(),
         "target_bbox_max": target_bbox_max.tolist(),
