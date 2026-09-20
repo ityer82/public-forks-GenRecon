@@ -26,14 +26,26 @@ from genrecon.utils.logger import logger
 
 # Anchors every lighting/camera default to demo_franka_pickplace.py's current hardcoded values
 # (add_lighting()/setup_camera()) -- a bad or unparseable LLM reply falls back to exactly today's
-# render, not an arbitrary guess.
-DEFAULT_LIGHTING = {
-    "dome_intensity": 1000.0,
-    "dome_color": [1.0, 1.0, 1.0],
-    "distant_intensity": 3000.0,
-    "distant_angle": 1.0,
-    "distant_rotation_deg": [-45.0, 30.0, 0.0],
+# render, not an arbitrary guess. Duplicated here rather than imported: genrecon/ and IsaacSim/ are
+# separate uv envs/processes that never import each other directly.
+LIGHTING_PRESETS = {
+    "ambient": {
+        "dome_intensity": 1000.0,
+        "dome_color": [1.0, 1.0, 1.0],
+        "distant_intensity": 3000.0,
+        "distant_angle": 1.0,
+        "distant_rotation_deg": [-45.0, 30.0, 0.0],
+    },
+    "room": {
+        "dome_intensity": 400.0,
+        "dome_color": [1.0, 0.95, 0.85],
+        "distant_intensity": 1500.0,
+        "distant_angle": 3.0,
+        "distant_rotation_deg": [-80.0, 10.0, 0.0],
+    },
 }
+DEFAULT_LIGHTING_MODE = "ambient"
+DEFAULT_LIGHTING = LIGHTING_PRESETS[DEFAULT_LIGHTING_MODE]
 DEFAULT_CAMERA = {"mode": "angled", "distance_multiplier": 2.0}
 
 # Keeps offsets "well under the Panda's ~0.85m reach", per demo_franka_pickplace.py's own
@@ -42,6 +54,7 @@ MAX_PLACE_OFFSET_METERS = 0.6
 
 APPROACH_SIDE_CHOICES = ["neg-x", "pos-x", "neg-y", "pos-y"]
 CAMERA_MODE_CHOICES = ["angled", "overhead"]
+LIGHTING_MODE_CHOICES = ["ambient", "room"]
 
 
 class SceneAgentState(TypedDict):
@@ -55,6 +68,7 @@ class SceneAgentState(TypedDict):
     approach_side: str
     start_distance: float
     gripper_open_width: float
+    lighting_mode: str
     lighting: dict
     camera: dict
     reasoning: dict[str, str]
@@ -254,43 +268,83 @@ def _make_ask_approach_side_node(llm: ChatOllama):
     return ask_approach_side
 
 
-def _make_ask_lighting_node(llm: ChatOllama):
-    def ask_lighting(state: SceneAgentState) -> dict:
+def _make_ask_lighting_mode_node(llm: ChatOllama):
+    def ask_lighting_mode(state: SceneAgentState) -> dict:
         answer = _prompt_user(
-            "Describe the lighting for the scene (e.g. 'bright studio light', 'dim warm indoor "
-            "light', 'outdoor daylight'), or press enter for the default."
+            "Ambient lighting (soft, shadowless, uniform) or room lighting (a warmer overhead "
+            f"light with soft shadows, like an indoor room)? Options: {', '.join(LIGHTING_MODE_CHOICES)}, "
+            "or press enter for ambient (today's default)."
         )
         if not answer:
-            return {"lighting": dict(DEFAULT_LIGHTING), "reasoning": {**state["reasoning"], "lighting": "default (no answer given)"}}
+            return {"lighting_mode": DEFAULT_LIGHTING_MODE, "reasoning": {**state["reasoning"], "lighting_mode": "default (no answer given)"}}
+        if answer in LIGHTING_MODE_CHOICES:
+            return {"lighting_mode": answer, "reasoning": {**state["reasoning"], "lighting_mode": "exact match"}}
+
+        prompt = (
+            f"A user described a lighting style preference as: '{answer}'. Map this to one of: "
+            f"{', '.join(LIGHTING_MODE_CHOICES)} ('ambient' for soft/uniform/shadowless lighting, "
+            "'room' for a warmer indoor look with an overhead light and soft shadows -- 'ambient' is "
+            "a reasonable default for an ambiguous answer). Reply with ONLY a JSON object "
+            '{"lighting_mode": "<one of the listed options>"}.'
+        )
+        try:
+            reply = llm.invoke(prompt).content
+            parsed = _parse_json_object(reply)
+            chosen = str(parsed.get("lighting_mode", "")).strip() if parsed else ""
+        except Exception as e:
+            logger.warning(f"scene_agent: lighting-mode inference failed for '{answer}': {e}")
+            chosen = ""
+
+        if chosen not in LIGHTING_MODE_CHOICES:
+            chosen = DEFAULT_LIGHTING_MODE
+            reasoning = f"could not resolve '{answer}', defaulting to '{chosen}'"
+        else:
+            reasoning = f"resolved '{answer}' -> '{chosen}'"
+        return {"lighting_mode": chosen, "reasoning": {**state["reasoning"], "lighting_mode": reasoning}}
+
+    return ask_lighting_mode
+
+
+def _make_ask_lighting_node(llm: ChatOllama):
+    def ask_lighting(state: SceneAgentState) -> dict:
+        preset = LIGHTING_PRESETS[state["lighting_mode"]]
+        answer = _prompt_user(
+            "Describe the lighting for the scene (e.g. 'bright studio light', 'dim warm indoor "
+            f"light', 'outdoor daylight'), or press enter to use the '{state['lighting_mode']}' "
+            "preset as-is."
+        )
+        if not answer:
+            return {"lighting": dict(preset), "reasoning": {**state["reasoning"], "lighting": f"'{state['lighting_mode']}' preset (no answer given)"}}
 
         prompt = (
             f"A user described a lighting mood for a robotics simulation render as: '{answer}'. "
-            "Map it to concrete USD light parameters as a JSON object with keys: "
-            '"dome_intensity" (float, reasonable range 200-3000, default 1000), '
-            '"dome_color" ([r,g,b] floats 0-1, default [1,1,1], warm tints lean toward [1, 0.9, 0.75]), '
-            '"distant_intensity" (float, reasonable range 500-6000, default 3000), '
-            '"distant_angle" (float, softness of the shadow-casting light in degrees, default 1.0), '
-            '"distant_rotation_deg" ([x,y,z] floats, default [-45, 30, 0]). '
+            f"They already chose '{state['lighting_mode']}' as the overall lighting mode. Map their "
+            "description to concrete USD light parameters as a JSON object with keys: "
+            f'"dome_intensity" (float, reasonable range 200-3000, default {preset["dome_intensity"]}), '
+            f'"dome_color" ([r,g,b] floats 0-1, default {preset["dome_color"]}, warm tints lean toward [1, 0.9, 0.75]), '
+            f'"distant_intensity" (float, reasonable range 500-6000, default {preset["distant_intensity"]}), '
+            f'"distant_angle" (float, softness of the shadow-casting light in degrees, default {preset["distant_angle"]}), '
+            f'"distant_rotation_deg" ([x,y,z] floats, default {preset["distant_rotation_deg"]}). '
             "Reply with ONLY that JSON object, no other keys, no explanation."
         )
         try:
             reply = llm.invoke(prompt).content
         except Exception as e:
             logger.warning(f"scene_agent: lighting inference failed for '{answer}': {e}")
-            return {"lighting": dict(DEFAULT_LIGHTING), "reasoning": {**state["reasoning"], "lighting": f"LLM call failed, using default: {e}"}}
+            return {"lighting": dict(preset), "reasoning": {**state["reasoning"], "lighting": f"LLM call failed, using '{state['lighting_mode']}' preset: {e}"}}
 
         parsed = _parse_json_object(reply)
-        lighting = _clamp_lighting(parsed) if parsed else None
+        lighting = _clamp_lighting(parsed, preset) if parsed else None
         if lighting is None:
-            return {"lighting": dict(DEFAULT_LIGHTING), "reasoning": {**state["reasoning"], "lighting": f"unparseable reply, using default: {reply!r}"}}
+            return {"lighting": dict(preset), "reasoning": {**state["reasoning"], "lighting": f"unparseable reply, using '{state['lighting_mode']}' preset: {reply!r}"}}
         return {"lighting": lighting, "reasoning": {**state["reasoning"], "lighting": f"mapped '{answer}' -> {lighting}"}}
 
     return ask_lighting
 
 
-def _clamp_lighting(parsed: dict) -> dict:
+def _clamp_lighting(parsed: dict, preset: dict = DEFAULT_LIGHTING) -> dict:
     try:
-        lighting = dict(DEFAULT_LIGHTING)
+        lighting = dict(preset)
         if "dome_intensity" in parsed:
             lighting["dome_intensity"] = max(50.0, min(10000.0, float(parsed["dome_intensity"])))
         if "dome_color" in parsed and len(parsed["dome_color"]) == 3:
@@ -359,6 +413,7 @@ def confirm_and_write_spec(state: SceneAgentState) -> dict:
     else:
         print(f"  Place location: offset {state['place_offset']}")
     print(f"  Approach side:  {state['approach_side']}")
+    print(f"  Lighting mode:  {state['lighting_mode']}")
     print(f"  Lighting:       {state['lighting']}")
     print(f"  Camera:         {state['camera']}")
     _prompt_user("Press enter to confirm and generate the scene (answers are not re-editable in this pass).")
@@ -371,6 +426,7 @@ def build_scene_agent_graph(llm: ChatOllama):
     graph.add_node("ask_pick_target", _make_ask_pick_target_node(llm))
     graph.add_node("ask_place_location", _make_ask_place_location_node(llm))
     graph.add_node("ask_approach_side", _make_ask_approach_side_node(llm))
+    graph.add_node("ask_lighting_mode", _make_ask_lighting_mode_node(llm))
     graph.add_node("ask_lighting", _make_ask_lighting_node(llm))
     graph.add_node("ask_camera", _make_ask_camera_node(llm))
     graph.add_node("confirm_and_write_spec", confirm_and_write_spec)
@@ -379,7 +435,8 @@ def build_scene_agent_graph(llm: ChatOllama):
     graph.add_edge("describe_objects", "ask_pick_target")
     graph.add_edge("ask_pick_target", "ask_place_location")
     graph.add_edge("ask_place_location", "ask_approach_side")
-    graph.add_edge("ask_approach_side", "ask_lighting")
+    graph.add_edge("ask_approach_side", "ask_lighting_mode")
+    graph.add_edge("ask_lighting_mode", "ask_lighting")
     graph.add_edge("ask_lighting", "ask_camera")
     graph.add_edge("ask_camera", "confirm_and_write_spec")
     graph.add_edge("confirm_and_write_spec", END)
@@ -410,6 +467,7 @@ def run_scene_agent(
         "approach_side": "neg-y",
         "start_distance": start_distance,
         "gripper_open_width": gripper_open_width,
+        "lighting_mode": DEFAULT_LIGHTING_MODE,
         "lighting": dict(DEFAULT_LIGHTING),
         "camera": dict(DEFAULT_CAMERA),
         "reasoning": {},

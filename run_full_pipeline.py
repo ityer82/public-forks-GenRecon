@@ -293,6 +293,7 @@ def main(argv: list[str] | None = None) -> None:
                         scene_agent_extra_args.extend([f"{flag}={value}"])
 
                 _opt_eq("--start-distance", result.get("start_distance"))
+                _opt_eq("--lighting-mode", result.get("lighting_mode"))
                 lighting = result.get("lighting") or {}
                 _opt_eq("--dome-light-intensity", lighting.get("dome_intensity"))
                 dome_color = lighting.get("dome_color")
