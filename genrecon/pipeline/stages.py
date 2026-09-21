@@ -216,6 +216,8 @@ def stage3_mvsam3d(
     seg_log: Path,
     log_mirror: LogMirror,
     cobgs_mask_dir: Path | None = None,
+    stage1_steps: int = 25,
+    stage2_steps: int = 12,
 ) -> None:
     _ensure_on_path(mvsam3d_vendor_dir / "mvsam3d_scripts")
     from collect_mvsam3d_outputs import collect_mvsam3d_outputs
@@ -233,9 +235,21 @@ def stage3_mvsam3d(
 
     da3_output = mvsam3d_input_dir / "da3_output.npz"
     if len(classes) > 1:
-        run_multiobject_inference(input_path=mvsam3d_input_dir, mask_prompts=classes, da3_output_path=str(da3_output))
+        run_multiobject_inference(
+            input_path=mvsam3d_input_dir,
+            mask_prompts=classes,
+            da3_output_path=str(da3_output),
+            stage1_steps=stage1_steps,
+            stage2_steps=stage2_steps,
+        )
     else:
-        run_weighted_inference(input_path=mvsam3d_input_dir, mask_prompt=classes[0], da3_output_path=str(da3_output))
+        run_weighted_inference(
+            input_path=mvsam3d_input_dir,
+            mask_prompt=classes[0],
+            da3_output_path=str(da3_output),
+            stage1_steps=stage1_steps,
+            stage2_steps=stage2_steps,
+        )
 
     import torch
 

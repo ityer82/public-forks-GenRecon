@@ -58,6 +58,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Per-class mesh reconstruction (TRELLIS.2/MV-SAM3D). No-op without --classes.",
     )
     parser.add_argument("--mesh-backend", dest="mesh_backend", choices=["trellis2", "mvsam3d"], default="mvsam3d")
+    parser.add_argument("--mvsam3d-stage1-steps", dest="mvsam3d_stage1_steps", type=int, default=25,
+                        help="MV-SAM3D stage 1 (shape) inference steps. The upstream MV-SAM3D default is 50.")
+    parser.add_argument("--mvsam3d-stage2-steps", dest="mvsam3d_stage2_steps", type=int, default=12,
+                        help="MV-SAM3D stage 2 (texture) inference steps. The upstream MV-SAM3D default is 25.")
     parser.add_argument("--skip_isaac", dest="run_usd", action="store_false", default=True)
     parser.add_argument("--collision_approximation", default="convexDecomposition")
     parser.add_argument(
@@ -258,6 +262,8 @@ def main(argv: list[str] | None = None) -> None:
                             seg_log=seg_log,
                             log_mirror=log_mirror,
                             cobgs_mask_dir=cobgs_mask_dir,
+                            stage1_steps=args.mvsam3d_stage1_steps,
+                            stage2_steps=args.mvsam3d_stage2_steps,
                         )
             else:
                 logger.info(f"Stage 3: skipped (no --use-trellis, or --start-from-stage {args.start_from_stage})")
