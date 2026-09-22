@@ -106,12 +106,18 @@ def parse_images_txt(path: Path) -> List[dict]:
     """
     Parse COLMAP images.txt -> list of entries sorted by IMAGE_ID, each:
         {image_id, extrinsics (3,4) w2c, camera_id, name}
-    Each image occupies two lines; the second (2D points) line is skipped.
+    Each image occupies two lines; the second (2D points) line is skipped. That second line is
+    frequently blank in this repo's exports (no reprojected 2D-3D correspondences), so blank
+    lines are kept here (only comment lines are dropped) to preserve the 2-line pairing -- an
+    earlier version filtered blank lines before chunking by 2, which silently discarded every
+    other image whenever a points2D line was empty.
     """
-    lines = [l for l in path.read_text().splitlines() if l.strip() and not l.strip().startswith("#")]
+    lines = [l for l in path.read_text().splitlines() if not l.strip().startswith("#")]
 
     entries = []
     for i in range(0, len(lines), 2):
+        if not lines[i].strip():
+            continue
         parts = lines[i].split()
         image_id = int(parts[0])
         qw, qx, qy, qz = (float(p) for p in parts[1:5])

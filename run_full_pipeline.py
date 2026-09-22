@@ -47,6 +47,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--num_imgs_per_scene", type=int, default=32)
     parser.add_argument("--skip-frames", dest="skip_frames", type=int, default=-1)
     parser.add_argument(
+        "--max-frames", dest="max_frames", type=int, default=-1,
+        help="Only use the first N images (sorted by filename) from image_folder. Applied before "
+        "--skip-frames. -1 (default) uses all images.",
+    )
+    parser.add_argument(
         "--no-align-to-gravity", dest="align_to_gravity", action="store_false", default=True,
         help="Gravity alignment is ON by default; pass this to disable it.",
     )
@@ -221,6 +226,7 @@ def main(argv: list[str] | None = None) -> None:
                     VGGT_CHECKPOINT,
                     export_dir,
                     skip_frames=args.skip_frames,
+                    max_frames=args.max_frames,
                     align_to_gravity=args.align_to_gravity,
                     rotate_horizontal_deg=args.rotate_horizontal_deg,
                     conf_thres=args.vggt_conf_thres,

@@ -59,6 +59,7 @@ def stage0_vggt_export(
     export_dir: Path,
     *,
     skip_frames: int,
+    max_frames: int = -1,
     align_to_gravity: bool,
     rotate_horizontal_deg: float,
     conf_thres: float,
@@ -76,6 +77,7 @@ def stage0_vggt_export(
             model,
             image_resolution=512,
             skip_frames=skip_frames,
+            max_frames=max_frames,
         )
         predictions = apply_gravity_alignment(predictions, align_to_gravity, rotate_horizontal_deg)
         export_colmap_dataset(
