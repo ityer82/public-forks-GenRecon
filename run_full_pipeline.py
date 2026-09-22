@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import random
 import sys
 import time
 from pathlib import Path
@@ -57,6 +58,29 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--rotate-horizontal-deg", type=float, default=0.0)
     parser.add_argument("--classes", type=str, default=None)
+    parser.add_argument(
+        "--discover-classes", dest="discover_classes", action="store_true", default=False,
+        help="Instead of --classes, ask a local vision-LLM (--discovery-vlm-model) to propose "
+        "object-class labels from Stage 0's exported images. Mutually exclusive with --classes, "
+        "--pick_place_target, --place-target, and --ai-scene-agent.",
+    )
+    parser.add_argument(
+        "--discovery-vlm-model", dest="discovery_vlm_model", default="qwen2.5vl:7b",
+        help="Ollama vision-LLM model tag used by --discover-classes. Must be pulled separately "
+        "(`ollama pull qwen2.5vl:7b`).",
+    )
+    parser.add_argument(
+        "--discovery-num-images", dest="discovery_num_images", type=int, default=6,
+        help="Number of evenly-spaced frames from export_dir/images sent to --discovery-vlm-model "
+        "for --discover-classes.",
+    )
+    parser.add_argument(
+        "--random-pick-place", dest="random_pick_place", action="store_true", default=False,
+        help="Requires --discover-classes. Runs the pick-and-place fast path (Stage P1-P4) on a "
+        "random pair of the discovered classes, with no --ai-scene-agent and every pick-and-place "
+        "option (--place-offset, --place-target-clearance, --gripper-open-width, --approach-side) "
+        "left at its default.",
+    )
     parser.add_argument("--run_glb", action="store_true", default=False)
     parser.add_argument(
         "--use-trellis", dest="use_trellis", action=argparse.BooleanOptionalAction, default=True,
@@ -128,9 +152,22 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace, log
     if not args.image_folder.is_dir():
         parser.error(f"Image folder not found: {args.image_folder}")
 
+    if args.discover_classes:
+        if args.classes:
+            parser.error("--discover-classes and --classes are mutually exclusive.")
+        if args.pick_place_target:
+            parser.error("--discover-classes and --pick_place_target are mutually exclusive.")
+        if args.place_target:
+            parser.error("--discover-classes and --place-target are mutually exclusive.")
+        if args.ai_scene_agent:
+            parser.error("--discover-classes and --ai-scene-agent are mutually exclusive.")
+
+    if args.random_pick_place and not args.discover_classes:
+        parser.error("--random-pick-place requires --discover-classes.")
+
     classes = [c.strip() for c in args.classes.split(",")] if args.classes else []
 
-    if args.use_trellis and not classes:
+    if args.use_trellis and not classes and not args.discover_classes:
         logger.info(
             "Note: --classes not set, so per-class mesh reconstruction (enabled by default) "
             "does not apply to this run."
@@ -236,6 +273,28 @@ def main(argv: list[str] | None = None) -> None:
             logger.info(f"Stage 0: skipped (--start-from-stage {args.start_from_stage}), assuming existing export at {export_dir}")
         check_stop_after_stage(0)
 
+        if args.discover_classes:
+            with stage(f"Stage 0b: object-class discovery (model={args.discovery_vlm_model})"):
+                from genrecon.utils.object_discovery import discover_object_classes
+
+                classes = discover_object_classes(
+                    export_dir / "images",
+                    vlm_model=args.discovery_vlm_model,
+                    num_images=args.discovery_num_images,
+                    ollama_host=os.environ.get("OLLAMA_HOST"),
+                )
+                logger.info(f"Discovery: found {len(classes)} classes: {', '.join(classes)}")
+
+            if args.random_pick_place:
+                if len(classes) < 2:
+                    logger.error(f"--random-pick-place requires at least 2 discovered classes, got {classes}.")
+                    sys.exit(1)
+                args.pick_place_target, args.place_target = random.sample(classes, 2)
+                logger.info(
+                    f"Random pick-and-place: pick='{args.pick_place_target}', "
+                    f"place='{args.place_target}' (chosen from discovered classes {classes})"
+                )
+
         cobgs_mask_dir = output_dir / "segmentation_raw" / "masks" / "classes"
         seg_log = output_dir / "segmentation.log"
         image_to_3d_output_dir = run_dir / "image_to_3d_meshes"
@@ -243,7 +302,7 @@ def main(argv: list[str] | None = None) -> None:
         # ── Stage 1-3: segmentation + per-class 3D reconstruction (only if --classes) ──
         if classes:
             if args.start_from_stage <= 1:
-                with stage(f"Stage 1: segmentation (classes: {args.classes})"):
+                with stage(f"Stage 1: segmentation (classes: {classes})"):
                     cobgs_mask_dir = stages.stage1_segmentation(
                         args.scene_name,
                         export_dir,
