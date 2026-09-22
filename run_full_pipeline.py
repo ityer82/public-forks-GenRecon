@@ -62,6 +62,10 @@ def build_parser() -> argparse.ArgumentParser:
                         help="MV-SAM3D stage 1 (shape) inference steps. The upstream MV-SAM3D default is 50.")
     parser.add_argument("--mvsam3d-stage2-steps", dest="mvsam3d_stage2_steps", type=int, default=12,
                         help="MV-SAM3D stage 2 (texture) inference steps. The upstream MV-SAM3D default is 25.")
+    parser.add_argument("--mvsam3d-top-k-views", dest="mvsam3d_top_k_views", type=int, default=5,
+                        help="Prune to the k views that best cover each object angularly before "
+                             "MV-SAM3D's main diffusion pass. Pass 0 or a value >= the scene's "
+                             "view count to disable pruning (use every view with a mask).")
     parser.add_argument("--skip_isaac", dest="run_usd", action="store_false", default=True)
     parser.add_argument("--collision_approximation", default="convexDecomposition")
     parser.add_argument(
@@ -98,6 +102,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--approach-side", dest="approach_side", choices=["neg-x", "pos-x", "neg-y", "pos-y"], default="neg-y")
     parser.add_argument("--ai-scene-agent", dest="ai_scene_agent", action="store_true", default=False)
     parser.add_argument("--scene-agent-ollama-model", dest="scene_agent_ollama_model", default="qwen2.5:7b")
+    parser.add_argument(
+        "--room", dest="room", action="store_true", default=False,
+        help="Wrap the table in compose_isaac_scene.py's static kitchen room backdrop "
+        "(requires --table, which is on by default in compose_isaac_scene.py).",
+    )
+    parser.add_argument(
+        "--room-asset-dir", dest="room_asset_dir", type=Path, default=None,
+        help="Override compose_isaac_scene.py's --room-asset-dir (default: assets/room "
+        "relative to the IsaacSim script).",
+    )
     return parser
 
 
@@ -189,6 +203,12 @@ def main(argv: list[str] | None = None) -> None:
             logger.info(f"Stopping after stage {n} (--stop-after-stage {args.stop_after_stage}).")
             sys.exit(0)
 
+    compose_scene_extra_args: list[str] = []
+    if args.room:
+        compose_scene_extra_args.append("--room")
+        if args.room_asset_dir:
+            compose_scene_extra_args.extend(["--room-asset-dir", str(args.room_asset_dir)])
+
     pipeline_t0 = time.monotonic()
     logger.info(f"Pipeline started for scene '{args.scene_name}'")
 
@@ -264,6 +284,7 @@ def main(argv: list[str] | None = None) -> None:
                             cobgs_mask_dir=cobgs_mask_dir,
                             stage1_steps=args.mvsam3d_stage1_steps,
                             stage2_steps=args.mvsam3d_stage2_steps,
+                            top_k_views=args.mvsam3d_top_k_views,
                         )
             else:
                 logger.info(f"Stage 3: skipped (no --use-trellis, or --start-from-stage {args.start_from_stage})")
@@ -343,6 +364,7 @@ def main(argv: list[str] | None = None) -> None:
                     log_file=pick_place_dir / "compose_isaac_scene.log",
                     debug_config_log=debug_config_log,
                     log_mirror=log_mirror,
+                    extra_args=compose_scene_extra_args,
                 )
 
             # Sanitized here (space/slash -> underscore), not earlier: compose_isaac_scene.py always
@@ -475,6 +497,7 @@ def main(argv: list[str] | None = None) -> None:
                     stages.stage12_compose_isaac_scene(
                         shapes_dir, isaacsim_dir=ISAACSIM_DIR, output_dir=output_dir,
                         debug_config_log=debug_config_log, log_mirror=log_mirror,
+                        extra_args=compose_scene_extra_args,
                     )
             else:
                 logger.info(f"Stage 12: skipped (--start-from-stage {args.start_from_stage})")

@@ -56,6 +56,10 @@ _MV_SAM3D_DIR = Path(__file__).resolve().parent
 _NOTEBOOK_DIR = _MV_SAM3D_DIR / "notebook"
 sys.path.append(str(_NOTEBOOK_DIR))
 
+# For view_selection.py (angular-coverage view pruning), same rationale as above.
+_MVSAM3D_SCRIPTS_DIR = _MV_SAM3D_DIR / "mvsam3d_scripts"
+sys.path.append(str(_MVSAM3D_SCRIPTS_DIR))
+
 # Loaded via importlib under a private module name rather than `import inference`: genrecon's
 # own repo root has an unrelated top-level `inference` package (inference/get_chunks.py etc.,
 # see reconstruct_scene.py), and a bare `import inference` here would collide with it in
@@ -2223,6 +2227,9 @@ def run_multiobject_inference(
     pose_opt_mask_erosion: int = 3,
     pose_opt_device: str = "cuda",
     pose_opt_optimize_scale: bool = False,
+    # View pruning (angular coverage)
+    top_k_views: Optional[int] = None,
+    view_selection_pointcloud_dir: Optional[Path] = None,
 ):
     """
     Run multi-object inference: process each object sequentially, then merge.
@@ -2331,8 +2338,10 @@ def run_multiobject_inference(
                 pose_opt_mask_erosion=pose_opt_mask_erosion,
                 pose_opt_device=pose_opt_device,
                 pose_opt_optimize_scale=pose_opt_optimize_scale,
+                top_k_views=top_k_views,
+                view_selection_pointcloud_dir=view_selection_pointcloud_dir,
             )
-            
+
             if result:
                 obj_result = {
                     'object_name': mask_prompt,
@@ -2421,6 +2430,8 @@ def run_single_object_for_multiobject(
     pose_opt_mask_erosion: int = 3,
     pose_opt_device: str = "cuda",
     pose_opt_optimize_scale: bool = False,
+    top_k_views: Optional[int] = None,
+    view_selection_pointcloud_dir: Optional[Path] = None,
 ) -> Optional[dict]:
     """
     Wrapper for run_weighted_inference that returns GLB path and pose for multi-object merging.
@@ -2471,8 +2482,10 @@ def run_single_object_for_multiobject(
         pose_opt_mask_erosion=pose_opt_mask_erosion,
         pose_opt_device=pose_opt_device,
         pose_opt_optimize_scale=pose_opt_optimize_scale,
+        top_k_views=top_k_views,
+        view_selection_pointcloud_dir=view_selection_pointcloud_dir,
     )
-    
+
     # Copy result files to object_output_dir
     if result_dict and result_dict['glb_path']:
         try:
@@ -2573,6 +2586,9 @@ def run_weighted_inference(
     pose_opt_mask_erosion: int = 3,
     pose_opt_device: str = "cuda",
     pose_opt_optimize_scale: bool = False,
+    # View pruning (angular coverage)
+    top_k_views: Optional[int] = None,
+    view_selection_pointcloud_dir: Optional[Path] = None,
 ):
     """
     Run weighted inference with adaptive multi-view fusion.
@@ -2745,7 +2761,68 @@ def run_weighted_inference(
             da3_intrinsics = np.array(matched_da3_intrinsics)
         
         logger.info(f"  Successfully loaded and matched {len(view_pointmaps)} external pointmaps from DA3")
-    
+
+    # View pruning: select a subset of the loaded views that best covers the object
+    # angularly, before running the (expensive, per-view) main diffusion pass.
+    if top_k_views is not None and 0 < top_k_views < num_views:
+        if da3_extrinsics is None:
+            logger.warning(
+                f"[ViewSelection] top_k_views={top_k_views} requested but no DA3 extrinsics "
+                f"are available; skipping view pruning (need --da3_output for camera poses)."
+            )
+        else:
+            from view_selection import (
+                compute_object_centroid_from_pointcloud,
+                compute_object_centroid_from_pointmaps,
+                sanitize_label,
+                select_views_by_angular_coverage,
+            )
+
+            camera_poses = convert_da3_extrinsics_to_camera_poses(da3_extrinsics)
+
+            centroid = None
+            if view_selection_pointcloud_dir is not None and mask_prompt:
+                ply_path = (
+                    Path(view_selection_pointcloud_dir)
+                    / sanitize_label(mask_prompt)
+                    / "point_cloud"
+                    / f"{sanitize_label(mask_prompt)}.ply"
+                )
+                centroid = compute_object_centroid_from_pointcloud(ply_path)
+                if centroid is not None:
+                    logger.info(f"[ViewSelection] Using object centroid from point cloud: {ply_path}")
+
+            if centroid is None and view_pointmaps is not None:
+                centroid = compute_object_centroid_from_pointmaps(view_pointmaps, view_masks, camera_poses)
+                if centroid is not None:
+                    logger.info("[ViewSelection] Using object centroid estimated from masked DA3 pointmaps")
+
+            if centroid is None:
+                logger.warning(
+                    "[ViewSelection] Could not determine an object centroid (no point cloud and "
+                    "no usable pointmaps); skipping view pruning."
+                )
+            else:
+                camera_positions = [p["camera_position"] for p in camera_poses]
+                selected = select_views_by_angular_coverage(camera_positions, centroid, top_k_views)
+                dropped_names = [loaded_image_names[i] for i in range(num_views) if i not in selected]
+                kept_names = [loaded_image_names[i] for i in selected]
+                logger.info(
+                    f"[ViewSelection] Pruned {num_views} -> {len(selected)} views for '{mask_prompt}': "
+                    f"kept={kept_names}, dropped={dropped_names}"
+                )
+
+                view_images = [view_images[i] for i in selected]
+                view_masks = [view_masks[i] for i in selected]
+                loaded_image_names = [loaded_image_names[i] for i in selected]
+                if view_pointmaps is not None:
+                    view_pointmaps = [view_pointmaps[i] for i in selected]
+                if da3_extrinsics is not None:
+                    da3_extrinsics = da3_extrinsics[selected]
+                if da3_intrinsics is not None:
+                    da3_intrinsics = da3_intrinsics[selected]
+                num_views = len(selected)
+
     is_single_view = num_views == 1
     
     if is_single_view:
@@ -3984,7 +4061,16 @@ Examples:
                         help="Compute and visualize latent visibility per view (requires --da3_output)")
     parser.add_argument("--self_occlusion_tolerance", type=float, default=4.0,
                         help="Tolerance for self-occlusion detection in voxel units (default: 4.0)")
-    
+    parser.add_argument("--top_k_views", type=int, default=None,
+                        help="Prune to the k views that best cover the object angularly, before "
+                             "the main diffusion pass (requires --da3_output for camera poses). "
+                             "Default: no pruning, use every view with a mask.")
+    parser.add_argument("--view_selection_pointcloud_dir", type=str, default=None,
+                        help="Optional dir of per-object segmentation point clouds "
+                             "(<dir>/<label>/point_cloud/<label>.ply) used as the object centroid "
+                             "source for --top_k_views. Falls back to estimating the centroid from "
+                             "the masked DA3 pointmaps when not given or not found.")
+
     # ========================================
     # Pose Optimization Parameters
     # ========================================
@@ -4064,6 +4150,9 @@ Examples:
                 pose_opt_mask_erosion=args.pose_opt_mask_erosion,
                 pose_opt_device=args.pose_opt_device,
                 pose_opt_optimize_scale=args.pose_opt_optimize_scale,
+                # View pruning
+                top_k_views=args.top_k_views,
+                view_selection_pointcloud_dir=args.view_selection_pointcloud_dir,
             )
         else:
             # Single-object mode (original behavior)
@@ -4110,6 +4199,9 @@ Examples:
                 pose_opt_mask_erosion=args.pose_opt_mask_erosion,
                 pose_opt_device=args.pose_opt_device,
                 pose_opt_optimize_scale=args.pose_opt_optimize_scale,
+                # View pruning
+                top_k_views=args.top_k_views,
+                view_selection_pointcloud_dir=args.view_selection_pointcloud_dir,
             )
     except Exception as e:
         logger.error(f"Inference failed: {e}")

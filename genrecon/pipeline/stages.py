@@ -218,6 +218,7 @@ def stage3_mvsam3d(
     cobgs_mask_dir: Path | None = None,
     stage1_steps: int = 25,
     stage2_steps: int = 12,
+    top_k_views: int | None = 5,
 ) -> None:
     _ensure_on_path(mvsam3d_vendor_dir / "mvsam3d_scripts")
     from collect_mvsam3d_outputs import collect_mvsam3d_outputs
@@ -241,6 +242,8 @@ def stage3_mvsam3d(
             da3_output_path=str(da3_output),
             stage1_steps=stage1_steps,
             stage2_steps=stage2_steps,
+            top_k_views=top_k_views,
+            view_selection_pointcloud_dir=cobgs_mask_dir,
         )
     else:
         run_weighted_inference(
@@ -249,6 +252,8 @@ def stage3_mvsam3d(
             da3_output_path=str(da3_output),
             stage1_steps=stage1_steps,
             stage2_steps=stage2_steps,
+            top_k_views=top_k_views,
+            view_selection_pointcloud_dir=cobgs_mask_dir,
         )
 
     import torch
@@ -387,12 +392,13 @@ def stageP3_compose_isaac_scene(
     log_file: Path,
     debug_config_log: Path,
     log_mirror: LogMirror,
+    extra_args: list[str],
 ) -> None:
     run_external_step(
         "stageP3_compose_isaac_scene",
         isaacsim_dir / "compose_isaac_scene.py",
         isaacsim_dir,
-        ["--input", str(pick_place_glb_dir), "--output", str(scene_usda)],
+        ["--input", str(pick_place_glb_dir), "--output", str(scene_usda), *extra_args],
         log_file=log_file,
         debug_config_log=debug_config_log,
         log_mirror=log_mirror,
@@ -689,12 +695,13 @@ def stage12_compose_isaac_scene(
     output_dir: Path,
     debug_config_log: Path,
     log_mirror: LogMirror,
+    extra_args: list[str],
 ) -> None:
     run_external_step(
         "stage12_compose_isaac_scene",
         isaacsim_dir / "compose_isaac_scene.py",
         isaacsim_dir,
-        ["--input", str(shapes_dir / "glb"), "--output", str(shapes_dir / "glb" / "scene.usda"), "--background-label", "background"],
+        ["--input", str(shapes_dir / "glb"), "--output", str(shapes_dir / "glb" / "scene.usda"), "--background-label", "background", *extra_args],
         log_file=output_dir / "compose_isaac_scene.log",
         debug_config_log=debug_config_log,
         log_mirror=log_mirror,

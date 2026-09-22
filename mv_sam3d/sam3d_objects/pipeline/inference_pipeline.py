@@ -634,8 +634,12 @@ class InferencePipeline:
             f"Postprocessing mesh with option with_mesh_postprocess {with_mesh_postprocess}, with_texture_baking {with_texture_baking}..."
         )
         if "mesh" in outputs:
+            if "gaussian" not in outputs:
+                # Texture baking renders the gaussians; without them the GLB is geometry-only.
+                logger.warning("No gaussian decoded; disabling texture baking (untextured mesh).")
+                with_texture_baking = False
             glb = postprocessing_utils.to_glb(
-                outputs["gaussian"][0],
+                outputs["gaussian"][0] if "gaussian" in outputs else None,
                 outputs["mesh"][0],
                 # Optional parameters
                 simplify=0.95,  # Ratio of triangles to remove in the simplification process
