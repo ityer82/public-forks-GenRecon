@@ -17,6 +17,8 @@ import subprocess
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+# Local checkpoint copy of google/paligemma2-3b-pt-448 (moved out of the HF cache into the repo).
+DEFAULT_PALIGEMMA_CHECKPOINT = str(SCRIPT_DIR.parent / "checkpoints" / "paligemma" / "paligemma2-3b-pt-448")
 
 
 def run_stage(name, cmd, skip=False, skip_reason=None, read_from_drive=False):
@@ -70,6 +72,7 @@ def run_segmentation(
     detector_backend: str = "groundingdino",
     detection_vlm_model: str = "gemma4:31b",
     detection_ollama_host: str | None = None,
+    detection_hf_model: str = DEFAULT_PALIGEMMA_CHECKPOINT,
     detection_num_sample_frames: int = 8,
     detection_box_padding_frac: float = 0.05,
 ) -> None:
@@ -87,6 +90,7 @@ def run_segmentation(
     detector_flags = [
         "--detector_backend", detector_backend,
         "--detection_vlm_model", detection_vlm_model,
+        "--detection_hf_model", detection_hf_model,
         "--detection_num_sample_frames", str(detection_num_sample_frames),
         "--detection_box_padding_frac", str(detection_box_padding_frac),
     ] + (["--detection_ollama_host", detection_ollama_host] if detection_ollama_host else [])
@@ -181,14 +185,20 @@ def main():
                               "becomes exactly --output_root instead of --output_root/<scene>. "
                               "Useful when --output_root is already scene-specific (e.g. driven "
                               "by an external per-scene pipeline).")
-    parser.add_argument("--detector_backend", choices=["groundingdino", "gemma"], default="groundingdino",
+    parser.add_argument("--detector_backend", choices=["groundingdino", "gemma", "hf"], default="groundingdino",
                          help="Box-detection backend for Stage 1. 'gemma' uses a local "
                               "Ollama-served Gemma vision model instead of Grounding DINO -- "
-                              "see segmentation/gemma_detection_utils.py.")
+                              "see segmentation/gemma_detection_utils.py. 'hf' uses a "
+                              "locally-downloaded HF transformers PaliGemma checkpoint instead "
+                              "-- see segmentation/gemma_detection_utils_hf.py.")
     parser.add_argument("--detection_vlm_model", type=str, default="gemma4:31b",
                          help="Ollama model tag used when --detector_backend gemma.")
     parser.add_argument("--detection_ollama_host", type=str, default=None,
                          help="Ollama base URL override for --detector_backend gemma.")
+    parser.add_argument("--detection_hf_model", type=str, default=DEFAULT_PALIGEMMA_CHECKPOINT,
+                         help="HF PaliGemma model id, or a local checkpoint directory, used "
+                              "when --detector_backend hf. Defaults to the local copy at "
+                              "checkpoints/paligemma/paligemma2-3b-pt-448.")
     parser.add_argument("--detection_num_sample_frames", type=int, default=8,
                          help="--detector_backend gemma, --classes mode only: number of "
                               "evenly-spaced frames sent to Gemma for the initial scan.")
@@ -220,6 +230,7 @@ def main():
             detector_backend=args.detector_backend,
             detection_vlm_model=args.detection_vlm_model,
             detection_ollama_host=args.detection_ollama_host,
+            detection_hf_model=args.detection_hf_model,
             detection_num_sample_frames=args.detection_num_sample_frames,
             detection_box_padding_frac=args.detection_box_padding_frac,
         )

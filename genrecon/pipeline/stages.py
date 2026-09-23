@@ -135,6 +135,7 @@ def stage1_segmentation(
     detector_backend: str = "groundingdino",
     detection_vlm_model: str = "gemma4:31b",
     detection_ollama_host: str | None = None,
+    detection_hf_model: str = str(GENRECON_DIR / "checkpoints" / "paligemma" / "paligemma2-3b-pt-448"),
     detection_num_sample_frames: int = 8,
     detection_box_padding_frac: float = 0.05,
 ) -> Path:
@@ -158,6 +159,7 @@ def stage1_segmentation(
             detector_backend=detector_backend,
             detection_vlm_model=detection_vlm_model,
             detection_ollama_host=detection_ollama_host,
+            detection_hf_model=detection_hf_model,
             detection_num_sample_frames=detection_num_sample_frames,
             detection_box_padding_frac=detection_box_padding_frac,
         )

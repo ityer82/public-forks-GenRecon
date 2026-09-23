@@ -1,8 +1,14 @@
 """Single-shot vision-LLM call that proposes open-vocabulary object-class labels from a
 handful of Stage 0's exported representative images, for --discover-classes (an alternative
 to manually typing --classes). Unlike friction_agent/scene_agent, this call is image-grounded
-(HumanMessage content blocks with image_url data URIs) and has no LangGraph state machine --
-it's one prompt, one reply, one parse.
+and has no LangGraph state machine -- it's one prompt, one reply, one parse.
+
+Two backends share the same prompt/sampling/parsing code (see discover_object_classes):
+- "ollama" (default): a local Ollama daemon via langchain_ollama.ChatOllama.
+- "hf": a locally-downloaded HF transformers checkpoint (default: gemma-3-12b-it), run
+  in-process, no Ollama daemon required. See
+  https://ai.google.dev/gemma/docs/capabilities/vision/image for the image-text-to-text
+  pipeline() usage this follows.
 """
 import base64
 import json
@@ -79,7 +85,34 @@ def _drop_specificity_duplicates(labels: list[str]) -> list[str]:
     return [label for label in labels if label not in to_drop]
 
 
-def discover_object_classes(
+def _parse_and_postprocess(reply: str, model_label: str) -> list[str]:
+    """Shared reply-handling for both backends: parse the {"objects": [...]} JSON reply,
+    dedupe/normalize labels, and drop specificity duplicates. Raises RuntimeError on an
+    unparseable reply or zero usable labels."""
+    parsed = _parse_json_object(reply)
+    if parsed is None or not isinstance(parsed.get("objects"), list):
+        raise RuntimeError(
+            f"Object-class discovery: could not parse a JSON {{'objects': [...]}} reply from "
+            f"'{model_label}'. Raw reply:\n{reply}"
+        )
+
+    seen: set[str] = set()
+    labels: list[str] = []
+    for raw in parsed["objects"]:
+        if not isinstance(raw, str):
+            continue
+        label = raw.strip().lower()
+        if label and label not in seen:
+            seen.add(label)
+            labels.append(label)
+
+    if not labels:
+        raise RuntimeError(f"Object-class discovery: model '{model_label}' returned zero usable object labels.")
+
+    return _drop_specificity_duplicates(labels)
+
+
+def _discover_object_classes_ollama(
     export_images_dir: Path,
     vlm_model: str,
     num_images: int,
@@ -118,24 +151,81 @@ def discover_object_classes(
     except Exception as e:
         raise RuntimeError(f"Object-class discovery failed calling Ollama model '{vlm_model}': {e}") from e
 
-    parsed = _parse_json_object(reply)
-    if parsed is None or not isinstance(parsed.get("objects"), list):
-        raise RuntimeError(
-            f"Object-class discovery: could not parse a JSON {{'objects': [...]}} reply from "
-            f"'{vlm_model}'. Raw reply:\n{reply}"
-        )
+    return _parse_and_postprocess(reply, vlm_model)
 
-    seen: set[str] = set()
-    labels: list[str] = []
-    for raw in parsed["objects"]:
-        if not isinstance(raw, str):
-            continue
-        label = raw.strip().lower()
-        if label and label not in seen:
-            seen.add(label)
-            labels.append(label)
 
-    if not labels:
-        raise RuntimeError(f"Object-class discovery: model '{vlm_model}' returned zero usable object labels.")
+def _discover_object_classes_hf(
+    export_images_dir: Path,
+    model_id: str,
+    num_images: int,
+) -> list[str]:
+    """HF-transformers counterpart to _discover_object_classes_ollama: runs the same
+    DISCOVERY_PROMPT against the same evenly-spaced frames, but through a locally-downloaded
+    Gemma vision-language checkpoint (default: gemma-3-12b-it) instead of Ollama. Follows the
+    image-text-to-text `pipeline()` usage documented at
+    https://ai.google.dev/gemma/docs/capabilities/vision/image.
 
-    return _drop_specificity_duplicates(labels)
+    Runs in-process (gemma3 is natively supported by the project's pinned transformers version,
+    unlike gemma4, which needed an isolated transformers>=5 subprocess). Uses device=0 rather
+    than device_map="auto" so this doesn't require the accelerate package -- gemma-3-12b-it fits
+    on one GPU.
+    """
+    import torch
+    from PIL import Image
+    from transformers import GenerationConfig, pipeline
+
+    image_paths = sorted(export_images_dir.glob("*.jpg"))
+    if not image_paths:
+        raise RuntimeError(f"No .jpg images found in {export_images_dir} for class discovery.")
+
+    selected = _select_evenly_spaced(image_paths, num_images)
+    logger.info(f"Discovery: sampling {len(selected)}/{len(image_paths)} frames from {export_images_dir}")
+
+    content = [{"type": "image", "image": Image.open(p).convert("RGB")} for p in selected]
+    content.append({"type": "text", "text": DISCOVERY_PROMPT.format(n=len(selected))})
+    messages = [{"role": "user", "content": content}]
+
+    pipe = None
+    try:
+        device = 0 if torch.cuda.is_available() else -1
+        pipe = pipeline(task="image-text-to-text", model=model_id, device=device, dtype="auto")
+        config = GenerationConfig(do_sample=False, max_new_tokens=512)  # greedy, mirrors Ollama's temperature=0
+        output = pipe(messages, return_full_text=False, generate_kwargs={"generation_config": config})
+        reply = output[0]["generated_text"]
+    except Exception as e:
+        raise RuntimeError(f"Object-class discovery failed calling HF model '{model_id}': {e}") from e
+    finally:
+        # Free VRAM before Stage 1 (its own subprocess) needs it -- mirrors the Ollama path's
+        # keep_alive=0 unload; there's no daemon managing residency here.
+        del pipe
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    return _parse_and_postprocess(reply, model_id)
+
+
+def discover_object_classes(
+    export_images_dir: Path,
+    vlm_model: str,
+    num_images: int,
+    ollama_host: str | None = None,
+    backend: str = "ollama",
+    hf_model: str | None = None,
+) -> list[str]:
+    """Asks a vision-LLM to propose open-vocabulary object-class labels from `num_images`
+    evenly-spaced frames in `export_images_dir` (Stage 0's export_dir/images, always .jpg).
+    Returns a deduped, lowercase-normalized, whitespace-stripped list of labels.
+
+    backend="ollama" (default) calls a local Ollama daemon with model tag `vlm_model`
+    (unchanged legacy path). backend="hf" runs a locally-downloaded HF `hf_model` checkpoint
+    via transformers instead.
+
+    Raises RuntimeError if no images are found, the model is unreachable, the reply can't be
+    parsed, or zero labels are discovered -- discovery failing silently into an empty --classes
+    run is worse than a loud crash, since it would silently skip Stages 1-3.
+    """
+    if backend == "hf":
+        if not hf_model:
+            raise ValueError("discover_object_classes(backend='hf') requires hf_model to be set.")
+        return _discover_object_classes_hf(export_images_dir, hf_model, num_images)
+    return _discover_object_classes_ollama(export_images_dir, vlm_model, num_images, ollama_host=ollama_host)

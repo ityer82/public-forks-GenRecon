@@ -19,6 +19,9 @@ from detection_utils import detect_frame_boxes, match_detections_to_classes, det
 from gemma_detection_utils import (
     detect_frame_boxes_gemma, match_detections_to_classes_gemma, detect_classes_in_frames_gemma,
 )
+from gemma_detection_utils_hf import (
+    detect_frame_boxes_hf, detect_classes_in_frames_hf, PaliGemmaDetector,
+)
 
 from scene.colmap_loader import (
     read_extrinsics_binary, read_extrinsics_text,
@@ -28,6 +31,11 @@ from scene.colmap_loader import (
 from scene.frustum_utils import lift_box_to_frustum, reproject_frustum_area_fraction
 
 import argparse
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# Local checkpoint copy of google/paligemma2-3b-pt-448 (moved out of the HF cache into the repo
+# -- see checkpoints/paligemma/download_ckpts.sh-equivalent note in gemma_detection_utils_hf.py).
+DEFAULT_PALIGEMMA_CHECKPOINT = os.path.join(REPO_ROOT, "checkpoints", "paligemma", "paligemma2-3b-pt-448")
 
 # FIXME: figure how does this influence the G-DINO model
 torch.autocast(device_type="cuda", dtype=torch.float16).__enter__()
@@ -75,17 +83,25 @@ parser.add_argument('--reproj_area_threshold', type=float, default=0.02,
 parser.add_argument('--frustum_box_margin', type=float, default=0.0,
                      help="Pixel margin added around a detection box when sampling COLMAP "
                           "points to estimate its 3D frustum's depth extent.")
-parser.add_argument('--detector_backend', choices=['groundingdino', 'gemma'], default='groundingdino',
+parser.add_argument('--detector_backend', choices=['groundingdino', 'gemma', 'hf'], default='groundingdino',
                      help="Box-detection backend. 'groundingdino' (default) is unchanged "
                           "existing behavior. 'gemma' uses a local Ollama-served Gemma "
                           "vision model instead (see gemma_detection_utils.py) -- validated "
                           "with gemma4:31b; the smaller gemma4:12b tag is not recommended, "
-                          "see gemma_detection_utils.py's module docstring.")
+                          "see gemma_detection_utils.py's module docstring. 'hf' uses a "
+                          "locally-downloaded HF transformers PaliGemma checkpoint instead of "
+                          "Ollama (see gemma_detection_utils_hf.py) -- Gemma-3 chat models "
+                          "were tested and don't reliably ground boxes; PaliGemma does.")
 parser.add_argument('--detection_vlm_model', type=str, default='gemma4:31b',
                      help="Ollama model tag used when --detector_backend gemma.")
 parser.add_argument('--detection_ollama_host', type=str, default=None,
                      help="Ollama base URL override for --detector_backend gemma "
                           "(defaults to http://localhost:11434).")
+parser.add_argument('--detection_hf_model', type=str, default=DEFAULT_PALIGEMMA_CHECKPOINT,
+                     help="HF PaliGemma model id, or a local checkpoint directory, used when "
+                          "--detector_backend hf. Defaults to the local copy at "
+                          "checkpoints/paligemma/paligemma2-3b-pt-448; falls back to "
+                          "downloading a HF Hub repo id if pointed at one instead.")
 parser.add_argument('--detection_num_sample_frames', type=int, default=8,
                      help="--detector_backend gemma, --classes mode only: number of evenly-"
                           "spaced frames sent to Gemma for the initial multi-class scan, "
@@ -104,7 +120,6 @@ multi_class = args.classes is not None
 candidate_classes = [c.strip() for c in args.classes.split(',') if c.strip()] if args.classes is not None else []
 
 # init sam image predictor and video predictor model
-REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sam2_checkpoint = os.path.join(REPO_ROOT, "checkpoints", "sam2", "ckpts", "sam2_hiera_large.pt")
 model_cfg = "sam2_hiera_l.yaml"
 
@@ -112,8 +127,8 @@ video_predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint)
 sam2_image_model = build_sam2(model_cfg, sam2_checkpoint)
 image_predictor = SAM2ImagePredictor(sam2_image_model)
 
-# build grounding dino model (skipped for --detector_backend gemma, which needs no local
-# detection model -- it calls out to Ollama instead)
+# build grounding dino model (skipped for --detector_backend gemma/hf, which need no local
+# detection model here -- 'gemma' calls out to Ollama, 'hf' loads PaliGemma in-process below)
 device = "cuda" if torch.cuda.is_available() else "cpu"
 grounding_model = None
 if args.detector_backend == 'groundingdino':
@@ -122,6 +137,13 @@ if args.detector_backend == 'groundingdino':
         model_checkpoint_path=os.path.join(REPO_ROOT, "checkpoints", "groundingdino", "ckpts", "groundingdino_swinb_cogcoor.pth"),
         device=device
     )
+
+# --detector_backend hf: load the PaliGemma checkpoint once for the whole run (this script is
+# already its own subprocess -- see main_light.py -- so process exit frees its GPU memory, same
+# as grounding_model above; no persistent-worker/atexit machinery needed).
+hf_detector = None
+if args.detector_backend == 'hf':
+    hf_detector = PaliGemmaDetector(args.detection_hf_model)
 # setup the input image and text prompt for SAM 2 and Grounding DINO
 # VERY important: text queries need to be lowercased + end with a dot
 
@@ -200,6 +222,12 @@ if args.classes is not None:
             ollama_host=args.detection_ollama_host,
             box_padding_frac=args.detection_box_padding_frac,
         )
+    elif args.detector_backend == 'hf':
+        class_to_detections = detect_classes_in_frames_hf(
+            video_dir, frame_names, candidate_classes, hf_detector,
+            num_sample_frames=args.detection_num_sample_frames,
+            box_padding_frac=args.detection_box_padding_frac,
+        )
     else:
         class_to_detections = detect_classes_in_all_frames(
             video_dir, frame_names, grounding_model, candidate_classes, detect_caption,
@@ -234,6 +262,13 @@ else:
             args.detection_vlm_model, ollama_host=args.detection_ollama_host,
             box_padding_frac=args.detection_box_padding_frac,
         )
+    elif args.detector_backend == 'hf':
+        anchor_height, anchor_width, _ = image_source.shape
+        hf_candidate_classes = candidate_classes if multi_class else [text]
+        input_boxes, confidences, class_names = detect_frame_boxes_hf(
+            img_path, hf_candidate_classes, anchor_width, anchor_height, hf_detector,
+            box_padding_frac=args.detection_box_padding_frac,
+        )
     else:
         input_boxes, confidences, class_names = detect_frame_boxes(
             grounding_model, image_source, image, detect_caption,
@@ -249,7 +284,7 @@ else:
     confidences_arr = np.array(confidences)
 
     if multi_class:
-        if args.detector_backend == 'gemma':
+        if args.detector_backend in ('gemma', 'hf'):
             kept_indices, OBJECT_CLASSES = match_detections_to_classes_gemma(
                 class_names, candidate_classes)
         else:
@@ -535,6 +570,12 @@ while global_idx < len(frame_names):
                 args.detection_vlm_model, ollama_host=args.detection_ollama_host,
                 box_padding_frac=args.detection_box_padding_frac,
             )
+        elif args.detector_backend == 'hf':
+            redetect_height, redetect_width, _ = image_source.shape
+            input_boxes_det, confidences_det, class_names_det = detect_frame_boxes_hf(
+                img_path, missing_classes, redetect_width, redetect_height, hf_detector,
+                box_padding_frac=args.detection_box_padding_frac,
+            )
         else:
             input_boxes_det, confidences_det, class_names_det = detect_frame_boxes(
                 grounding_model, image_source, image, detect_caption,
@@ -551,7 +592,7 @@ while global_idx < len(frame_names):
         # whatever boxes come back in the detector's incidental order),
         # restricted to the classes actually missing here, so a re-detect
         # can never rebind one class's object_id to another class's box.
-        if args.detector_backend == 'gemma':
+        if args.detector_backend in ('gemma', 'hf'):
             kept_indices, matched_classes = match_detections_to_classes_gemma(
                 class_names_det, missing_classes)
         else:

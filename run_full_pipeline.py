@@ -66,9 +66,25 @@ def build_parser() -> argparse.ArgumentParser:
         "--pick_place_target, --place-target, and --ai-scene-agent.",
     )
     parser.add_argument(
+        "--discovery-backend", dest="discovery_backend", choices=["ollama", "hf"], default="ollama",
+        help="--discover-classes backend. 'ollama' (default) talks to a local Ollama daemon "
+        "(--discovery-vlm-model). 'hf' runs a locally-downloaded HF transformers vision-LLM "
+        "checkpoint directly, in-process (--discovery-hf-model), no Ollama daemon required.",
+    )
+    parser.add_argument(
         "--discovery-vlm-model", dest="discovery_vlm_model", default="gemma4:31b",
-        help="Ollama vision-LLM model tag used by --discover-classes. Must be pulled separately "
-        "(`ollama pull gemma4:31b`).",
+        help="Ollama vision-LLM model tag used by --discover-classes with --discovery-backend "
+        "ollama. Must be pulled separately (`ollama pull gemma4:31b`).",
+    )
+    parser.add_argument(
+        "--discovery-hf-model", dest="discovery_hf_model",
+        default=str(GENRECON_DIR / "checkpoints" / "gemma" / "gemma-3-12b-it"),
+        help="HF model id, or a local checkpoint directory, used by --discover-classes with "
+        "--discovery-backend hf. Defaults to the local copy at "
+        "checkpoints/gemma/gemma-3-12b-it; falls back to downloading a HF Hub repo id if "
+        "pointed at one instead. Discovery is usually correct but can occasionally mislabel "
+        "an object (e.g. an apple as a 'tomato'); review --classes/discovered_classes.json "
+        "if label accuracy matters.",
     )
     parser.add_argument(
         "--discovery-num-images", dest="discovery_num_images", type=int, default=6,
@@ -76,11 +92,14 @@ def build_parser() -> argparse.ArgumentParser:
         "for --discover-classes.",
     )
     parser.add_argument(
-        "--detector-backend", dest="detector_backend", choices=["groundingdino", "gemma"],
+        "--detector-backend", dest="detector_backend", choices=["groundingdino", "gemma", "hf"],
         default="groundingdino",
         help="Stage 1 box-detection backend. 'groundingdino' (default) is unchanged existing "
         "behavior. 'gemma' uses a local Ollama-served Gemma vision model instead of Grounding "
-        "DINO -- validated with gemma4:31b, see segmentation/gemma_detection_utils.py.",
+        "DINO -- validated with gemma4:31b, see segmentation/gemma_detection_utils.py. 'hf' "
+        "uses a locally-downloaded HF transformers PaliGemma checkpoint instead of Ollama, see "
+        "segmentation/gemma_detection_utils_hf.py -- Gemma-3 chat models were tested for box "
+        "detection and don't reliably ground boxes to real objects; PaliGemma does.",
     )
     parser.add_argument(
         "--detection-vlm-model", dest="detection_vlm_model", default="gemma4:31b",
@@ -90,6 +109,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--detection-ollama-host", dest="detection_ollama_host", default=None,
         help="Ollama base URL override for --detector-backend gemma (defaults to "
         "http://localhost:11434).",
+    )
+    parser.add_argument(
+        "--detection-hf-model", dest="detection_hf_model",
+        default=str(GENRECON_DIR / "checkpoints" / "paligemma" / "paligemma2-3b-pt-448"),
+        help="HF PaliGemma model id, or a local checkpoint directory, used by "
+        "--detector-backend hf. Defaults to the local copy at "
+        "checkpoints/paligemma/paligemma2-3b-pt-448; falls back to downloading a HF Hub repo "
+        "id if pointed at one instead.",
     )
     parser.add_argument(
         "--detection-num-sample-frames", dest="detection_num_sample_frames", type=int, default=8,
@@ -322,7 +349,10 @@ def main(argv: list[str] | None = None) -> None:
                     f"cached classes from {discovered_classes_cache}: {', '.join(classes)}"
                 )
             else:
-                with stage(f"Stage 0b: object-class discovery (model={args.discovery_vlm_model})"):
+                discovery_model_label = (
+                    args.discovery_hf_model if args.discovery_backend == "hf" else args.discovery_vlm_model
+                )
+                with stage(f"Stage 0b: object-class discovery (backend={args.discovery_backend}, model={discovery_model_label})"):
                     from genrecon.utils.object_discovery import discover_object_classes
 
                     classes = discover_object_classes(
@@ -330,6 +360,8 @@ def main(argv: list[str] | None = None) -> None:
                         vlm_model=args.discovery_vlm_model,
                         num_images=args.discovery_num_images,
                         ollama_host=os.environ.get("OLLAMA_HOST"),
+                        backend=args.discovery_backend,
+                        hf_model=args.discovery_hf_model,
                     )
                     logger.info(f"Discovery: found {len(classes)} classes: {', '.join(classes)}")
                 discovered_classes_cache.write_text(json.dumps(classes, indent=2))
@@ -365,6 +397,7 @@ def main(argv: list[str] | None = None) -> None:
                         detector_backend=args.detector_backend,
                         detection_vlm_model=args.detection_vlm_model,
                         detection_ollama_host=args.detection_ollama_host,
+                        detection_hf_model=args.detection_hf_model,
                         detection_num_sample_frames=args.detection_num_sample_frames,
                         detection_box_padding_frac=args.detection_box_padding_frac,
                     )
