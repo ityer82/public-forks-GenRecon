@@ -18,6 +18,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import random
 import sys
@@ -65,14 +66,43 @@ def build_parser() -> argparse.ArgumentParser:
         "--pick_place_target, --place-target, and --ai-scene-agent.",
     )
     parser.add_argument(
-        "--discovery-vlm-model", dest="discovery_vlm_model", default="qwen2.5vl:7b",
+        "--discovery-vlm-model", dest="discovery_vlm_model", default="gemma4:31b",
         help="Ollama vision-LLM model tag used by --discover-classes. Must be pulled separately "
-        "(`ollama pull qwen2.5vl:7b`).",
+        "(`ollama pull gemma4:31b`).",
     )
     parser.add_argument(
         "--discovery-num-images", dest="discovery_num_images", type=int, default=6,
         help="Number of evenly-spaced frames from export_dir/images sent to --discovery-vlm-model "
         "for --discover-classes.",
+    )
+    parser.add_argument(
+        "--detector-backend", dest="detector_backend", choices=["groundingdino", "gemma"],
+        default="groundingdino",
+        help="Stage 1 box-detection backend. 'groundingdino' (default) is unchanged existing "
+        "behavior. 'gemma' uses a local Ollama-served Gemma vision model instead of Grounding "
+        "DINO -- validated with gemma4:31b, see segmentation/gemma_detection_utils.py.",
+    )
+    parser.add_argument(
+        "--detection-vlm-model", dest="detection_vlm_model", default="gemma4:31b",
+        help="Ollama model tag used by --detector-backend gemma. Must be pulled separately.",
+    )
+    parser.add_argument(
+        "--detection-ollama-host", dest="detection_ollama_host", default=None,
+        help="Ollama base URL override for --detector-backend gemma (defaults to "
+        "http://localhost:11434).",
+    )
+    parser.add_argument(
+        "--detection-num-sample-frames", dest="detection_num_sample_frames", type=int, default=8,
+        help="--detector-backend gemma, --classes mode only: number of evenly-spaced frames "
+        "sent to Gemma for the initial multi-class scan, instead of Grounding DINO's cheap "
+        "every-frame scan (a per-frame VLM call is not cheap enough to run on every frame).",
+    )
+    parser.add_argument(
+        "--detection-box-padding-frac", dest="detection_box_padding_frac", type=float, default=0.05,
+        help="--detector-backend gemma only: outward padding applied to each detected box "
+        "(as a fraction of its own width/height) before it's used to prompt SAM2. Mitigates "
+        "an undershoot failure mode found in testing where a box that doesn't fully enclose "
+        "its object makes SAM2 truncate the mask at the wrong edge.",
     )
     parser.add_argument(
         "--random-pick-place", dest="random_pick_place", action="store_true", default=False,
@@ -167,7 +197,7 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace, log
 
     classes = [c.strip() for c in args.classes.split(",")] if args.classes else []
 
-    if args.use_trellis and not classes and not args.discover_classes:
+    if args.use_trellis and not classes and not args.discover_classes and not args.ai_scene_agent:
         logger.info(
             "Note: --classes not set, so per-class mesh reconstruction (enabled by default) "
             "does not apply to this run."
@@ -201,8 +231,13 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace, log
             parser.error("--ai-scene-agent and --pick_place_target are mutually exclusive.")
         if args.robot_target:
             parser.error("--ai-scene-agent and --robot-target are mutually exclusive.")
-        if not classes:
-            parser.error("--ai-scene-agent requires --classes (the objects it asks the user about).")
+        if not classes and args.start_from_stage <= 3:
+            parser.error(
+                "--ai-scene-agent requires --classes when --start-from-stage <= 3 (Stage 1-3 "
+                "need an explicit class list to segment and mesh the objects it asks about); "
+                "pass --classes, or use --start-from-stage > 3 to discover classes from "
+                f"existing meshes under {GENRECON_DIR / 'runs' / args.scene_name / 'image_to_3d_meshes'}."
+            )
         if not args.use_trellis:
             logger.info("Note: --ai-scene-agent requires a per-object mesh for every --classes label; overriding --no-use-trellis to on for this run.")
             args.use_trellis = True
@@ -274,16 +309,30 @@ def main(argv: list[str] | None = None) -> None:
         check_stop_after_stage(0)
 
         if args.discover_classes:
-            with stage(f"Stage 0b: object-class discovery (model={args.discovery_vlm_model})"):
-                from genrecon.utils.object_discovery import discover_object_classes
-
-                classes = discover_object_classes(
-                    export_dir / "images",
-                    vlm_model=args.discovery_vlm_model,
-                    num_images=args.discovery_num_images,
-                    ollama_host=os.environ.get("OLLAMA_HOST"),
+            # Cached to run_dir so a --start-from-stage rerun that skips Stage 1 (segmentation)
+            # can't silently diverge from the class list Stage 1 actually segmented against --
+            # discovery is model-sampled (non-zero temperature) and can legitimately return
+            # different phrasing across calls on the same images, which would otherwise leave
+            # a later stage looking for masks under class names Stage 1 never produced.
+            discovered_classes_cache = run_dir / "discovered_classes.json"
+            if args.start_from_stage > 0 and discovered_classes_cache.exists():
+                classes = json.loads(discovered_classes_cache.read_text())
+                logger.info(
+                    f"Stage 0b: skipped (--start-from-stage {args.start_from_stage}), reusing "
+                    f"cached classes from {discovered_classes_cache}: {', '.join(classes)}"
                 )
-                logger.info(f"Discovery: found {len(classes)} classes: {', '.join(classes)}")
+            else:
+                with stage(f"Stage 0b: object-class discovery (model={args.discovery_vlm_model})"):
+                    from genrecon.utils.object_discovery import discover_object_classes
+
+                    classes = discover_object_classes(
+                        export_dir / "images",
+                        vlm_model=args.discovery_vlm_model,
+                        num_images=args.discovery_num_images,
+                        ollama_host=os.environ.get("OLLAMA_HOST"),
+                    )
+                    logger.info(f"Discovery: found {len(classes)} classes: {', '.join(classes)}")
+                discovered_classes_cache.write_text(json.dumps(classes, indent=2))
 
             if args.random_pick_place:
                 if len(classes) < 2:
@@ -313,6 +362,11 @@ def main(argv: list[str] | None = None) -> None:
                         skip_hull_consistency_check=args.skip_hull_consistency_check,
                         seg_log=seg_log,
                         log_mirror=log_mirror,
+                        detector_backend=args.detector_backend,
+                        detection_vlm_model=args.detection_vlm_model,
+                        detection_ollama_host=args.detection_ollama_host,
+                        detection_num_sample_frames=args.detection_num_sample_frames,
+                        detection_box_padding_frac=args.detection_box_padding_frac,
                     )
             else:
                 logger.info(f"Stage 1: skipped (--start-from-stage {args.start_from_stage}), assuming existing segmentation at {output_dir / 'segmentation_raw'}")
@@ -365,9 +419,36 @@ def main(argv: list[str] | None = None) -> None:
         scene_agent_extra_args: list[str] = []
 
         if args.ai_scene_agent:
+            if classes:
+                available_classes = stages.classes_with_meshes(classes, image_to_3d_output_dir)
+                missing = [c for c in classes if c not in available_classes]
+                if missing:
+                    logger.warning(
+                        f"Stage P0: {len(missing)} of {len(classes)} --classes label(s) have no "
+                        f"generated mesh under {image_to_3d_output_dir} and won't be offered to "
+                        f"the scene agent: {missing}"
+                    )
+            else:
+                available_classes = stages.discover_classes_from_mesh_dir(image_to_3d_output_dir)
+                logger.info(
+                    f"Stage P0: --classes not set; discovered {len(available_classes)} class(es) "
+                    f"from existing meshes under {image_to_3d_output_dir}: {available_classes}"
+                )
+                # No --classes was given, so this discovered list is the only one there is --
+                # propagate it to `classes` so Stage P1 (which aligns every label in `classes`,
+                # unfiltered) has something to align instead of silently processing nothing.
+                classes = available_classes
+            if len(available_classes) < 2:
+                source = f"--classes {args.classes}" if classes else f"meshes under {image_to_3d_output_dir}"
+                logger.error(
+                    f"--ai-scene-agent requires at least 2 classes with a generated mesh, got "
+                    f"{available_classes} (from {source})."
+                )
+                sys.exit(1)
+
             with stage(f"Stage P0: interactive scene agent (model={args.scene_agent_ollama_model})"):
                 result = stages.stageP0_scene_agent(
-                    classes,
+                    available_classes,
                     image_to_3d_output_dir,
                     run_dir / "pick_place" / "scene_spec.json",
                     ollama_model=args.scene_agent_ollama_model,

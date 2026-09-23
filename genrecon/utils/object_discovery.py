@@ -104,7 +104,11 @@ def discover_object_classes(
     for p in selected:
         content.append({"type": "image_url", "image_url": {"url": _encode_image_data_uri(p)}})
 
-    kwargs = {"model": vlm_model, "keep_alive": 0}
+    # temperature=0: discovery should be reproducible across repeated calls on the same
+    # images (a non-deterministic default previously let two runs against the same run_dir
+    # disagree on class names -- see run_full_pipeline.py's discovered_classes.json cache,
+    # which is the other half of that fix).
+    kwargs = {"model": vlm_model, "keep_alive": 0, "temperature": 0}
     if ollama_host:
         kwargs["base_url"] = ollama_host
     llm = ChatOllama(**kwargs)

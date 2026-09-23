@@ -132,6 +132,11 @@ def stage1_segmentation(
     skip_hull_consistency_check: bool,
     seg_log: Path,
     log_mirror: LogMirror,
+    detector_backend: str = "groundingdino",
+    detection_vlm_model: str = "gemma4:31b",
+    detection_ollama_host: str | None = None,
+    detection_num_sample_frames: int = 8,
+    detection_box_padding_frac: float = 0.05,
 ) -> Path:
     """Returns the COB-GS mask directory (output_root/masks/classes)."""
     _ensure_on_path(GENRECON_DIR / "segmentation")
@@ -150,6 +155,11 @@ def stage1_segmentation(
             depth_edge_rtol=depth_edge_rtol,
             skip_hull_consistency_check=skip_hull_consistency_check,
             flat_output=True,
+            detector_backend=detector_backend,
+            detection_vlm_model=detection_vlm_model,
+            detection_ollama_host=detection_ollama_host,
+            detection_num_sample_frames=detection_num_sample_frames,
+            detection_box_padding_frac=detection_box_padding_frac,
         )
     log_mirror.mirror(seg_log)
 
@@ -279,6 +289,23 @@ def stage3_mvsam3d(
 # ---------------------------------------------------------------------------
 # Stage P0: interactive scene agent (only with --ai-scene-agent)
 # ---------------------------------------------------------------------------
+
+
+def classes_with_meshes(classes: list[str], image_to_3d_output_dir: Path) -> list[str]:
+    """Subset of `classes` that actually have a generated mesh.glb under
+    image_to_3d_output_dir, keyed by the raw (unsanitized) label -- the same path
+    stageP1_align_meshes and scene_agent.py._describe_objects already read from."""
+    return [c for c in classes if (image_to_3d_output_dir / c / "mesh.glb").exists()]
+
+
+def discover_classes_from_mesh_dir(image_to_3d_output_dir: Path) -> list[str]:
+    """Classes list derived straight from existing meshes on disk -- used by --ai-scene-agent
+    runs started mid-pipeline (--start-from-stage > 3) without --classes, where there's no
+    --classes list to filter in the first place. Every subdirectory of image_to_3d_output_dir
+    containing a mesh.glb is treated as a class (raw, unsanitized label), sorted for determinism."""
+    if not image_to_3d_output_dir.is_dir():
+        return []
+    return sorted(p.name for p in image_to_3d_output_dir.iterdir() if p.is_dir() and (p / "mesh.glb").exists())
 
 
 def stageP0_scene_agent(

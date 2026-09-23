@@ -67,6 +67,11 @@ def run_segmentation(
     skip_hull_consistency_check: bool = False,
     read_from_drive: bool = False,
     flat_output: bool = False,
+    detector_backend: str = "groundingdino",
+    detection_vlm_model: str = "gemma4:31b",
+    detection_ollama_host: str | None = None,
+    detection_num_sample_frames: int = 8,
+    detection_box_padding_frac: float = 0.05,
 ) -> None:
     """Runs Stage 1 (2D mask extraction) and Stage 1.5 (point-cloud segmentation) for a scene.
     Dispatches to detect_and_segment.py/segment_pointcloud.py as real subprocesses (the actual
@@ -79,13 +84,20 @@ def run_segmentation(
     multi_class = classes is not None
     classes_flag = ["--classes", classes] if multi_class else []
 
+    detector_flags = [
+        "--detector_backend", detector_backend,
+        "--detection_vlm_model", detection_vlm_model,
+        "--detection_num_sample_frames", str(detection_num_sample_frames),
+        "--detection_box_padding_frac", str(detection_box_padding_frac),
+    ] + (["--detection_ollama_host", detection_ollama_host] if detection_ollama_host else [])
+
     if not skip_mask:
         run_stage(
             "Stage 1: Mask extraction",
             py + [str(SCRIPT_DIR / "detect_and_segment.py"),
                   "--dataset_root", dataset_root, "--output", output_root, "--scene", scene,
                   "--text", label, "--resolution", str(resolution), "--frame_idx", "0"] + classes_flag
-            + (["--flat_output"] if flat_output else []),
+            + (["--flat_output"] if flat_output else []) + detector_flags,
             skip=stage1_done(mask_dir, multi_class),
             skip_reason=mask_dir,
             read_from_drive=read_from_drive,
@@ -169,6 +181,20 @@ def main():
                               "becomes exactly --output_root instead of --output_root/<scene>. "
                               "Useful when --output_root is already scene-specific (e.g. driven "
                               "by an external per-scene pipeline).")
+    parser.add_argument("--detector_backend", choices=["groundingdino", "gemma"], default="groundingdino",
+                         help="Box-detection backend for Stage 1. 'gemma' uses a local "
+                              "Ollama-served Gemma vision model instead of Grounding DINO -- "
+                              "see segmentation/gemma_detection_utils.py.")
+    parser.add_argument("--detection_vlm_model", type=str, default="gemma4:31b",
+                         help="Ollama model tag used when --detector_backend gemma.")
+    parser.add_argument("--detection_ollama_host", type=str, default=None,
+                         help="Ollama base URL override for --detector_backend gemma.")
+    parser.add_argument("--detection_num_sample_frames", type=int, default=8,
+                         help="--detector_backend gemma, --classes mode only: number of "
+                              "evenly-spaced frames sent to Gemma for the initial scan.")
+    parser.add_argument("--detection_box_padding_frac", type=float, default=0.05,
+                         help="--detector_backend gemma only: outward box padding fraction "
+                              "applied before SAM2 prompting.")
     args = parser.parse_args()
 
     try:
@@ -191,6 +217,11 @@ def main():
             skip_hull_consistency_check=args.skip_hull_consistency_check,
             read_from_drive=args.read_from_drive,
             flat_output=args.flat_output,
+            detector_backend=args.detector_backend,
+            detection_vlm_model=args.detection_vlm_model,
+            detection_ollama_host=args.detection_ollama_host,
+            detection_num_sample_frames=args.detection_num_sample_frames,
+            detection_box_padding_frac=args.detection_box_padding_frac,
         )
     except ValueError as e:
         parser.error(str(e))

@@ -16,6 +16,9 @@ from track_utils import sample_points_from_masks
 from video_utils import create_video_from_images
 from groundingdino.util.inference import load_model, load_image
 from detection_utils import detect_frame_boxes, match_detections_to_classes, detect_classes_in_all_frames
+from gemma_detection_utils import (
+    detect_frame_boxes_gemma, match_detections_to_classes_gemma, detect_classes_in_frames_gemma,
+)
 
 from scene.colmap_loader import (
     read_extrinsics_binary, read_extrinsics_text,
@@ -72,6 +75,29 @@ parser.add_argument('--reproj_area_threshold', type=float, default=0.02,
 parser.add_argument('--frustum_box_margin', type=float, default=0.0,
                      help="Pixel margin added around a detection box when sampling COLMAP "
                           "points to estimate its 3D frustum's depth extent.")
+parser.add_argument('--detector_backend', choices=['groundingdino', 'gemma'], default='groundingdino',
+                     help="Box-detection backend. 'groundingdino' (default) is unchanged "
+                          "existing behavior. 'gemma' uses a local Ollama-served Gemma "
+                          "vision model instead (see gemma_detection_utils.py) -- validated "
+                          "with gemma4:31b; the smaller gemma4:12b tag is not recommended, "
+                          "see gemma_detection_utils.py's module docstring.")
+parser.add_argument('--detection_vlm_model', type=str, default='gemma4:31b',
+                     help="Ollama model tag used when --detector_backend gemma.")
+parser.add_argument('--detection_ollama_host', type=str, default=None,
+                     help="Ollama base URL override for --detector_backend gemma "
+                          "(defaults to http://localhost:11434).")
+parser.add_argument('--detection_num_sample_frames', type=int, default=8,
+                     help="--detector_backend gemma, --classes mode only: number of evenly-"
+                          "spaced frames sent to Gemma for the initial multi-class scan, "
+                          "instead of Grounding DINO's cheap every-frame scan (a per-frame "
+                          "VLM call is not cheap enough to run on every frame).")
+parser.add_argument('--detection_box_padding_frac', type=float, default=0.05,
+                     help="--detector_backend gemma only: outward padding applied to each "
+                          "detected box (as a fraction of its own width/height) before it's "
+                          "used to prompt SAM2. Mitigates the undershoot failure mode found "
+                          "in testing, where a box that doesn't fully enclose its object "
+                          "makes SAM2 truncate the mask at the wrong edge. Grounding DINO's "
+                          "boxes get no padding (different failure mode, not needed).")
 args = parser.parse_args()
 
 multi_class = args.classes is not None
@@ -86,13 +112,16 @@ video_predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint)
 sam2_image_model = build_sam2(model_cfg, sam2_checkpoint)
 image_predictor = SAM2ImagePredictor(sam2_image_model)
 
-# build grounding dino model
+# build grounding dino model (skipped for --detector_backend gemma, which needs no local
+# detection model -- it calls out to Ollama instead)
 device = "cuda" if torch.cuda.is_available() else "cpu"
-grounding_model = load_model(
-    model_config_path=os.path.join(REPO_ROOT, "checkpoints", "groundingdino", "GroundingDINO_SwinB_cfg.py"),
-    model_checkpoint_path=os.path.join(REPO_ROOT, "checkpoints", "groundingdino", "ckpts", "groundingdino_swinb_cogcoor.pth"),
-    device=device
-)
+grounding_model = None
+if args.detector_backend == 'groundingdino':
+    grounding_model = load_model(
+        model_config_path=os.path.join(REPO_ROOT, "checkpoints", "groundingdino", "GroundingDINO_SwinB_cfg.py"),
+        model_checkpoint_path=os.path.join(REPO_ROOT, "checkpoints", "groundingdino", "ckpts", "groundingdino_swinb_cogcoor.pth"),
+        device=device
+    )
 # setup the input image and text prompt for SAM 2 and Grounding DINO
 # VERY important: text queries need to be lowercased + end with a dot
 
@@ -164,9 +193,17 @@ if args.classes is not None:
     # class missing from frame 0 can still be found and seeded without
     # spreading one class's boxes across several frames (which would risk
     # duplicate detections/tracks for the same object).
-    class_to_detections = detect_classes_in_all_frames(
-        video_dir, frame_names, grounding_model, candidate_classes, detect_caption,
-    )
+    if args.detector_backend == 'gemma':
+        class_to_detections = detect_classes_in_frames_gemma(
+            video_dir, frame_names, candidate_classes, args.detection_vlm_model,
+            num_sample_frames=args.detection_num_sample_frames,
+            ollama_host=args.detection_ollama_host,
+            box_padding_frac=args.detection_box_padding_frac,
+        )
+    else:
+        class_to_detections = detect_classes_in_all_frames(
+            video_dir, frame_names, grounding_model, candidate_classes, detect_caption,
+        )
     OBJECT_CLASSES = []
     input_boxes = []
     object_frame_idxs = []
@@ -185,14 +222,23 @@ if args.classes is not None:
     labels = [f"{cls} {conf:.2f}" for cls, conf in zip(OBJECT_CLASSES, confidences)]
     OBJECTS = labels
 else:
-    # prompt grounding dino to get the box coordinates on the single anchor frame
+    # prompt the detector to get the box coordinates on the single anchor frame
     img_path = os.path.join(video_dir, frame_names[ann_frame_idx])
     image_source, image = load_image(img_path)
 
-    input_boxes, confidences, class_names = detect_frame_boxes(
-        grounding_model, image_source, image, detect_caption,
-        box_threshold=0.3, text_threshold=0.45, remove_combined=multi_class,
-    )
+    if args.detector_backend == 'gemma':
+        anchor_height, anchor_width, _ = image_source.shape
+        gemma_candidate_classes = candidate_classes if multi_class else [text]
+        input_boxes, confidences, class_names = detect_frame_boxes_gemma(
+            img_path, gemma_candidate_classes, anchor_width, anchor_height,
+            args.detection_vlm_model, ollama_host=args.detection_ollama_host,
+            box_padding_frac=args.detection_box_padding_frac,
+        )
+    else:
+        input_boxes, confidences, class_names = detect_frame_boxes(
+            grounding_model, image_source, image, detect_caption,
+            box_threshold=0.3, text_threshold=0.45, remove_combined=multi_class,
+        )
 
     labels = [
         f"{class_name} {confidence:.2f}"
@@ -203,8 +249,12 @@ else:
     confidences_arr = np.array(confidences)
 
     if multi_class:
-        kept_indices, OBJECT_CLASSES = match_detections_to_classes(
-            class_names, confidences, candidate_classes)
+        if args.detector_backend == 'gemma':
+            kept_indices, OBJECT_CLASSES = match_detections_to_classes_gemma(
+                class_names, candidate_classes)
+        else:
+            kept_indices, OBJECT_CLASSES = match_detections_to_classes(
+                class_names, confidences, candidate_classes)
         high_confidence_indices = kept_indices
         max_confidence = np.max(confidences_arr) if len(confidences_arr) else 0.0
     else:
@@ -478,23 +528,35 @@ while global_idx < len(frame_names):
         img_path = os.path.join(video_dir, frame_names[global_idx])
         print(f"empty mask for classes {missing_classes}: " + img_path)
         image_source, image = load_image(img_path)
-        input_boxes_det, confidences_det, class_names_det = detect_frame_boxes(
-            grounding_model, image_source, image, detect_caption,
-            box_threshold=0.5,
-            text_threshold=0.5,
-            remove_combined=multi_class,
-        )
+        if args.detector_backend == 'gemma':
+            redetect_height, redetect_width, _ = image_source.shape
+            input_boxes_det, confidences_det, class_names_det = detect_frame_boxes_gemma(
+                img_path, missing_classes, redetect_width, redetect_height,
+                args.detection_vlm_model, ollama_host=args.detection_ollama_host,
+                box_padding_frac=args.detection_box_padding_frac,
+            )
+        else:
+            input_boxes_det, confidences_det, class_names_det = detect_frame_boxes(
+                grounding_model, image_source, image, detect_caption,
+                box_threshold=0.5,
+                text_threshold=0.5,
+                remove_combined=multi_class,
+            )
         if len(input_boxes_det) == 0:
             global_idx += 1
             continue
 
         # Re-run the same phrase-to-class matching used for the initial
         # seed detections (instead of positionally zipping OBJECTS against
-        # whatever boxes come back in GroundingDINO's incidental order),
+        # whatever boxes come back in the detector's incidental order),
         # restricted to the classes actually missing here, so a re-detect
         # can never rebind one class's object_id to another class's box.
-        kept_indices, matched_classes = match_detections_to_classes(
-            class_names_det, confidences_det, missing_classes)
+        if args.detector_backend == 'gemma':
+            kept_indices, matched_classes = match_detections_to_classes_gemma(
+                class_names_det, missing_classes)
+        else:
+            kept_indices, matched_classes = match_detections_to_classes(
+                class_names_det, confidences_det, missing_classes)
         reseed_obj_ids = []
         reseed_boxes = []
         for kept_idx, matched_cls in zip(kept_indices, matched_classes):

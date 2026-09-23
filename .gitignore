@@ -209,3 +209,7 @@ __marimo__/
 # Results
 *.jpg
 /visualization
+
+# MV-SAM3D vendored source (mv_sam3d/): transient run output + checkpoint symlink
+/mv_sam3d/visualization
+/mv_sam3d/checkpoints
