@@ -313,6 +313,14 @@ def main(argv: list[str] | None = None) -> None:
         if args.room_asset_dir:
             compose_scene_extra_args.extend(["--room-asset-dir", str(args.room_asset_dir)])
 
+    # compose_isaac_scene.py's --table defaults to on (it was built for the pick-and-place demo,
+    # Stage P3 below, where a real table prop under the picked/placed objects is correct). The
+    # full-reconstruction path (Stage 12) already has its own reconstructed background/floor
+    # mesh spanning the whole scene, so the same small fixed-size table prop would get centered
+    # underneath that mesh's bounding box at floor height -- making the entire reconstructed
+    # scene appear perched on a tiny table. Suppress it there.
+    full_scene_compose_extra_args = compose_scene_extra_args + ["--no-table"]
+
     pipeline_t0 = time.monotonic()
     logger.info(f"Pipeline started for scene '{args.scene_name}'")
 
@@ -676,7 +684,7 @@ def main(argv: list[str] | None = None) -> None:
                     stages.stage12_compose_isaac_scene(
                         shapes_dir, isaacsim_dir=ISAACSIM_DIR, output_dir=output_dir,
                         debug_config_log=debug_config_log, log_mirror=log_mirror,
-                        extra_args=compose_scene_extra_args,
+                        extra_args=full_scene_compose_extra_args,
                     )
             else:
                 logger.info(f"Stage 12: skipped (--start-from-stage {args.start_from_stage})")
