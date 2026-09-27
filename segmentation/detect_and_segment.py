@@ -16,11 +16,9 @@ from track_utils import sample_points_from_masks
 from video_utils import create_video_from_images
 from groundingdino.util.inference import load_model, load_image
 from detection_utils import detect_frame_boxes, match_detections_to_classes, detect_classes_in_all_frames
-from gemma_detection_utils import (
-    detect_frame_boxes_gemma, match_detections_to_classes_gemma, detect_classes_in_frames_gemma,
-)
 from gemma_detection_utils_hf import (
-    detect_frame_boxes_hf, detect_classes_in_frames_hf, PaliGemmaDetector,
+    detect_frame_boxes_hf, detect_classes_in_frames_hf, match_detections_to_classes_hf,
+    PaliGemmaDetector, pad_box_xyxy,
 )
 
 from scene.colmap_loader import (
@@ -83,32 +81,23 @@ parser.add_argument('--reproj_area_threshold', type=float, default=0.02,
 parser.add_argument('--frustum_box_margin', type=float, default=0.0,
                      help="Pixel margin added around a detection box when sampling COLMAP "
                           "points to estimate its 3D frustum's depth extent.")
-parser.add_argument('--detector_backend', choices=['groundingdino', 'gemma', 'hf'], default='groundingdino',
+parser.add_argument('--detector_backend', choices=['groundingdino', 'hf'], default='groundingdino',
                      help="Box-detection backend. 'groundingdino' (default) is unchanged "
-                          "existing behavior. 'gemma' uses a local Ollama-served Gemma "
-                          "vision model instead (see gemma_detection_utils.py) -- validated "
-                          "with gemma4:31b; the smaller gemma4:12b tag is not recommended, "
-                          "see gemma_detection_utils.py's module docstring. 'hf' uses a "
-                          "locally-downloaded HF transformers PaliGemma checkpoint instead of "
-                          "Ollama (see gemma_detection_utils_hf.py) -- Gemma-3 chat models "
-                          "were tested and don't reliably ground boxes; PaliGemma does.")
-parser.add_argument('--detection_vlm_model', type=str, default='gemma4:31b',
-                     help="Ollama model tag used when --detector_backend gemma.")
-parser.add_argument('--detection_ollama_host', type=str, default=None,
-                     help="Ollama base URL override for --detector_backend gemma "
-                          "(defaults to http://localhost:11434).")
+                          "existing behavior. 'hf' uses a locally-downloaded HF "
+                          "transformers PaliGemma checkpoint instead (see "
+                          "gemma_detection_utils_hf.py) -- Gemma-3 chat models were tested "
+                          "and don't reliably ground boxes; PaliGemma does.")
 parser.add_argument('--detection_hf_model', type=str, default=DEFAULT_PALIGEMMA_CHECKPOINT,
                      help="HF PaliGemma model id, or a local checkpoint directory, used when "
                           "--detector_backend hf. Defaults to the local copy at "
                           "checkpoints/paligemma/paligemma2-3b-pt-448; falls back to "
                           "downloading a HF Hub repo id if pointed at one instead.")
-parser.add_argument('--detection_num_sample_frames', type=int, default=8,
-                     help="--detector_backend gemma, --classes mode only: number of evenly-"
-                          "spaced frames sent to Gemma for the initial multi-class scan, "
-                          "instead of Grounding DINO's cheap every-frame scan (a per-frame "
-                          "VLM call is not cheap enough to run on every frame).")
+parser.add_argument('--boxes_json', type=str, default=None,
+                     help="JSON from Stage 0b discovery ({'left_image': name, 'objects': {label: "
+                          "{'left_box': [x1,y1,x2,y2], ...}}}, pixel coords). With --classes, the "
+                          "class boxes are taken from here instead of running a detector.")
 parser.add_argument('--detection_box_padding_frac', type=float, default=0.05,
-                     help="--detector_backend gemma only: outward padding applied to each "
+                     help="--detector_backend hf only: outward padding applied to each "
                           "detected box (as a fraction of its own width/height) before it's "
                           "used to prompt SAM2. Mitigates the undershoot failure mode found "
                           "in testing, where a box that doesn't fully enclose its object "
@@ -127,8 +116,8 @@ video_predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint)
 sam2_image_model = build_sam2(model_cfg, sam2_checkpoint)
 image_predictor = SAM2ImagePredictor(sam2_image_model)
 
-# build grounding dino model (skipped for --detector_backend gemma/hf, which need no local
-# detection model here -- 'gemma' calls out to Ollama, 'hf' loads PaliGemma in-process below)
+# build grounding dino model (skipped for --detector_backend hf, which loads PaliGemma
+# in-process below)
 device = "cuda" if torch.cuda.is_available() else "cpu"
 grounding_model = None
 if args.detector_backend == 'groundingdino':
@@ -142,7 +131,7 @@ if args.detector_backend == 'groundingdino':
 # already its own subprocess -- see main_light.py -- so process exit frees its GPU memory, same
 # as grounding_model above; no persistent-worker/atexit machinery needed).
 hf_detector = None
-if args.detector_backend == 'hf':
+if args.detector_backend == 'hf' and args.boxes_json is None:
     hf_detector = PaliGemmaDetector(args.detection_hf_model)
 # setup the input image and text prompt for SAM 2 and Grounding DINO
 # VERY important: text queries need to be lowercased + end with a dot
@@ -215,17 +204,22 @@ if args.classes is not None:
     # class missing from frame 0 can still be found and seeded without
     # spreading one class's boxes across several frames (which would risk
     # duplicate detections/tracks for the same object).
-    if args.detector_backend == 'gemma':
-        class_to_detections = detect_classes_in_frames_gemma(
-            video_dir, frame_names, candidate_classes, args.detection_vlm_model,
-            num_sample_frames=args.detection_num_sample_frames,
-            ollama_host=args.detection_ollama_host,
-            box_padding_frac=args.detection_box_padding_frac,
-        )
+    if args.boxes_json is not None:
+        with open(args.boxes_json) as f:
+            boxes_spec = json.load(f)
+        left_idx = frame_names.index(boxes_spec["left_image"])
+        with Image.open(os.path.join(video_dir, frame_names[left_idx])) as im:
+            box_w, box_h = im.size
+        class_to_detections = {}
+        for cls in candidate_classes:
+            obj = boxes_spec["objects"].get(cls)
+            if obj is None:
+                raise SystemExit(f"[error] class '{cls}' has no box in {args.boxes_json}")
+            box = pad_box_xyxy(obj["left_box"], box_w, box_h, args.detection_box_padding_frac)
+            class_to_detections[cls] = {"frame_idx": left_idx, "boxes": [box], "confidences": [1.0]}
     elif args.detector_backend == 'hf':
         class_to_detections = detect_classes_in_frames_hf(
             video_dir, frame_names, candidate_classes, hf_detector,
-            num_sample_frames=args.detection_num_sample_frames,
             box_padding_frac=args.detection_box_padding_frac,
         )
     else:
@@ -254,15 +248,7 @@ else:
     img_path = os.path.join(video_dir, frame_names[ann_frame_idx])
     image_source, image = load_image(img_path)
 
-    if args.detector_backend == 'gemma':
-        anchor_height, anchor_width, _ = image_source.shape
-        gemma_candidate_classes = candidate_classes if multi_class else [text]
-        input_boxes, confidences, class_names = detect_frame_boxes_gemma(
-            img_path, gemma_candidate_classes, anchor_width, anchor_height,
-            args.detection_vlm_model, ollama_host=args.detection_ollama_host,
-            box_padding_frac=args.detection_box_padding_frac,
-        )
-    elif args.detector_backend == 'hf':
+    if args.detector_backend == 'hf':
         anchor_height, anchor_width, _ = image_source.shape
         hf_candidate_classes = candidate_classes if multi_class else [text]
         input_boxes, confidences, class_names = detect_frame_boxes_hf(
@@ -284,8 +270,8 @@ else:
     confidences_arr = np.array(confidences)
 
     if multi_class:
-        if args.detector_backend in ('gemma', 'hf'):
-            kept_indices, OBJECT_CLASSES = match_detections_to_classes_gemma(
+        if args.detector_backend == 'hf':
+            kept_indices, OBJECT_CLASSES = match_detections_to_classes_hf(
                 class_names, candidate_classes)
         else:
             kept_indices, OBJECT_CLASSES = match_detections_to_classes(
@@ -563,14 +549,7 @@ while global_idx < len(frame_names):
         img_path = os.path.join(video_dir, frame_names[global_idx])
         print(f"empty mask for classes {missing_classes}: " + img_path)
         image_source, image = load_image(img_path)
-        if args.detector_backend == 'gemma':
-            redetect_height, redetect_width, _ = image_source.shape
-            input_boxes_det, confidences_det, class_names_det = detect_frame_boxes_gemma(
-                img_path, missing_classes, redetect_width, redetect_height,
-                args.detection_vlm_model, ollama_host=args.detection_ollama_host,
-                box_padding_frac=args.detection_box_padding_frac,
-            )
-        elif args.detector_backend == 'hf':
+        if args.detector_backend == 'hf':
             redetect_height, redetect_width, _ = image_source.shape
             input_boxes_det, confidences_det, class_names_det = detect_frame_boxes_hf(
                 img_path, missing_classes, redetect_width, redetect_height, hf_detector,
@@ -592,8 +571,8 @@ while global_idx < len(frame_names):
         # whatever boxes come back in the detector's incidental order),
         # restricted to the classes actually missing here, so a re-detect
         # can never rebind one class's object_id to another class's box.
-        if args.detector_backend in ('gemma', 'hf'):
-            kept_indices, matched_classes = match_detections_to_classes_gemma(
+        if args.detector_backend == 'hf':
+            kept_indices, matched_classes = match_detections_to_classes_hf(
                 class_names_det, missing_classes)
         else:
             kept_indices, matched_classes = match_detections_to_classes(

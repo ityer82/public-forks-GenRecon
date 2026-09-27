@@ -262,6 +262,7 @@ def run_reconstruct_scene(
     max_inflated_voxels: int | None = None,
     exclude_masks_root: Path | None = None,
     unmasked_path: Path | None = None,
+    sampler_steps_scale: float | None = 0.5,
 ) -> None:
     """Iphone-mode-only entry point for reconstruct_scene.py's pipeline, callable directly with
     typed kwargs instead of going through argparse -- this is the only mode
@@ -315,6 +316,7 @@ def run_reconstruct_scene(
         "exclude_masks_root": str(exclude_masks_root) if exclude_masks_root is not None else None,
         "max_inflated_voxels": max_inflated_voxels,
         "unmasked_path": str(unmasked_path) if unmasked_path is not None else None,
+        "sampler_steps_scale": sampler_steps_scale,
     }
     with (out_path / "args.json").open("w", encoding="utf-8") as f:
         json.dump(args_dict, f, indent=2, sort_keys=True)
@@ -334,6 +336,14 @@ def run_reconstruct_scene(
             pipeline_obj.max_chunks_per_group_override = max_chunks_per_group
         if max_inflated_voxels is not None:
             pipeline_obj.max_inflated_voxels_override = max_inflated_voxels
+        if sampler_steps_scale is not None:
+            for params_attr in (
+                "sparse_structure_sampler_params",
+                "shape_slat_sampler_params",
+                "tex_slat_sampler_params",
+            ):
+                params = getattr(pipeline_obj, params_attr)
+                params["steps"] = max(1, round(params["steps"] * sampler_steps_scale))
         pipeline_obj.to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
 
         chunker_cls, selecter_cls, _default_transforms_json = MODES["Iphone"]
@@ -656,6 +666,15 @@ def build_parser() -> argparse.ArgumentParser:
         "--object_mesh_ply to crop real per-object meshes from. Roughly doubles "
         "Stage 5 GPU cost when set. mode=Iphone only.",
     )
+    parser.add_argument(
+        "--sampler_steps_scale",
+        type=float,
+        default=0.5,
+        help="Multiplies the sparse_structure/shape_slat/tex_slat sampler "
+        "step counts from --pipeline_config (default: halve them, trading "
+        "reconstruction quality for speed). Set to 1.0 to use the config's "
+        "step counts unmodified.",
+    )
     return parser
 
 
@@ -697,6 +716,14 @@ def main() -> None:
         pipeline.max_chunks_per_group_override = args.max_chunks_per_group
     if args.max_inflated_voxels is not None:
         pipeline.max_inflated_voxels_override = args.max_inflated_voxels
+    if args.sampler_steps_scale is not None:
+        for params_attr in (
+            "sparse_structure_sampler_params",
+            "shape_slat_sampler_params",
+            "tex_slat_sampler_params",
+        ):
+            params = getattr(pipeline, params_attr)
+            params["steps"] = max(1, round(params["steps"] * args.sampler_steps_scale))
     pipeline.to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
 
     chunker_cls, selecter_cls, transforms_json = MODES[args.mode]

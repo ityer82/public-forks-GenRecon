@@ -4,15 +4,14 @@ segmentation] -> GenRecon reconstruction -> GLB bake.
 
 Python port of run_full_pipeline.sh: same CLI surface, but every non-Isaac, non-TRELLIS.2 stage
 runs in-process as a typed Python function call instead of a subprocess with a hand-built argv
-string (see genrecon/pipeline/stages.py). Isaac Sim (../IsaacSim) and TRELLIS.2 (../trellis2,
-only reachable via --mesh-backend trellis2) remain subprocesses, since both still run in their
-own separate uv env.
+string (see genrecon/pipeline/stages.py). Isaac Sim (../IsaacSim) remains a subprocess, since it
+still runs in its own separate uv env.
 
 Usage:
     uv run python run_full_pipeline.py <image_folder> <scene_name> [options...]
 
 Example:
-    uv run python run_full_pipeline.py /path/to/images food2_vggt --classes "banana,bowl" \\
+    uv run python run_full_pipeline.py /path/to/images food2_vggt --classes "banana,bowl" --mode pick-and-place \\
         --pick_place_target banana --place-target bowl
 """
 from __future__ import annotations
@@ -26,10 +25,18 @@ import time
 from pathlib import Path
 
 GENRECON_DIR = Path(__file__).resolve().parent
-TRELLIS2_DIR = GENRECON_DIR.parent / "trellis2"
 ISAACSIM_DIR = GENRECON_DIR.parent / "IsaacSim"
 MVSAM3D_VENDOR_DIR = GENRECON_DIR / "mv_sam3d"
 VGGT_CHECKPOINT = GENRECON_DIR / "checkpoints" / "vggt_omega" / "ckpts" / "vggt_omega_1b_512.pt"
+COLLISION_APPROXIMATION = "convexDecomposition"
+RUN_GLB = False
+SIMPLIFY_THRESHOLD = 250_000
+TEXTURE_SIZE = 2048
+USE_TRELLIS = True
+MODES = ("pick-and-place", "full-scene", "full-scene-with-robot")
+FULL_SCENE_MODES = ("full-scene", "full-scene-with-robot")
+DISCOVERY_HF_MODEL = "Qwen/Qwen3-VL-8B-Instruct"  # one-shot object labels + boxes (Stage 0b)
+DETECTION_HF_MODEL = str(GENRECON_DIR / "checkpoints" / "paligemma" / "paligemma2-3b-pt-448")
 
 
 def _place_offset(s: str) -> tuple[float, float, float]:
@@ -44,8 +51,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("image_folder", type=Path)
     parser.add_argument("scene_name", type=str)
 
-    parser.add_argument("--simplify_threshold", type=int, default=250_000)
-    parser.add_argument("--texture_size", type=int, default=2048)
     parser.add_argument("--num_imgs_per_scene", type=int, default=32)
     parser.add_argument("--skip-frames", dest="skip_frames", type=int, default=-1)
     parser.add_argument(
@@ -53,97 +58,33 @@ def build_parser() -> argparse.ArgumentParser:
         help="Only use the first N images (sorted by filename) from image_folder. Applied before "
         "--skip-frames. -1 (default) uses all images.",
     )
-    parser.add_argument(
-        "--no-align-to-gravity", dest="align_to_gravity", action="store_false", default=True,
-        help="Gravity alignment is ON by default; pass this to disable it.",
-    )
     parser.add_argument("--rotate-horizontal-deg", type=float, default=0.0)
     parser.add_argument("--classes", type=str, default=None)
     parser.add_argument(
-        "--discover-classes", dest="discover_classes", action="store_true", default=False,
-        help="Instead of --classes, ask a local vision-LLM (--discovery-vlm-model) to propose "
-        "object-class labels from Stage 0's exported images. Mutually exclusive with --classes, "
-        "--pick_place_target, --place-target, and --ai-scene-agent.",
+        "--discover-classes", dest="discover_classes", action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Instead of --classes, ask a local vision-LLM (DISCOVERY_HF_MODEL, Qwen3-VL) to "
+        "propose object labels and left/right bounding boxes from Stage 0's exported stereo pair. pick-and-place mode only: ON by "
+        "default unless --classes, --pick_place_target, or --place-target is given (pass "
+        "--no-discover-classes to disable it explicitly). Explicitly passing --discover-classes "
+        "together with any of those, or in a full-scene mode, is an error. Compatible with "
+        "--ai-scene-agent, which then chooses among the discovered classes.",
     )
     parser.add_argument(
-        "--discovery-backend", dest="discovery_backend", choices=["ollama", "hf"], default="ollama",
-        help="--discover-classes backend. 'ollama' (default) talks to a local Ollama daemon "
-        "(--discovery-vlm-model). 'hf' runs a locally-downloaded HF transformers vision-LLM "
-        "checkpoint directly, in-process (--discovery-hf-model), no Ollama daemon required.",
-    )
-    parser.add_argument(
-        "--discovery-vlm-model", dest="discovery_vlm_model", default="gemma4:31b",
-        help="Ollama vision-LLM model tag used by --discover-classes with --discovery-backend "
-        "ollama. Must be pulled separately (`ollama pull gemma4:31b`).",
-    )
-    parser.add_argument(
-        "--discovery-hf-model", dest="discovery_hf_model",
-        default=str(GENRECON_DIR / "checkpoints" / "gemma" / "gemma-3-12b-it"),
-        help="HF model id, or a local checkpoint directory, used by --discover-classes with "
-        "--discovery-backend hf. Defaults to the local copy at "
-        "checkpoints/gemma/gemma-3-12b-it; falls back to downloading a HF Hub repo id if "
-        "pointed at one instead. Discovery is usually correct but can occasionally mislabel "
-        "an object (e.g. an apple as a 'tomato'); review --classes/discovered_classes.json "
-        "if label accuracy matters.",
-    )
-    parser.add_argument(
-        "--discovery-num-images", dest="discovery_num_images", type=int, default=6,
-        help="Number of evenly-spaced frames from export_dir/images sent to --discovery-vlm-model "
-        "for --discover-classes.",
-    )
-    parser.add_argument(
-        "--detector-backend", dest="detector_backend", choices=["groundingdino", "gemma", "hf"],
-        default="groundingdino",
-        help="Stage 1 box-detection backend. 'groundingdino' (default) is unchanged existing "
-        "behavior. 'gemma' uses a local Ollama-served Gemma vision model instead of Grounding "
-        "DINO -- validated with gemma4:31b, see segmentation/gemma_detection_utils.py. 'hf' "
-        "uses a locally-downloaded HF transformers PaliGemma checkpoint instead of Ollama, see "
-        "segmentation/gemma_detection_utils_hf.py -- Gemma-3 chat models were tested for box "
-        "detection and don't reliably ground boxes to real objects; PaliGemma does.",
-    )
-    parser.add_argument(
-        "--detection-vlm-model", dest="detection_vlm_model", default="gemma4:31b",
-        help="Ollama model tag used by --detector-backend gemma. Must be pulled separately.",
-    )
-    parser.add_argument(
-        "--detection-ollama-host", dest="detection_ollama_host", default=None,
-        help="Ollama base URL override for --detector-backend gemma (defaults to "
-        "http://localhost:11434).",
-    )
-    parser.add_argument(
-        "--detection-hf-model", dest="detection_hf_model",
-        default=str(GENRECON_DIR / "checkpoints" / "paligemma" / "paligemma2-3b-pt-448"),
-        help="HF PaliGemma model id, or a local checkpoint directory, used by "
-        "--detector-backend hf. Defaults to the local copy at "
-        "checkpoints/paligemma/paligemma2-3b-pt-448; falls back to downloading a HF Hub repo "
-        "id if pointed at one instead.",
-    )
-    parser.add_argument(
-        "--detection-num-sample-frames", dest="detection_num_sample_frames", type=int, default=8,
-        help="--detector-backend gemma, --classes mode only: number of evenly-spaced frames "
-        "sent to Gemma for the initial multi-class scan, instead of Grounding DINO's cheap "
-        "every-frame scan (a per-frame VLM call is not cheap enough to run on every frame).",
+        "--mode", dest="mode", choices=list(MODES), default="pick-and-place",
+        help="Run mode. 'pick-and-place' (default): HF/PaliGemma detector; classes are "
+        "discovered (unless --classes is given) and a random pick/place pair is chosen. "
+        "'full-scene': Grounding DINO detector; requires --classes; full-scene reconstruction. "
+        "'full-scene-with-robot': like full-scene, then a robot-collision demo against a "
+        "randomly chosen class (or --robot-target if given).",
     )
     parser.add_argument(
         "--detection-box-padding-frac", dest="detection_box_padding_frac", type=float, default=0.05,
-        help="--detector-backend gemma only: outward padding applied to each detected box "
+        help="pick-and-place mode (hf backend) only: outward padding applied to each detected box "
         "(as a fraction of its own width/height) before it's used to prompt SAM2. Mitigates "
         "an undershoot failure mode found in testing where a box that doesn't fully enclose "
         "its object makes SAM2 truncate the mask at the wrong edge.",
     )
-    parser.add_argument(
-        "--random-pick-place", dest="random_pick_place", action="store_true", default=False,
-        help="Requires --discover-classes. Runs the pick-and-place fast path (Stage P1-P4) on a "
-        "random pair of the discovered classes, with no --ai-scene-agent and every pick-and-place "
-        "option (--place-offset, --place-target-clearance, --gripper-open-width, --approach-side) "
-        "left at its default.",
-    )
-    parser.add_argument("--run_glb", action="store_true", default=False)
-    parser.add_argument(
-        "--use-trellis", dest="use_trellis", action=argparse.BooleanOptionalAction, default=True,
-        help="Per-class mesh reconstruction (TRELLIS.2/MV-SAM3D). No-op without --classes.",
-    )
-    parser.add_argument("--mesh-backend", dest="mesh_backend", choices=["trellis2", "mvsam3d"], default="mvsam3d")
     parser.add_argument("--mvsam3d-stage1-steps", dest="mvsam3d_stage1_steps", type=int, default=25,
                         help="MV-SAM3D stage 1 (shape) inference steps. The upstream MV-SAM3D default is 50.")
     parser.add_argument("--mvsam3d-stage2-steps", dest="mvsam3d_stage2_steps", type=int, default=12,
@@ -153,7 +94,6 @@ def build_parser() -> argparse.ArgumentParser:
                              "MV-SAM3D's main diffusion pass. Pass 0 or a value >= the scene's "
                              "view count to disable pruning (use every view with a mask).")
     parser.add_argument("--skip_isaac", dest="run_usd", action="store_false", default=True)
-    parser.add_argument("--collision_approximation", default="convexDecomposition")
     parser.add_argument(
         "--friction-table-path", type=Path,
         default=GENRECON_DIR / "configs" / "materials" / "friction_table.example.yaml",
@@ -167,10 +107,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--depth_edge_rtol", type=float, default=0.03)
     parser.add_argument("--fix_num_chunks", type=int, default=16)
     parser.add_argument("--robot-target", dest="robot_target", default=None)
-    parser.add_argument("--skip_floater_removal", dest="run_floater_removal", action="store_false", default=True)
-    parser.add_argument("--floater_search_padding_factor", type=float, default=0.2)
-    parser.add_argument("--floater_containment_frac", type=float, default=0.95)
-    parser.add_argument("--floater_max_faces", type=int, default=5000)
     # Lowered from demo_rerun.py's own CLI default (50.0, a percentile filter that discards half
     # of every exported point cloud by construction) -- see vggt/demo_rerun.py's --conf-thres help.
     parser.add_argument("--vggt-conf-thres", dest="vggt_conf_thres", type=float, default=20.0)
@@ -179,7 +115,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Spawn the rerun point-cloud viewer after Stage 0's export (background thread). Off "
         "by default -- nothing downstream reads from it, and it adds nothing to a headless run.",
     )
-    parser.add_argument("--skip_hull_consistency_check", action="store_true", default=False)
     parser.add_argument("--pick_place_target", default=None)
     parser.add_argument("--place-offset", dest="place_offset", type=_place_offset, default=(0.3, 0.0, 0.0))
     parser.add_argument("--place-target", dest="place_target", default=None)
@@ -201,13 +136,41 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace, logger) -> list[str]:
-    """Ports run_full_pipeline.sh's cross-field validation (lines ~168-259). Mutates
-    args.use_trellis in place where bash silently overrides it. Returns the parsed --classes
-    list. Calls parser.error() (exit 2) on invalid combinations, matching bash's exit-1-with-
-    message behavior closely enough for a CLI tool."""
+def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace, logger) -> tuple[list[str], bool]:
+    """Ports run_full_pipeline.sh's cross-field validation (lines ~168-259). Returns the parsed
+    --classes list and the effective use_trellis flag (derived from USE_TRELLIS, overridden per
+    the same rules bash silently applied). Calls parser.error() (exit 2) on invalid combinations,
+    matching bash's exit-1-with-message behavior closely enough for a CLI tool."""
     if not args.image_folder.is_dir():
         parser.error(f"Image folder not found: {args.image_folder}")
+
+    full_scene_mode = args.mode in FULL_SCENE_MODES
+    args.detector_backend = "groundingdino" if full_scene_mode else "hf"
+
+    if full_scene_mode:
+        if not args.classes:
+            parser.error(f"--mode {args.mode} requires --classes.")
+        if args.discover_classes:
+            parser.error(f"--mode {args.mode} does not support --discover-classes; pass --classes.")
+        args.discover_classes = False
+        for flag, value in (
+            ("--pick_place_target", args.pick_place_target),
+            ("--place-target", args.place_target),
+            ("--ai-scene-agent", args.ai_scene_agent),
+        ):
+            if value:
+                parser.error(f"{flag} is only valid with --mode pick-and-place.")
+        if args.mode == "full-scene" and args.robot_target:
+            parser.error("--robot-target requires --mode full-scene-with-robot.")
+        if args.mode == "full-scene-with-robot" and not args.run_usd:
+            parser.error("--mode full-scene-with-robot cannot be combined with --skip_isaac.")
+    elif args.robot_target:
+        parser.error("--robot-target requires --mode full-scene-with-robot.")
+
+    if args.discover_classes is None:
+        args.discover_classes = not (
+            args.classes or args.pick_place_target or args.place_target
+        )
 
     if args.discover_classes:
         if args.classes:
@@ -216,23 +179,26 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace, log
             parser.error("--discover-classes and --pick_place_target are mutually exclusive.")
         if args.place_target:
             parser.error("--discover-classes and --place-target are mutually exclusive.")
-        if args.ai_scene_agent:
-            parser.error("--discover-classes and --ai-scene-agent are mutually exclusive.")
 
-    if args.random_pick_place and not args.discover_classes:
-        parser.error("--random-pick-place requires --discover-classes.")
+    # pick-and-place picks a random pair unless the pick target is given or the scene agent chooses.
+    args.random_pick_place = (
+        args.mode == "pick-and-place" and not args.pick_place_target and not args.ai_scene_agent
+    )
+    if args.random_pick_place and not args.classes and not args.discover_classes:
+        parser.error("--mode pick-and-place requires --classes or class discovery (--discover-classes).")
 
     classes = [c.strip() for c in args.classes.split(",")] if args.classes else []
 
-    if args.use_trellis and not classes and not args.discover_classes and not args.ai_scene_agent:
+    use_trellis = USE_TRELLIS
+    if use_trellis and not classes and not args.discover_classes and not args.ai_scene_agent:
         logger.info(
             "Note: --classes not set, so per-class mesh reconstruction (enabled by default) "
             "does not apply to this run."
         )
-        args.use_trellis = False
+        use_trellis = False
 
-    if args.mesh_backend == "mvsam3d" and not MVSAM3D_VENDOR_DIR.is_dir():
-        parser.error(f"--mesh-backend mvsam3d requires the vendored MV-SAM3D source at {MVSAM3D_VENDOR_DIR}.")
+    if not MVSAM3D_VENDOR_DIR.is_dir():
+        parser.error(f"Requires the vendored MV-SAM3D source at {MVSAM3D_VENDOR_DIR}.")
 
     if args.pick_place_target:
         if args.robot_target:
@@ -241,9 +207,9 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace, log
             parser.error("--pick_place_target requires --classes to include the same label.")
         if args.pick_place_target not in classes:
             parser.error(f"--pick_place_target '{args.pick_place_target}' must exactly match one of the labels passed to --classes ('{args.classes}').")
-        if not args.use_trellis:
-            logger.info("Note: --pick_place_target requires TRELLIS.2's per-object mesh; overriding --no-use-trellis to on for this run.")
-            args.use_trellis = True
+        if not use_trellis:
+            logger.info("Note: --pick_place_target requires TRELLIS.2's per-object mesh; overriding use_trellis to on for this run.")
+            use_trellis = True
 
     if args.place_target:
         if not args.pick_place_target:
@@ -258,18 +224,19 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace, log
             parser.error("--ai-scene-agent and --pick_place_target are mutually exclusive.")
         if args.robot_target:
             parser.error("--ai-scene-agent and --robot-target are mutually exclusive.")
-        if not classes and args.start_from_stage <= 3:
+        if not classes and not args.discover_classes and args.start_from_stage <= 3:
             parser.error(
-                "--ai-scene-agent requires --classes when --start-from-stage <= 3 (Stage 1-3 "
-                "need an explicit class list to segment and mesh the objects it asks about); "
-                "pass --classes, or use --start-from-stage > 3 to discover classes from "
+                "--ai-scene-agent requires --classes or --discover-classes when "
+                "--start-from-stage <= 3 (Stage 1-3 need a class list to segment and mesh the "
+                "objects it asks about); pass one of them, or use --start-from-stage > 3 to "
+                "discover classes from "
                 f"existing meshes under {GENRECON_DIR / 'runs' / args.scene_name / 'image_to_3d_meshes'}."
             )
-        if not args.use_trellis:
-            logger.info("Note: --ai-scene-agent requires a per-object mesh for every --classes label; overriding --no-use-trellis to on for this run.")
-            args.use_trellis = True
+        if not use_trellis:
+            logger.info("Note: --ai-scene-agent requires a per-object mesh for every --classes label; overriding use_trellis to on for this run.")
+            use_trellis = True
 
-    return classes
+    return classes, use_trellis
 
 
 def _format_duration(seconds: float) -> str:
@@ -299,7 +266,10 @@ def main(argv: list[str] | None = None) -> None:
     from genrecon.pipeline.subprocess_utils import LogMirror, stage
     from genrecon.utils.logger import logger
 
-    classes = validate_args(parser, args, logger)
+    classes, use_trellis = validate_args(parser, args, logger)
+    if args.mode == "full-scene-with-robot" and not args.robot_target:
+        args.robot_target = random.choice(classes)
+        logger.info(f"Random robot target: '{args.robot_target}' (chosen from classes {classes})")
     log_mirror = LogMirror(pipeline_log)
 
     def check_stop_after_stage(n: int) -> None:
@@ -334,7 +304,7 @@ def main(argv: list[str] | None = None) -> None:
                     export_dir,
                     skip_frames=args.skip_frames,
                     max_frames=args.max_frames,
-                    align_to_gravity=args.align_to_gravity,
+                    align_to_gravity=True,
                     rotate_horizontal_deg=args.rotate_horizontal_deg,
                     conf_thres=args.vggt_conf_thres,
                     spawn_viewer=args.vggt_viewer,
@@ -350,39 +320,41 @@ def main(argv: list[str] | None = None) -> None:
             # different phrasing across calls on the same images, which would otherwise leave
             # a later stage looking for masks under class names Stage 1 never produced.
             discovered_classes_cache = run_dir / "discovered_classes.json"
-            if args.start_from_stage > 0 and discovered_classes_cache.exists():
+            discovered_boxes_cache = run_dir / "discovered_boxes.json"
+            if args.start_from_stage > 0 and discovered_classes_cache.exists() and discovered_boxes_cache.exists():
                 classes = json.loads(discovered_classes_cache.read_text())
                 logger.info(
                     f"Stage 0b: skipped (--start-from-stage {args.start_from_stage}), reusing "
                     f"cached classes from {discovered_classes_cache}: {', '.join(classes)}"
                 )
             else:
-                discovery_model_label = (
-                    args.discovery_hf_model if args.discovery_backend == "hf" else args.discovery_vlm_model
-                )
-                with stage(f"Stage 0b: object-class discovery (backend={args.discovery_backend}, model={discovery_model_label})"):
-                    from genrecon.utils.object_discovery import discover_object_classes
+                with stage(f"Stage 0b: object discovery + detection (model={DISCOVERY_HF_MODEL})"):
+                    from genrecon.utils.object_discovery import discover_objects
 
-                    classes = discover_object_classes(
-                        export_dir / "images",
-                        vlm_model=args.discovery_vlm_model,
-                        num_images=args.discovery_num_images,
-                        ollama_host=os.environ.get("OLLAMA_HOST"),
-                        backend=args.discovery_backend,
-                        hf_model=args.discovery_hf_model,
-                    )
-                    logger.info(f"Discovery: found {len(classes)} classes: {', '.join(classes)}")
+                    objects = discover_objects(export_dir / "images", model_id=DISCOVERY_HF_MODEL)
+                    classes = [o["label"] for o in objects]
+                    logger.info(f"Discovery: found {len(classes)} objects: {', '.join(classes)}")
+                left_image = next(p.name for p in sorted((export_dir / "images").glob("*.jpg"))
+                                  if "left" in p.name.lower())
                 discovered_classes_cache.write_text(json.dumps(classes, indent=2))
+                discovered_boxes_cache.write_text(json.dumps({
+                    "left_image": left_image,
+                    "objects": {o["label"]: {"left_box": o["left_box"], "right_box": o["right_box"]}
+                                for o in objects},
+                }, indent=2))
+            boxes_json = discovered_boxes_cache
+        else:
+            boxes_json = None
 
-            if args.random_pick_place:
-                if len(classes) < 2:
-                    logger.error(f"--random-pick-place requires at least 2 discovered classes, got {classes}.")
-                    sys.exit(1)
-                args.pick_place_target, args.place_target = random.sample(classes, 2)
-                logger.info(
-                    f"Random pick-and-place: pick='{args.pick_place_target}', "
-                    f"place='{args.place_target}' (chosen from discovered classes {classes})"
-                )
+        if args.random_pick_place:
+            if len(classes) < 2:
+                logger.error(f"pick-and-place mode requires at least 2 classes for random selection, got {classes}.")
+                sys.exit(1)
+            args.pick_place_target, args.place_target = random.sample(classes, 2)
+            logger.info(
+                f"Random pick-and-place: pick='{args.pick_place_target}', "
+                f"place='{args.place_target}' (chosen from classes {classes})"
+            )
 
         cobgs_mask_dir = output_dir / "segmentation_raw" / "masks" / "classes"
         seg_log = output_dir / "segmentation.log"
@@ -399,15 +371,12 @@ def main(argv: list[str] | None = None) -> None:
                         classes,
                         depth_conf_thres=args.depth_conf_thres,
                         depth_edge_rtol=args.depth_edge_rtol,
-                        skip_hull_consistency_check=args.skip_hull_consistency_check,
                         seg_log=seg_log,
                         log_mirror=log_mirror,
                         detector_backend=args.detector_backend,
-                        detection_vlm_model=args.detection_vlm_model,
-                        detection_ollama_host=args.detection_ollama_host,
-                        detection_hf_model=args.detection_hf_model,
-                        detection_num_sample_frames=args.detection_num_sample_frames,
+                        detection_hf_model=DETECTION_HF_MODEL,
                         detection_box_padding_frac=args.detection_box_padding_frac,
+                        boxes_json=boxes_json,
                     )
             else:
                 logger.info(f"Stage 1: skipped (--start-from-stage {args.start_from_stage}), assuming existing segmentation at {output_dir / 'segmentation_raw'}")
@@ -420,34 +389,23 @@ def main(argv: list[str] | None = None) -> None:
                 logger.info(f"Stage 2: skipped (--start-from-stage {args.start_from_stage})")
             check_stop_after_stage(2)
 
-            if args.use_trellis and args.start_from_stage <= 3:
-                if args.mesh_backend == "trellis2":
-                    with stage(f"Stage 3: TRELLIS.2 reconstruction -> {image_to_3d_output_dir}"):
-                        stages.stage3_trellis2(
-                            cobgs_mask_dir,
-                            run_dir / "trellis2_input",
-                            image_to_3d_output_dir,
-                            trellis2_dir=TRELLIS2_DIR,
-                            seg_log=seg_log,
-                            log_mirror=log_mirror,
-                        )
-                else:
-                    with stage(f"Stage 3: MV-SAM3D reconstruction -> {image_to_3d_output_dir}"):
-                        stages.stage3_mvsam3d(
-                            run_dir,
-                            args.scene_name,
-                            classes,
-                            image_to_3d_output_dir,
-                            mvsam3d_vendor_dir=MVSAM3D_VENDOR_DIR,
-                            seg_log=seg_log,
-                            log_mirror=log_mirror,
-                            cobgs_mask_dir=cobgs_mask_dir,
-                            stage1_steps=args.mvsam3d_stage1_steps,
-                            stage2_steps=args.mvsam3d_stage2_steps,
-                            top_k_views=args.mvsam3d_top_k_views,
-                        )
+            if use_trellis and args.start_from_stage <= 3:
+                with stage(f"Stage 3: MV-SAM3D reconstruction -> {image_to_3d_output_dir}"):
+                    stages.stage3_mvsam3d(
+                        run_dir,
+                        args.scene_name,
+                        classes,
+                        image_to_3d_output_dir,
+                        mvsam3d_vendor_dir=MVSAM3D_VENDOR_DIR,
+                        seg_log=seg_log,
+                        log_mirror=log_mirror,
+                        cobgs_mask_dir=cobgs_mask_dir,
+                        stage1_steps=args.mvsam3d_stage1_steps,
+                        stage2_steps=args.mvsam3d_stage2_steps,
+                        top_k_views=args.mvsam3d_top_k_views,
+                    )
             else:
-                logger.info(f"Stage 3: skipped (no --use-trellis, or --start-from-stage {args.start_from_stage})")
+                logger.info(f"Stage 3: skipped (use_trellis disabled, or --start-from-stage {args.start_from_stage})")
             check_stop_after_stage(3)
 
         # ── Stage P0 (only with --ai-scene-agent) ──
@@ -530,14 +488,14 @@ def main(argv: list[str] | None = None) -> None:
 
             with stage(f"Stage P1: aligning meshes for all --classes labels to scene scale -> {pick_place_glb_dir}"):
                 stages.stageP1_align_meshes(
-                    run_dir, classes, cobgs_mask_dir, pick_place_glb_dir, mesh_backend=args.mesh_backend
+                    run_dir, classes, cobgs_mask_dir, pick_place_glb_dir
                 )
 
-            with stage(f"Stage P2: convert_asset.py (collision_approximation={args.collision_approximation}) -> {pick_place_glb_dir}/<label>/asset.usd"):
+            with stage(f"Stage P2: convert_asset.py (collision_approximation={COLLISION_APPROXIMATION}) -> {pick_place_glb_dir}/<label>/asset.usd"):
                 stages.stageP2_convert_asset(
                     pick_place_glb_dir,
                     isaacsim_dir=ISAACSIM_DIR,
-                    collision_approximation=args.collision_approximation,
+                    collision_approximation=COLLISION_APPROXIMATION,
                     log_file=pick_place_dir / "convert_asset.log",
                     debug_config_log=debug_config_log,
                     log_mirror=log_mirror,
@@ -633,10 +591,6 @@ def main(argv: list[str] | None = None) -> None:
                     cobgs_mask_dir,
                     classes,
                     output_dir,
-                    run_floater_removal=args.run_floater_removal,
-                    floater_search_padding_factor=args.floater_search_padding_factor,
-                    floater_containment_frac=args.floater_containment_frac,
-                    floater_max_faces=args.floater_max_faces,
                 )
         else:
             logger.info(f"Stage 8: skipped (no --classes, or --start-from-stage {args.start_from_stage})")
@@ -659,18 +613,18 @@ def main(argv: list[str] | None = None) -> None:
             if args.start_from_stage <= 10:
                 with stage(f"Stage 10: mesh_to_glb.py -> {shapes_dir}/glb"):
                     stages.stage10_mesh_to_glb(
-                        shapes_dir, run_dir, classes, use_trellis=args.use_trellis, mesh_backend=args.mesh_backend
+                        shapes_dir, run_dir, classes, use_trellis=use_trellis
                     )
             else:
                 logger.info(f"Stage 10: skipped (--start-from-stage {args.start_from_stage})")
             check_stop_after_stage(10)
 
             if args.start_from_stage <= 11:
-                with stage(f"Stage 11: convert_asset.py (collision_approximation={args.collision_approximation}) -> {shapes_dir}/glb/<label>/asset.usd"):
+                with stage(f"Stage 11: convert_asset.py (collision_approximation={COLLISION_APPROXIMATION}) -> {shapes_dir}/glb/<label>/asset.usd"):
                     stages.stage11_convert_asset(
                         shapes_dir, classes,
                         isaacsim_dir=ISAACSIM_DIR,
-                        collision_approximation=args.collision_approximation,
+                        collision_approximation=COLLISION_APPROXIMATION,
                         output_dir=output_dir,
                         debug_config_log=debug_config_log,
                         log_mirror=log_mirror,
@@ -691,17 +645,17 @@ def main(argv: list[str] | None = None) -> None:
             check_stop_after_stage(12)
 
         # ── Stage 13: chunked GLB bake ──
-        if args.run_glb and args.start_from_stage <= 13:
-            with stage(f"Stage 13: chunked_to_glb.py (simplify_threshold={args.simplify_threshold}, texture_size={args.texture_size})"):
+        if RUN_GLB and args.start_from_stage <= 13:
+            with stage(f"Stage 13: chunked_to_glb.py (simplify_threshold={SIMPLIFY_THRESHOLD}, texture_size={TEXTURE_SIZE})"):
                 stages.stage13_chunked_to_glb(
-                    output_dir, simplify_threshold=args.simplify_threshold, texture_size=args.texture_size
+                    output_dir, simplify_threshold=SIMPLIFY_THRESHOLD, texture_size=TEXTURE_SIZE
                 )
             logger.info(f"Done: {output_dir}/scene.glb")
-        elif args.run_glb:
+        elif RUN_GLB:
             logger.info(f"Stage 13: skipped (--start-from-stage {args.start_from_stage})")
             logger.info(f"Done: {shapes_dir}/mesh.ply")
         else:
-            logger.info("--run_glb not set, skipping GLB bake.")
+            logger.info("GLB bake disabled, skipping.")
             logger.info(f"Done: {shapes_dir}/mesh.ply")
 
         # ── Stage 14: organize final per-object deliverables ──

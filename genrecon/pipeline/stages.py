@@ -40,7 +40,7 @@ def _split_classes(classes_csv: str | None) -> list[str]:
 def sanitize_label(label: str) -> str:
     """Mirrors labels.json's sanitize_label (spaces/slashes -> underscores), used wherever a
     scene-side artifact (shapes/, glb/) is keyed by the sanitized dirname instead of the raw
-    --classes spelling (image_to_3d_meshes/, trellis2_input/) -- including the USD prim names
+    --classes spelling (image_to_3d_meshes/, mv_sam3d_input/) -- including the USD prim names
     compose_isaac_scene.py derives from those dirnames, which is why run_full_pipeline.py also
     applies this to --pick-target/--place-target/--robot-target before invoking Isaac Sim: those
     prims are always named from the sanitized dirname, never the raw (possibly multi-word)
@@ -129,15 +129,12 @@ def stage1_segmentation(
     *,
     depth_conf_thres: float,
     depth_edge_rtol: float,
-    skip_hull_consistency_check: bool,
     seg_log: Path,
     log_mirror: LogMirror,
     detector_backend: str = "groundingdino",
-    detection_vlm_model: str = "gemma4:31b",
-    detection_ollama_host: str | None = None,
     detection_hf_model: str = str(GENRECON_DIR / "checkpoints" / "paligemma" / "paligemma2-3b-pt-448"),
-    detection_num_sample_frames: int = 8,
     detection_box_padding_frac: float = 0.05,
+    boxes_json: Path | None = None,
 ) -> Path:
     """Returns the COB-GS mask directory (output_root/masks/classes)."""
     _ensure_on_path(GENRECON_DIR / "segmentation")
@@ -154,14 +151,11 @@ def stage1_segmentation(
             depth_dir=str(export_dir / "depth"),
             depth_conf_thres=depth_conf_thres,
             depth_edge_rtol=depth_edge_rtol,
-            skip_hull_consistency_check=skip_hull_consistency_check,
             flat_output=True,
             detector_backend=detector_backend,
-            detection_vlm_model=detection_vlm_model,
-            detection_ollama_host=detection_ollama_host,
             detection_hf_model=detection_hf_model,
-            detection_num_sample_frames=detection_num_sample_frames,
             detection_box_padding_frac=detection_box_padding_frac,
+            boxes_json=str(boxes_json) if boxes_json else None,
         )
     log_mirror.mirror(seg_log)
 
@@ -185,39 +179,8 @@ def stage2_export_rgba_masks(images_dir: Path, masks_root: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Stage 3: per-class 3D reconstruction (TRELLIS.2 or MV-SAM3D backend)
+# Stage 3: per-class 3D reconstruction (MV-SAM3D backend)
 # ---------------------------------------------------------------------------
-
-
-def stage3_trellis2(
-    masks_root: Path,
-    trellis2_input_dir: Path,
-    image_to_3d_output_dir: Path,
-    *,
-    trellis2_dir: Path,
-    seg_log: Path,
-    log_mirror: LogMirror,
-) -> None:
-    _ensure_on_path(GENRECON_DIR / "scripts")
-    from stage_trellis2_inputs import stage_trellis2_inputs
-
-    stage_trellis2_inputs(masks_root, trellis2_input_dir)
-
-    run_external_step(
-        "stage3_trellis2_generate",
-        trellis2_dir / "generate.py",
-        trellis2_dir,
-        [
-            "--input", str(trellis2_input_dir),
-            "--output-dir", str(image_to_3d_output_dir),
-            "--resolution", "512",
-            "--no-preview",
-        ],
-        log_file=seg_log,
-        append=True,
-        runner=["uv", "run", "--no-sync", "generate.py"],
-        log_mirror=log_mirror,
-    )
 
 
 def stage3_mvsam3d(
@@ -282,6 +245,7 @@ def stage3_mvsam3d(
             classes,
             image_to_3d_output_dir,
             scene_pointcloud_dir=cobgs_mask_dir,
+            mvsam3d_input_dir=mvsam3d_input_dir,
         )
     log_mirror.mirror(seg_log)
     if failures:
@@ -354,7 +318,7 @@ def stageP0_scene_agent(
 
 
 # ---------------------------------------------------------------------------
-# Stage P1: align TRELLIS.2/MV-SAM3D meshes to scene scale for every --classes label
+# Stage P1: align MV-SAM3D meshes to scene scale for every --classes label
 # ---------------------------------------------------------------------------
 
 
@@ -363,13 +327,11 @@ def stageP1_align_meshes(
     classes: list[str],
     cobgs_mask_dir: Path,
     pick_place_glb_dir: Path,
-    *,
-    mesh_backend: str,
 ) -> None:
     _ensure_on_path(GENRECON_DIR / "scripts")
-    from align_trellis2_mesh_to_scene import align_trellis_mesh_to_scene
+    from align_meshes_to_scene import align_trellis_mesh_to_scene
 
-    apply_zup_correction = mesh_backend != "mvsam3d"
+    apply_zup_correction = False
     for label in classes:
         sanitized_label = sanitize_label(label)
         out_dir = pick_place_glb_dir / sanitized_label
@@ -567,17 +529,17 @@ def stage7_collect_shapes(output_dir: Path, classes: list[str], cobgs_mask_dir: 
 # ---------------------------------------------------------------------------
 
 
+FLOATER_SEARCH_PADDING_FACTOR = 0.2
+FLOATER_CONTAINMENT_FRAC = 0.95
+FLOATER_MAX_FACES = 5000
+
+
 def stage8_extract_object_meshes(
     shapes_dir: Path,
     scene_dir: Path,
     cobgs_mask_dir: Path,
     classes: list[str],
     output_dir: Path,
-    *,
-    run_floater_removal: bool,
-    floater_search_padding_factor: float,
-    floater_containment_frac: float,
-    floater_max_faces: int,
 ) -> None:
     _ensure_on_path(GENRECON_DIR / "scripts")
     from extract_object_mesh import extract_object_mesh
@@ -605,16 +567,15 @@ def stage8_extract_object_meshes(
         if not ok:
             logger.warning(f"Stage 8: extract_object_mesh soft-failed for {label!r}, continuing.")
 
-        if run_floater_removal:
-            remove_floater_mesh(
-                background_mesh,
-                obj_ply,
-                background_mesh,
-                floaters_out_ply=shapes_dir / f"{label}_floaters.ply",
-                search_padding_factor=floater_search_padding_factor,
-                containment_frac=floater_containment_frac,
-                max_floater_faces=floater_max_faces,
-            )
+        remove_floater_mesh(
+            background_mesh,
+            obj_ply,
+            background_mesh,
+            floaters_out_ply=shapes_dir / f"{label}_floaters.ply",
+            search_padding_factor=FLOATER_SEARCH_PADDING_FACTOR,
+            containment_frac=FLOATER_CONTAINMENT_FRAC,
+            max_floater_faces=FLOATER_MAX_FACES,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -645,7 +606,7 @@ def stage9_floor_and_friction(
 
 
 # ---------------------------------------------------------------------------
-# Stage 10: per-object mesh -> GLB (+ TRELLIS.2/MV-SAM3D substitution)
+# Stage 10: per-object mesh -> GLB (+ MV-SAM3D substitution)
 # ---------------------------------------------------------------------------
 
 
@@ -655,10 +616,9 @@ def stage10_mesh_to_glb(
     classes: list[str],
     *,
     use_trellis: bool,
-    mesh_backend: str,
 ) -> None:
     _ensure_on_path(GENRECON_DIR / "scripts")
-    from align_trellis2_mesh_to_scene import align_trellis_mesh_to_scene
+    from align_meshes_to_scene import align_trellis_mesh_to_scene
     from mesh_to_glb import convert
 
     glb_dir = shapes_dir / "glb"
@@ -667,7 +627,7 @@ def stage10_mesh_to_glb(
     if not use_trellis:
         return
 
-    apply_zup_correction = mesh_backend != "mvsam3d"
+    apply_zup_correction = False
     for label in classes:
         sanitized_label = sanitize_label(label)
         trellis_glb = run_dir / "image_to_3d_meshes" / label / "mesh.glb"
@@ -768,7 +728,7 @@ def stage14_organize_final_objects(run_dir: Path, output_dir: Path, shapes_dir: 
     organize_final_objects(
         shapes_dir,
         output_dir / "segmentation_raw",
-        run_dir / "trellis2_input",
+        run_dir / "mv_sam3d_input",
         run_dir / "image_to_3d_meshes",
         run_dir / "final_objects",
     )

@@ -66,15 +66,12 @@ def run_segmentation(
     depth_edge_rtol: float = 0.03,
     skip_mask: bool = False,
     skip_pc_segment: bool = False,
-    skip_hull_consistency_check: bool = False,
     read_from_drive: bool = False,
     flat_output: bool = False,
     detector_backend: str = "groundingdino",
-    detection_vlm_model: str = "gemma4:31b",
-    detection_ollama_host: str | None = None,
     detection_hf_model: str = DEFAULT_PALIGEMMA_CHECKPOINT,
-    detection_num_sample_frames: int = 8,
     detection_box_padding_frac: float = 0.05,
+    boxes_json: str | None = None,
 ) -> None:
     """Runs Stage 1 (2D mask extraction) and Stage 1.5 (point-cloud segmentation) for a scene.
     Dispatches to detect_and_segment.py/segment_pointcloud.py as real subprocesses (the actual
@@ -89,11 +86,9 @@ def run_segmentation(
 
     detector_flags = [
         "--detector_backend", detector_backend,
-        "--detection_vlm_model", detection_vlm_model,
         "--detection_hf_model", detection_hf_model,
-        "--detection_num_sample_frames", str(detection_num_sample_frames),
         "--detection_box_padding_frac", str(detection_box_padding_frac),
-    ] + (["--detection_ollama_host", detection_ollama_host] if detection_ollama_host else [])
+    ] + (["--boxes_json", boxes_json] if boxes_json else [])
 
     if not skip_mask:
         run_stage(
@@ -114,7 +109,6 @@ def run_segmentation(
                         "--voxel_size", str(voxel_size),
                         "--depth_conf_thres", str(depth_conf_thres),
                         "--depth_edge_rtol", str(depth_edge_rtol)]
-                       + (["--skip_hull_consistency_check"] if skip_hull_consistency_check else [])
                        if multi_class else [])
         run_stage(
             "Stage 1.5: Point-cloud segmentation",
@@ -173,9 +167,6 @@ def main():
     parser.add_argument("--skip_mask", action="store_true")
     parser.add_argument("--skip_pc_segment", action="store_true",
                          help="Skip Stage 1.5: direct point-cloud segmentation via mask reprojection")
-    parser.add_argument("--skip_hull_consistency_check", action="store_true",
-                         help="Stage 1.5, class-based mode: skip the per-class RANSAC volumetric-"
-                              "hull consensus check (see segment_pointcloud.py)")
     parser.add_argument("--read_from_drive", action="store_true",
                          help="Skip a stage if its output already exists on disk. "
                               "Default behavior is to always rerun and overwrite "
@@ -185,25 +176,16 @@ def main():
                               "becomes exactly --output_root instead of --output_root/<scene>. "
                               "Useful when --output_root is already scene-specific (e.g. driven "
                               "by an external per-scene pipeline).")
-    parser.add_argument("--detector_backend", choices=["groundingdino", "gemma", "hf"], default="groundingdino",
-                         help="Box-detection backend for Stage 1. 'gemma' uses a local "
-                              "Ollama-served Gemma vision model instead of Grounding DINO -- "
-                              "see segmentation/gemma_detection_utils.py. 'hf' uses a "
+    parser.add_argument("--detector_backend", choices=["groundingdino", "hf"], default="groundingdino",
+                         help="Box-detection backend for Stage 1. 'hf' uses a "
                               "locally-downloaded HF transformers PaliGemma checkpoint instead "
-                              "-- see segmentation/gemma_detection_utils_hf.py.")
-    parser.add_argument("--detection_vlm_model", type=str, default="gemma4:31b",
-                         help="Ollama model tag used when --detector_backend gemma.")
-    parser.add_argument("--detection_ollama_host", type=str, default=None,
-                         help="Ollama base URL override for --detector_backend gemma.")
+                              "of Grounding DINO -- see segmentation/gemma_detection_utils_hf.py.")
     parser.add_argument("--detection_hf_model", type=str, default=DEFAULT_PALIGEMMA_CHECKPOINT,
                          help="HF PaliGemma model id, or a local checkpoint directory, used "
                               "when --detector_backend hf. Defaults to the local copy at "
                               "checkpoints/paligemma/paligemma2-3b-pt-448.")
-    parser.add_argument("--detection_num_sample_frames", type=int, default=8,
-                         help="--detector_backend gemma, --classes mode only: number of "
-                              "evenly-spaced frames sent to Gemma for the initial scan.")
     parser.add_argument("--detection_box_padding_frac", type=float, default=0.05,
-                         help="--detector_backend gemma only: outward box padding fraction "
+                         help="--detector_backend hf only: outward box padding fraction "
                               "applied before SAM2 prompting.")
     args = parser.parse_args()
 
@@ -224,14 +206,10 @@ def main():
             depth_edge_rtol=args.depth_edge_rtol,
             skip_mask=args.skip_mask,
             skip_pc_segment=args.skip_pc_segment,
-            skip_hull_consistency_check=args.skip_hull_consistency_check,
             read_from_drive=args.read_from_drive,
             flat_output=args.flat_output,
             detector_backend=args.detector_backend,
-            detection_vlm_model=args.detection_vlm_model,
-            detection_ollama_host=args.detection_ollama_host,
             detection_hf_model=args.detection_hf_model,
-            detection_num_sample_frames=args.detection_num_sample_frames,
             detection_box_padding_frac=args.detection_box_padding_frac,
         )
     except ValueError as e:

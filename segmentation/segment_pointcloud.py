@@ -763,13 +763,6 @@ def main():
                               "a pixel is treated as a depth discontinuity and excluded from "
                               "lifting (mirrors VGGT-Omega's visual_util.py::depth_edge, used the "
                               "same way to build points3D.ply).")
-    parser.add_argument("--skip_hull_consistency_check", action="store_true",
-                         help="Multi-class mode: skip the per-class RANSAC volumetric-hull "
-                              "consensus check (builds a 3D convex hull per frame, finds the "
-                              "subgroup of frames whose hulls mutually agree via reprojection "
-                              "overlap with each frame's mask, and quarantines frames outside "
-                              "that majority group -- catches a wrong-instance track reseed "
-                              "contaminating a class's point cloud).")
     parser.add_argument("--hull_overlap_threshold", type=float, default=0.5,
                          help="Hull consistency check: minimum fraction of a frame's real mask "
                               "that must be explained by (fall inside) a hull's reprojected "
@@ -848,14 +841,13 @@ def main():
     # onto a different physical object of the same class) without the cost/
     # fragility of validating every individual point (see validate_lifted_points
     # below, which is disabled for exactly that reason).
-    if not args.skip_hull_consistency_check:
-        class_points, rejected_frames = filter_by_hull_consensus(
-            cam_extrinsics, cam_intrinsics, mask_dir, label_dirs, class_points,
-            class_frame_ids, frame_names, device,
-            overlap_threshold=args.hull_overlap_threshold,
-            min_hull_points=args.hull_min_points)
-        quarantine_rejected_frames(mask_dir, label_dirs, rejected_frames)
-        write_rejection_manifest(mask_dir, rejected_frames)
+    class_points, rejected_frames = filter_by_hull_consensus(
+        cam_extrinsics, cam_intrinsics, mask_dir, label_dirs, class_points,
+        class_frame_ids, frame_names, device,
+        overlap_threshold=args.hull_overlap_threshold,
+        min_hull_points=args.hull_min_points)
+    quarantine_rejected_frames(mask_dir, label_dirs, rejected_frames)
+    write_rejection_manifest(mask_dir, rejected_frames)
 
     # Voxel-dedup above gave each surviving lifted point a fixed identity;
     # cross-check that identity against every frame's mask, same as the old

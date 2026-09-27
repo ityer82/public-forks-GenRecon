@@ -25,7 +25,7 @@ convention mismatch before computing scale/translation. Any remaining
 left-right/front-back (yaw) mismatch is not corrected.
 
 Usage:
-    uv run python scripts/align_trellis2_mesh_to_scene.py \
+    uv run python scripts/align_meshes_to_scene.py \
         --trellis_glb runs/kitchen_bowl/trellis2_meshes/bowl/mesh.glb \
         --scene_mesh_ply runs/kitchen_bowl/genrecon_output/shapes/bowl_mesh.ply \
         --out_glb runs/kitchen_bowl/trellis2_meshes/bowl/mesh_aligned.glb

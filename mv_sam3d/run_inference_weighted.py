@@ -2186,6 +2186,32 @@ def merge_multiple_objects_glb(
         return None
 
 
+def _log_gpu_memory(tag: str) -> None:
+    """Logs this process's CUDA allocator state so per-object memory growth is visible."""
+    if not torch.cuda.is_available():
+        return
+    gib = 1024 ** 3
+    free, total = torch.cuda.mem_get_info()
+    logger.info(
+        f"[GPU mem] {tag}: allocated={torch.cuda.memory_allocated() / gib:.2f} GiB, "
+        f"reserved={torch.cuda.memory_reserved() / gib:.2f} GiB, "
+        f"max_allocated={torch.cuda.max_memory_allocated() / gib:.2f} GiB, "
+        f"device free={free / gib:.2f}/{total / gib:.2f} GiB"
+    )
+
+
+def _release_gpu_memory() -> None:
+    """Each object builds a fresh Inference (model) inside run_weighted_inference. Its locals
+    are freed on return, but hooks/closures can leave reference cycles, so collect them
+    explicitly and hand the cached blocks back before the next object loads its own model."""
+    import gc
+
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
+
 def run_multiobject_inference(
     input_path: Path,
     mask_prompts: List[str],
@@ -2230,6 +2256,8 @@ def run_multiobject_inference(
     # View pruning (angular coverage)
     top_k_views: Optional[int] = None,
     view_selection_pointcloud_dir: Optional[Path] = None,
+    # Reference view (view 0 = pose source): 'best_mask' or 'first' (old behaviour)
+    ref_view_policy: str = "best_mask",
 ):
     """
     Run multi-object inference: process each object sequentially, then merge.
@@ -2291,6 +2319,7 @@ def run_multiobject_inference(
         logger.info(f"\n{'='*70}")
         logger.info(f"[Object {i+1}/{len(mask_prompts)}] Processing: {mask_prompt}")
         logger.info(f"{'='*70}\n")
+        _log_gpu_memory(f"before object {i+1}/{len(mask_prompts)} ({mask_prompt})")
         
         # Create subdirectory for this object
         object_output_dir = multiobj_output_dir / mask_prompt
@@ -2340,6 +2369,7 @@ def run_multiobject_inference(
                 pose_opt_optimize_scale=pose_opt_optimize_scale,
                 top_k_views=top_k_views,
                 view_selection_pointcloud_dir=view_selection_pointcloud_dir,
+                ref_view_policy=ref_view_policy,
             )
 
             if result:
@@ -2365,6 +2395,10 @@ def run_multiobject_inference(
             import traceback
             traceback.print_exc()
             continue
+        finally:
+            _log_gpu_memory(f"after object {i+1}/{len(mask_prompts)} ({mask_prompt}), before cleanup")
+            _release_gpu_memory()
+            _log_gpu_memory(f"after object {i+1}/{len(mask_prompts)} ({mask_prompt}), after cleanup")
     
     # Merge all objects
     if object_results:
@@ -2432,6 +2466,8 @@ def run_single_object_for_multiobject(
     pose_opt_optimize_scale: bool = False,
     top_k_views: Optional[int] = None,
     view_selection_pointcloud_dir: Optional[Path] = None,
+    # Reference view (view 0 = pose source): 'best_mask' or 'first' (old behaviour)
+    ref_view_policy: str = "best_mask",
 ) -> Optional[dict]:
     """
     Wrapper for run_weighted_inference that returns GLB path and pose for multi-object merging.
@@ -2484,6 +2520,7 @@ def run_single_object_for_multiobject(
         pose_opt_optimize_scale=pose_opt_optimize_scale,
         top_k_views=top_k_views,
         view_selection_pointcloud_dir=view_selection_pointcloud_dir,
+        ref_view_policy=ref_view_policy,
     )
 
     # Copy result files to object_output_dir
@@ -2589,6 +2626,8 @@ def run_weighted_inference(
     # View pruning (angular coverage)
     top_k_views: Optional[int] = None,
     view_selection_pointcloud_dir: Optional[Path] = None,
+    # Reference view (view 0 = pose source): 'best_mask' or 'first' (old behaviour)
+    ref_view_policy: str = "best_mask",
 ):
     """
     Run weighted inference with adaptive multi-view fusion.
@@ -2762,6 +2801,22 @@ def run_weighted_inference(
         
         logger.info(f"  Successfully loaded and matched {len(view_pointmaps)} external pointmaps from DA3")
 
+    # Reference view: view 0 is the only view whose pose prediction is used (see
+    # multi_view_utils.POSE_KEYS) and its extrinsic is saved as params['ref_extrinsic'], so
+    # pick it by mask quality instead of taking whichever frame happens to come first.
+    ref_idx, ref_name = 0, (loaded_image_names[0] if loaded_image_names else None)
+    if ref_view_policy == "best_mask" and num_views > 1:
+        from view_selection import select_reference_view
+
+        ref_idx = select_reference_view(view_masks)
+        ref_name = loaded_image_names[ref_idx]
+        ref_area = int(np.asarray(view_masks[ref_idx]).astype(bool).sum())
+        max_area = max(int(np.asarray(m).astype(bool).sum()) for m in view_masks)
+        logger.info(
+            f"[ViewSelection] Reference view for '{mask_prompt}': {ref_name} "
+            f"(mask {ref_area} px, {ref_area / max(max_area, 1):.0%} of the largest mask)"
+        )
+
     # View pruning: select a subset of the loaded views that best covers the object
     # angularly, before running the (expensive, per-view) main diffusion pass.
     if top_k_views is not None and 0 < top_k_views < num_views:
@@ -2804,7 +2859,7 @@ def run_weighted_inference(
                 )
             else:
                 camera_positions = [p["camera_position"] for p in camera_poses]
-                selected = select_views_by_angular_coverage(camera_positions, centroid, top_k_views)
+                selected = select_views_by_angular_coverage(camera_positions, centroid, top_k_views, first_view=ref_idx)
                 dropped_names = [loaded_image_names[i] for i in range(num_views) if i not in selected]
                 kept_names = [loaded_image_names[i] for i in selected]
                 logger.info(
@@ -2822,6 +2877,21 @@ def run_weighted_inference(
                 if da3_intrinsics is not None:
                     da3_intrinsics = da3_intrinsics[selected]
                 num_views = len(selected)
+
+    # No pruning happened (or it was skipped): still move the reference view to the front.
+    if ref_view_policy == "best_mask" and num_views > 1 and loaded_image_names[0] != ref_name:
+        order = [loaded_image_names.index(ref_name)] + [
+            i for i in range(num_views) if loaded_image_names[i] != ref_name
+        ]
+        view_images = [view_images[i] for i in order]
+        view_masks = [view_masks[i] for i in order]
+        loaded_image_names = [loaded_image_names[i] for i in order]
+        if view_pointmaps is not None:
+            view_pointmaps = [view_pointmaps[i] for i in order]
+        if da3_extrinsics is not None:
+            da3_extrinsics = da3_extrinsics[order]
+        if da3_intrinsics is not None:
+            da3_intrinsics = da3_intrinsics[order]
 
     is_single_view = num_views == 1
     
@@ -4065,6 +4135,11 @@ Examples:
                         help="Prune to the k views that best cover the object angularly, before "
                              "the main diffusion pass (requires --da3_output for camera poses). "
                              "Default: no pruning, use every view with a mask.")
+    parser.add_argument("--ref_view_policy", choices=["best_mask", "first"], default="best_mask",
+                        help="Which view is placed first as the reference 'view 0' (the only view "
+                             "whose pose prediction is used, and whose extrinsic is saved as ref_extrinsic): "
+                             "'best_mask' = largest un-clipped mask (default), 'first' = first view "
+                             "with a mask (old behaviour).")
     parser.add_argument("--view_selection_pointcloud_dir", type=str, default=None,
                         help="Optional dir of per-object segmentation point clouds "
                              "(<dir>/<label>/point_cloud/<label>.ply) used as the object centroid "
@@ -4153,6 +4228,7 @@ Examples:
                 # View pruning
                 top_k_views=args.top_k_views,
                 view_selection_pointcloud_dir=args.view_selection_pointcloud_dir,
+                ref_view_policy=args.ref_view_policy,
             )
         else:
             # Single-object mode (original behavior)
@@ -4202,6 +4278,7 @@ Examples:
                 # View pruning
                 top_k_views=args.top_k_views,
                 view_selection_pointcloud_dir=args.view_selection_pointcloud_dir,
+                ref_view_policy=args.ref_view_policy,
             )
     except Exception as e:
         logger.error(f"Inference failed: {e}")

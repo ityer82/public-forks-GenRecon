@@ -38,8 +38,8 @@ def compute_object_centroid_from_pointcloud(ply_path: Path) -> Optional[np.ndarr
 
     These point clouds (<scene_pointcloud_dir>/<sanitize_label(label)>/point_cloud/
     <sanitize_label(label)>.ply) are already in the same gravity-aligned, world/scene
-    frame as the DA3 camera extrinsics (see collect_mvsam3d_outputs.py's gravity-snap
-    docstring), so no extra alignment is needed here.
+    frame as the DA3 camera extrinsics (see collect_mvsam3d_outputs.py's
+    silhouette-yaw docstring), so no extra alignment is needed here.
 
     Returns None if the file doesn't exist or fails to load, so callers can fall back
     to compute_object_centroid_from_pointmaps().
@@ -101,10 +101,29 @@ def compute_object_centroid_from_pointmaps(
     return np.median(all_points, axis=0)
 
 
+def select_reference_view(view_masks: Sequence[np.ndarray]) -> int:
+    """Index of the best view to use as "view 0", the reference view.
+
+    MV-SAM3D takes an object's pose (rotation, translation, scale) from view 0 alone (see
+    sam3d_objects/pipeline/multi_view_utils.py) and the caller records view 0's extrinsic as
+    the pose's camera frame, so view 0 should show the object clearly: the largest mask among
+    views whose mask does not touch the image border (i.e. is not clipped). Falls back to the
+    largest mask overall when every view is clipped. Ties resolve to the lowest index.
+    """
+    areas, clipped = [], []
+    for mask in view_masks:
+        m = np.asarray(mask).astype(bool)
+        areas.append(int(m.sum()))
+        clipped.append(bool(m[0].any() or m[-1].any() or m[:, 0].any() or m[:, -1].any()))
+    candidates = [i for i in range(len(areas)) if not clipped[i]] or list(range(len(areas)))
+    return max(candidates, key=lambda i: (areas[i], -i))
+
+
 def select_views_by_angular_coverage(
     camera_positions: Sequence[np.ndarray],
     centroid: np.ndarray,
     k: int,
+    first_view: int = 0,
 ) -> List[int]:
     """Greedily select k views whose viewing directions (relative to the object
     centroid) are maximally spread apart in angle, i.e. farthest-point sampling on
@@ -116,13 +135,15 @@ def select_views_by_angular_coverage(
         k: number of views to select. Clamped to [1, len(camera_positions)].
 
     Returns:
-        Selected view indices, sorted ascending (to preserve the caller's natural
-        view ordering rather than the greedy pick order).
+        Selected view indices: `first_view` first (it becomes the reference "view 0"),
+        then the rest sorted ascending (to preserve the caller's natural view ordering
+        rather than the greedy pick order). With the default `first_view=0` this is
+        simply sorted ascending.
     """
     n = len(camera_positions)
     k = max(1, min(k, n))
     if k >= n:
-        return list(range(n))
+        return [first_view] + [i for i in range(n) if i != first_view]
 
     positions = np.stack([np.asarray(p, dtype=np.float64) for p in camera_positions], axis=0)
     directions = positions - np.asarray(centroid, dtype=np.float64)
@@ -134,8 +155,8 @@ def select_views_by_angular_coverage(
     cos_sim = np.clip(directions @ directions.T, -1.0, 1.0)
     angular_dist = np.arccos(cos_sim)  # (n, n)
 
-    selected = [0]
-    remaining = set(range(n)) - {0}
+    selected = [first_view]
+    remaining = set(range(n)) - {first_view}
     while len(selected) < k:
         # For each remaining view, its "coverage score" is the distance to its
         # nearest already-selected view; pick the one that maximizes that minimum.
@@ -148,7 +169,7 @@ def select_views_by_angular_coverage(
         selected.append(best_idx)
         remaining.discard(best_idx)
 
-    selected.sort()
+    selected = [first_view] + sorted(selected[1:])
 
     if len(selected) > 1:
         min_gap = min(
