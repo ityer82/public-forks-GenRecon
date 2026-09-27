@@ -331,11 +331,9 @@ def main(argv: list[str] | None = None) -> None:
                 with stage(f"Stage 0b: object discovery + detection (model={DISCOVERY_HF_MODEL})"):
                     from genrecon.utils.object_discovery import discover_objects
 
-                    objects = discover_objects(export_dir / "images", model_id=DISCOVERY_HF_MODEL)
+                    left_image, objects = discover_objects(export_dir / "images", model_id=DISCOVERY_HF_MODEL)
                     classes = [o["label"] for o in objects]
                     logger.info(f"Discovery: found {len(classes)} objects: {', '.join(classes)}")
-                left_image = next(p.name for p in sorted((export_dir / "images").glob("*.jpg"))
-                                  if "left" in p.name.lower())
                 discovered_classes_cache.write_text(json.dumps(classes, indent=2))
                 discovered_boxes_cache.write_text(json.dumps({
                     "left_image": left_image,

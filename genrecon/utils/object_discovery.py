@@ -91,22 +91,33 @@ def pair_by_y_overlap(left, right, min_y_iou: float = MIN_Y_IOU):
 
 
 def _find_stereo_pair(images_dir: Path) -> tuple[Path, Path]:
+    """A literal left/right-named pair (a genuine 2-image stereo capture) is used as-is. Otherwise
+    this is a multi-frame export (N sequential frames from a single moving camera, named e.g.
+    frame_000001.jpg) -- fall back to its first two frames by filename, treated as the "left" and
+    "right" views for detection-box pairing purposes."""
     images = sorted(images_dir.glob("*.jpg"))
     left = [p for p in images if "left" in p.name.lower()]
     right = [p for p in images if "right" in p.name.lower()]
-    if len(images) != 2 or len(left) != 1 or len(right) != 1:
-        raise RuntimeError(
-            f"Object discovery expects exactly one left and one right .jpg in {images_dir}, "
-            f"found {[p.name for p in images]}."
+    if len(images) == 2 and len(left) == 1 and len(right) == 1:
+        return left[0], right[0]
+    if len(images) >= 2:
+        logger.info(
+            f"Discovery: no left/right-named stereo pair in {images_dir}; falling back to its "
+            f"first two frames ({images[0].name}, {images[1].name}) as the left/right views."
         )
-    return left[0], right[0]
+        return images[0], images[1]
+    raise RuntimeError(
+        f"Object discovery needs at least 2 .jpg images in {images_dir}, found {[p.name for p in images]}."
+    )
 
 
-def discover_objects(export_images_dir: Path, model_id: str) -> list[dict]:
-    """Returns [{"label", "left_box", "right_box"}] (pixel xyxy on the left/right image), labels
-    unique and lowercase. Raises RuntimeError if the images are not a stereo pair, the model
-    fails or its reply can't be parsed, or no object survives the left/right pairing -- an empty
-    result would silently skip Stages 1-3."""
+def discover_objects(export_images_dir: Path, model_id: str) -> tuple[str, list[dict]]:
+    """Returns (left_image_name, [{"label", "left_box", "right_box"}]) (pixel xyxy on the
+    left/right image), labels unique and lowercase. left_image_name is the actual filename used
+    as the "left" view (see _find_stereo_pair) -- callers must use it rather than re-deriving it
+    from a "left" substring match, which only holds for a genuine 2-image stereo capture. Raises
+    RuntimeError if there aren't at least 2 images, the model fails or its reply can't be parsed,
+    or no object survives the left/right pairing -- an empty result would silently skip Stages 1-3."""
     import torch
     from PIL import Image
     from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
@@ -156,4 +167,4 @@ def discover_objects(export_images_dir: Path, model_id: str) -> list[dict]:
             f"Object discovery: no object had matching left and right boxes "
             f"(left={len(per_view[0])}, right={len(per_view[1])} detections)."
         )
-    return objects
+    return left_path.name, objects

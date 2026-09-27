@@ -609,15 +609,28 @@ def write_rejection_manifest(mask_dir, rejected_frames):
 
 
 def validate_lifted_points(cam_extrinsics, cam_intrinsics, mask_dir, label_dirs,
-                            class_points, device, depth_tolerance):
+                            class_points, device, depth_tolerance,
+                            ratio_threshold, min_visible_frames):
     """Cross-frame consistency filter, mirroring the previous 3D-point
     validate_assignments pass, now applied to lifted points instead of the
     sparse COLMAP cloud. Voxel-dedup in lift_class_pointclouds already gave
     each surviving point a fixed, single world-space identity; here that
     identity is reprojected into every camera frame (vote_view, same as
-    before) and dropped if it's visible in a frame where its class has a
-    real (non-empty) detection but the point falls outside that class's
-    mask there.
+    before), and its cross-frame foreground vote ratio (votes / frames
+    visible with a real detection -- same fg_ratio computed by
+    segment_one_label for single-class mode) is compared against
+    `ratio_threshold`. Ratio-based rather than all-or-nothing (an earlier
+    version rejected a point on any single cross-frame miss, which pruned
+    95% of points on a test scene -- occlusion and mask-boundary jitter
+    make an occasional miss normal even for a genuinely correct point) so
+    it tolerates a minority of misses while still catching points with
+    systematic cross-frame contamination (e.g. a mask leaking onto a
+    stray, consistently-outside-the-silhouette cluster).
+
+    A point visible-with-detection in fewer than `min_visible_frames`
+    frames is kept unconditionally: too few votes make the ratio swing
+    arbitrarily on a single sample (same fallback spirit as
+    MIN_FILTERED_POINTS in scripts/align_meshes_to_scene.py).
 
     Returns a new {class_name: (xyz, rgb)} dict (does not mutate input).
     """
@@ -629,21 +642,30 @@ def validate_lifted_points(cam_extrinsics, cam_intrinsics, mask_dir, label_dirs,
 
         pts = torch.from_numpy(xyz_c).float().to(device)
         mask_subdir = os.path.join(mask_dir, label_dirs[cls_name], "mask_bin")
-        violations = torch.zeros(pts.shape[0], dtype=torch.bool, device=device)
+        fg_votes = torch.zeros(pts.shape[0], dtype=torch.float32, device=device)
+        visible_counts = torch.zeros(pts.shape[0], dtype=torch.float32, device=device)
 
         for i, key in enumerate(cam_extrinsics):
             extr = cam_extrinsics[key]
             intr = cam_intrinsics[extr.camera_id]
             visible, fg_vote = vote_view(pts, extr, intr, mask_subdir, device, depth_tolerance)
-            violations |= visible & ~fg_vote
-            print(f"\r[validate:{cls_name}] [{i + 1}/{len(cam_extrinsics)}] {extr.name}: "
-                  f"{int(violations.sum())} violations so far", end="")
+            visible_counts += visible.float()
+            fg_votes += fg_vote.float()
+            print(f"\r[validate:{cls_name}] [{i + 1}/{len(cam_extrinsics)}] {extr.name}", end="")
         print()
 
-        keep = (~violations).cpu().numpy()
+        fg_ratio = torch.zeros(pts.shape[0], device=device)
+        labeled = visible_counts > 0
+        fg_ratio[labeled] = fg_votes[labeled] / visible_counts[labeled]
+
+        enough_evidence = visible_counts >= min_visible_frames
+        reject = enough_evidence & (fg_ratio <= ratio_threshold)
+        keep = (~reject).cpu().numpy()
+
         validated[cls_name] = (xyz_c[keep], rgb_c[keep])
-        print(f"[{cls_name}] {xyz_c.shape[0]} lifted, {int((~keep).sum())} reassigned to "
-              f"background, {int(keep.sum())} kept")
+        print(f"[{cls_name}] {xyz_c.shape[0]} lifted, {int((~keep).sum())} rejected "
+              f"(fg_ratio <= {ratio_threshold} over >= {min_visible_frames} votes), "
+              f"{int(keep.sum())} kept")
 
     return validated
 
@@ -772,6 +794,18 @@ def main():
                               "seed a 3D convex hull hypothesis (a frame with fewer points can "
                               "still be scored against the winning fused hull, just can't serve "
                               "as a seed itself).")
+    parser.add_argument("--point_consistency_ratio_thres", type=float, default=0.6,
+                         help="Multi-class mode: minimum fraction of cross-frame votes "
+                              "(visible-with-a-real-detection frames where the lifted point "
+                              "falls inside that class's mask) a lifted point must clear to "
+                              "survive validate_lifted_points. Ratio-based (not all-or-nothing) "
+                              "to tolerate legitimate per-frame misses (occlusion, mask-boundary "
+                              "jitter) while rejecting points with systematic cross-frame "
+                              "contamination. Tune per-run -- noisier tracks/masks may need lower.")
+    parser.add_argument("--point_consistency_min_frames", type=int, default=3,
+                         help="Multi-class mode: minimum visible-with-detection frames a lifted "
+                              "point needs before --point_consistency_ratio_thres applies; points "
+                              "with fewer are kept unconditionally (too little evidence to judge).")
     parser.add_argument("--mask_dir_override", type=str, default=None,
                          help="Read per-frame masks directly from this directory instead of "
                               "the derived <output>/masks/<text> (single-class mode only, i.e. "
@@ -838,9 +872,11 @@ def main():
     # (via reprojection overlap with each frame's mask), and drop (+
     # quarantine on disk) any frame outside that group -- catches a
     # wrong-instance track reseed (e.g. a text-only re-detection locking
-    # onto a different physical object of the same class) without the cost/
-    # fragility of validating every individual point (see validate_lifted_points
-    # below, which is disabled for exactly that reason).
+    # onto a different physical object of the same class), but it operates
+    # on whole frames -- a systematic, low-level contamination shared across
+    # most frames (e.g. a mask leaking onto a stray cluster) produces no
+    # single outlier frame for this to catch. validate_lifted_points below
+    # covers that gap at per-point granularity.
     class_points, rejected_frames = filter_by_hull_consensus(
         cam_extrinsics, cam_intrinsics, mask_dir, label_dirs, class_points,
         class_frame_ids, frame_names, device,
@@ -850,14 +886,15 @@ def main():
     write_rejection_manifest(mask_dir, rejected_frames)
 
     # Voxel-dedup above gave each surviving lifted point a fixed identity;
-    # cross-check that identity against every frame's mask, same as the old
-    # validate_assignments pass on the sparse COLMAP cloud.
-    # Disabled: the all-frames-must-agree rule pruned 95% of points on the
-    # toy scene (2558 -> 125), too aggressive for dense per-pixel lifted
-    # points vs. the old sparse COLMAP cloud it was designed for.
-    # class_points = validate_lifted_points(
-    #     cam_extrinsics, cam_intrinsics, mask_dir, label_dirs, class_points,
-    #     device, args.depth_tolerance)
+    # cross-check that identity's foreground vote ratio against every
+    # frame's mask (reads mask_bin fresh from disk, so it automatically
+    # sees quarantine_rejected_frames's blanked-out masks above -- votes
+    # aren't diluted by frames already known to be wrong-instance re-detects).
+    class_points = validate_lifted_points(
+        cam_extrinsics, cam_intrinsics, mask_dir, label_dirs, class_points,
+        device, args.depth_tolerance,
+        ratio_threshold=args.point_consistency_ratio_thres,
+        min_visible_frames=args.point_consistency_min_frames)
 
     export_debug_projections(
         cam_extrinsics, cam_intrinsics, mask_dir, label_dirs, class_points,
