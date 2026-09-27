@@ -17,8 +17,6 @@ import subprocess
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-# Local checkpoint copy of google/paligemma2-3b-pt-448 (moved out of the HF cache into the repo).
-DEFAULT_PALIGEMMA_CHECKPOINT = str(SCRIPT_DIR.parent / "checkpoints" / "paligemma" / "paligemma2-3b-pt-448")
 
 
 def run_stage(name, cmd, skip=False, skip_reason=None, read_from_drive=False):
@@ -68,8 +66,6 @@ def run_segmentation(
     skip_pc_segment: bool = False,
     read_from_drive: bool = False,
     flat_output: bool = False,
-    detector_backend: str = "groundingdino",
-    detection_hf_model: str = DEFAULT_PALIGEMMA_CHECKPOINT,
     detection_box_padding_frac: float = 0.05,
     boxes_json: str | None = None,
 ) -> None:
@@ -85,8 +81,6 @@ def run_segmentation(
     classes_flag = ["--classes", classes] if multi_class else []
 
     detector_flags = [
-        "--detector_backend", detector_backend,
-        "--detection_hf_model", detection_hf_model,
         "--detection_box_padding_frac", str(detection_box_padding_frac),
     ] + (["--boxes_json", boxes_json] if boxes_json else [])
 
@@ -176,17 +170,9 @@ def main():
                               "becomes exactly --output_root instead of --output_root/<scene>. "
                               "Useful when --output_root is already scene-specific (e.g. driven "
                               "by an external per-scene pipeline).")
-    parser.add_argument("--detector_backend", choices=["groundingdino", "hf"], default="groundingdino",
-                         help="Box-detection backend for Stage 1. 'hf' uses a "
-                              "locally-downloaded HF transformers PaliGemma checkpoint instead "
-                              "of Grounding DINO -- see segmentation/gemma_detection_utils_hf.py.")
-    parser.add_argument("--detection_hf_model", type=str, default=DEFAULT_PALIGEMMA_CHECKPOINT,
-                         help="HF PaliGemma model id, or a local checkpoint directory, used "
-                              "when --detector_backend hf. Defaults to the local copy at "
-                              "checkpoints/paligemma/paligemma2-3b-pt-448.")
     parser.add_argument("--detection_box_padding_frac", type=float, default=0.05,
-                         help="--detector_backend hf only: outward box padding fraction "
-                              "applied before SAM2 prompting.")
+                         help="Outward box padding fraction applied to --boxes_json-sourced "
+                              "boxes before SAM2 prompting.")
     args = parser.parse_args()
 
     try:
@@ -208,8 +194,6 @@ def main():
             skip_pc_segment=args.skip_pc_segment,
             read_from_drive=args.read_from_drive,
             flat_output=args.flat_output,
-            detector_backend=args.detector_backend,
-            detection_hf_model=args.detection_hf_model,
             detection_box_padding_frac=args.detection_box_padding_frac,
         )
     except ValueError as e:

@@ -131,8 +131,6 @@ def stage1_segmentation(
     depth_edge_rtol: float,
     seg_log: Path,
     log_mirror: LogMirror,
-    detector_backend: str = "groundingdino",
-    detection_hf_model: str = str(GENRECON_DIR / "checkpoints" / "paligemma" / "paligemma2-3b-pt-448"),
     detection_box_padding_frac: float = 0.05,
     boxes_json: Path | None = None,
 ) -> Path:
@@ -152,8 +150,6 @@ def stage1_segmentation(
             depth_conf_thres=depth_conf_thres,
             depth_edge_rtol=depth_edge_rtol,
             flat_output=True,
-            detector_backend=detector_backend,
-            detection_hf_model=detection_hf_model,
             detection_box_padding_frac=detection_box_padding_frac,
             boxes_json=str(boxes_json) if boxes_json else None,
         )

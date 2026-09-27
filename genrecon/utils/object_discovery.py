@@ -1,9 +1,18 @@
-"""One-shot open-vocabulary object discovery + detection for --discover-classes (an alternative
-to manually typing --classes). A local Qwen3-VL checkpoint is queried once per image of the
-stereo pair (left, right) and returns, for every object on the table, a short visually
-specific label and a bounding box. Boxes are paired across the two views by y-axis overlap
-(the pair is roughly rectified, so the same object occupies the same rows in both views); an
-object is kept only when its left and right boxes agree, and is named by its left label.
+"""One-shot object discovery + detection: pick-and-place mode's only box-retrieval mechanism. A
+local Qwen3-VL checkpoint is queried once per image of the stereo pair (left, right) and
+returns a short visually specific label and a bounding box for each object found. For a genuine
+stereo pair, boxes are paired across the two views by y-axis overlap (the pair is roughly
+rectified, so the same object occupies the same rows in both views); an object is kept only when
+its left and right boxes agree, and is named by its left label. When no genuine stereo pair is
+available and the first two frames of a sequential capture are used as a stand-in (see
+_find_stereo_pair), the y-overlap premise doesn't hold -- the two frames are just two moments of
+a moving camera, not a synchronized rig -- so that cross-view check is skipped and every
+left-view detection is trusted directly.
+
+With no explicit class list, the prompt free-invents both labels and boxes for everything on
+the table ("discovery"). With an explicit --classes list, the prompt is conditioned to look for
+exactly those objects instead, and each detection's label is reconciled back to its requested
+spelling (see discover_objects's `classes` param).
 
 Asking for both views' boxes in a single call was tried and makes the model copy the left
 boxes into the right view, so each image is queried on its own.
@@ -25,6 +34,22 @@ DETECTION_PROMPT = (
 )
 
 MIN_Y_IOU = 0.6  # minimum y-range overlap for a left/right box pair
+
+
+def _build_prompt(classes: list[str] | None) -> str:
+    """The unconditioned free-discovery prompt (DETECTION_PROMPT) when `classes` is empty,
+    otherwise a variant conditioned to look for exactly those objects."""
+    if not classes:
+        return DETECTION_PROMPT
+    class_list = ", ".join(classes)
+    return (
+        "This is a tabletop scene. Ignore robot arms, the table and background. Find each of "
+        f"the following objects if it is present on the table: {class_list}. For each one "
+        "found, give its exact label copied verbatim from that list and a tight bounding box. "
+        "Do not report any object that isn't in the list. Output only JSON: "
+        "[{\"label\": str, \"bbox_2d\": [x1, y1, x2, y2]}] with coordinates relative to the "
+        "image on a 0-1000 grid."
+    )
 
 
 def _parse_json_list(text: str) -> list | None:
@@ -90,40 +115,56 @@ def pair_by_y_overlap(left, right, min_y_iou: float = MIN_Y_IOU):
     return pairs
 
 
-def _find_stereo_pair(images_dir: Path) -> tuple[Path, Path]:
+def _find_stereo_pair(images_dir: Path) -> tuple[Path, Path, bool]:
     """A literal left/right-named pair (a genuine 2-image stereo capture) is used as-is. Otherwise
     this is a multi-frame export (N sequential frames from a single moving camera, named e.g.
     frame_000001.jpg) -- fall back to its first two frames by filename, treated as the "left" and
-    "right" views for detection-box pairing purposes."""
+    "right" views for detection-box pairing purposes. Returns (left_path, right_path, is_stereo);
+    is_stereo is False in the fallback case, telling discover_objects to skip the y-overlap
+    cross-view check (see module docstring)."""
     images = sorted(images_dir.glob("*.jpg"))
     left = [p for p in images if "left" in p.name.lower()]
     right = [p for p in images if "right" in p.name.lower()]
     if len(images) == 2 and len(left) == 1 and len(right) == 1:
-        return left[0], right[0]
+        return left[0], right[0], True
     if len(images) >= 2:
         logger.info(
             f"Discovery: no left/right-named stereo pair in {images_dir}; falling back to its "
             f"first two frames ({images[0].name}, {images[1].name}) as the left/right views."
         )
-        return images[0], images[1]
+        return images[0], images[1], False
     raise RuntimeError(
         f"Object discovery needs at least 2 .jpg images in {images_dir}, found {[p.name for p in images]}."
     )
 
 
-def discover_objects(export_images_dir: Path, model_id: str) -> tuple[str, list[dict]]:
+def discover_objects(
+    export_images_dir: Path, model_id: str, classes: list[str] | None = None,
+) -> tuple[str, list[dict]]:
     """Returns (left_image_name, [{"label", "left_box", "right_box"}]) (pixel xyxy on the
-    left/right image), labels unique and lowercase. left_image_name is the actual filename used
-    as the "left" view (see _find_stereo_pair) -- callers must use it rather than re-deriving it
-    from a "left" substring match, which only holds for a genuine 2-image stereo capture. Raises
-    RuntimeError if there aren't at least 2 images, the model fails or its reply can't be parsed,
-    or no object survives the left/right pairing -- an empty result would silently skip Stages 1-3."""
+    left/right image). left_image_name is the actual filename used as the "left" view (see
+    _find_stereo_pair) -- callers must use it rather than re-deriving it from a "left" substring
+    match, which only holds for a genuine 2-image stereo capture. Raises RuntimeError if there
+    aren't at least 2 images, the model fails or its reply can't be parsed, or no object
+    survives the left/right pairing -- an empty result would silently skip Stages 1-3.
+
+    With `classes` given, the prompt is conditioned to look for exactly those objects (see
+    _build_prompt) and each detection's label is reconciled back to its requested spelling
+    (case-insensitive match), so labels come back identical to the `classes` strings --
+    downstream --pick_place_target/--place-target matching and mesh dirnames depend on that
+    exact identity. Detections that don't match any requested class are dropped, and a warning
+    is logged for any requested class that goes undetected. Labels are lowercased only in the
+    unconditioned (classes=None) free-discovery case."""
     import torch
     from PIL import Image
     from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 
-    left_path, right_path = _find_stereo_pair(export_images_dir)
-    logger.info(f"Discovery: querying {model_id} on {left_path.name} and {right_path.name}")
+    left_path, right_path, is_stereo = _find_stereo_pair(export_images_dir)
+    prompt = _build_prompt(classes)
+    logger.info(
+        f"Discovery: querying {model_id} on {left_path.name} and {right_path.name}"
+        + (f" (conditioned on classes: {', '.join(classes)})" if classes else "")
+    )
 
     model = None
     try:
@@ -136,7 +177,7 @@ def discover_objects(export_images_dir: Path, model_id: str) -> tuple[str, list[
             image = Image.open(path).convert("RGB")
             messages = [{"role": "user", "content": [
                 {"type": "image", "image": image},
-                {"type": "text", "text": DETECTION_PROMPT},
+                {"type": "text", "text": prompt},
             ]}]
             inputs = processor.apply_chat_template(
                 messages, add_generation_prompt=True, tokenize=True, return_dict=True, return_tensors="pt",
@@ -154,17 +195,39 @@ def discover_objects(export_images_dir: Path, model_id: str) -> tuple[str, list[
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+    if is_stereo:
+        paired = pair_by_y_overlap(*per_view)
+    else:
+        logger.info(
+            "Discovery: not a genuine stereo pair -- skipping the y-overlap cross-view check "
+            "and trusting every left-view detection directly."
+        )
+        paired = [(label, box, box) for label, box in per_view[0]]
+
     objects, seen = [], set()
-    for label, left_box, right_box in pair_by_y_overlap(*per_view):
+    for label, left_box, right_box in paired:
+        if classes:
+            matched = next((c for c in classes if c.strip().lower() == label), None)
+            if matched is None:
+                logger.warning(f"Discovery: dropping detection '{label}' -- not in --classes")
+                continue
+            label = matched
         if label in seen:
             logger.warning(f"Discovery: dropping duplicate label '{label}'")
             continue
         seen.add(label)
         objects.append({"label": label, "left_box": left_box, "right_box": right_box})
 
+    if classes:
+        missing = [c for c in classes if c not in seen]
+        if missing:
+            logger.warning(f"Discovery: requested class(es) not detected: {', '.join(missing)}")
+
     if not objects:
-        raise RuntimeError(
-            f"Object discovery: no object had matching left and right boxes "
-            f"(left={len(per_view[0])}, right={len(per_view[1])} detections)."
-        )
+        if is_stereo:
+            raise RuntimeError(
+                f"Object discovery: no object had matching left and right boxes "
+                f"(left={len(per_view[0])}, right={len(per_view[1])} detections)."
+            )
+        raise RuntimeError(f"Object discovery: no object detected in {left_path.name}.")
     return left_path.name, objects

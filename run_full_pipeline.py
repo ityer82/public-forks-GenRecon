@@ -36,7 +36,6 @@ USE_TRELLIS = True
 MODES = ("pick-and-place", "full-scene", "full-scene-with-robot")
 FULL_SCENE_MODES = ("full-scene", "full-scene-with-robot")
 DISCOVERY_HF_MODEL = "Qwen/Qwen3-VL-8B-Instruct"  # one-shot object labels + boxes (Stage 0b)
-DETECTION_HF_MODEL = str(GENRECON_DIR / "checkpoints" / "paligemma" / "paligemma2-3b-pt-448")
 
 
 def _place_offset(s: str) -> tuple[float, float, float]:
@@ -59,28 +58,25 @@ def build_parser() -> argparse.ArgumentParser:
         "--skip-frames. -1 (default) uses all images.",
     )
     parser.add_argument("--rotate-horizontal-deg", type=float, default=0.0)
-    parser.add_argument("--classes", type=str, default=None)
     parser.add_argument(
-        "--discover-classes", dest="discover_classes", action=argparse.BooleanOptionalAction,
-        default=None,
-        help="Instead of --classes, ask a local vision-LLM (DISCOVERY_HF_MODEL, Qwen3-VL) to "
-        "propose object labels and left/right bounding boxes from Stage 0's exported stereo pair. pick-and-place mode only: ON by "
-        "default unless --classes, --pick_place_target, or --place-target is given (pass "
-        "--no-discover-classes to disable it explicitly). Explicitly passing --discover-classes "
-        "together with any of those, or in a full-scene mode, is an error. Compatible with "
-        "--ai-scene-agent, which then chooses among the discovered classes.",
+        "--classes", type=str, default=None,
+        help="Comma-separated object labels (e.g. \"banana,bowl\"). pick-and-place mode: "
+        "conditions Stage 0b's Qwen3-VL pass to look for exactly these objects instead of "
+        "freely discovering everything on the table (see --mode). full-scene mode: required, "
+        "passed to Grounding DINO.",
     )
     parser.add_argument(
         "--mode", dest="mode", choices=list(MODES), default="pick-and-place",
-        help="Run mode. 'pick-and-place' (default): HF/PaliGemma detector; classes are "
-        "discovered (unless --classes is given) and a random pick/place pair is chosen. "
+        help="Run mode. 'pick-and-place' (default): a Qwen3-VL pass (Stage 0b) always retrieves "
+        "object labels + boxes -- conditioned on --classes if given, else freely discovering "
+        "every object on the table -- and a random pick/place pair is chosen. "
         "'full-scene': Grounding DINO detector; requires --classes; full-scene reconstruction. "
         "'full-scene-with-robot': like full-scene, then a robot-collision demo against a "
         "randomly chosen class (or --robot-target if given).",
     )
     parser.add_argument(
         "--detection-box-padding-frac", dest="detection_box_padding_frac", type=float, default=0.05,
-        help="pick-and-place mode (hf backend) only: outward padding applied to each detected box "
+        help="pick-and-place mode only: outward padding applied to each Stage 0b-discovered box "
         "(as a fraction of its own width/height) before it's used to prompt SAM2. Mitigates "
         "an undershoot failure mode found in testing where a box that doesn't fully enclose "
         "its object makes SAM2 truncate the mask at the wrong edge.",
@@ -145,14 +141,10 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace, log
         parser.error(f"Image folder not found: {args.image_folder}")
 
     full_scene_mode = args.mode in FULL_SCENE_MODES
-    args.detector_backend = "groundingdino" if full_scene_mode else "hf"
 
     if full_scene_mode:
         if not args.classes:
             parser.error(f"--mode {args.mode} requires --classes.")
-        if args.discover_classes:
-            parser.error(f"--mode {args.mode} does not support --discover-classes; pass --classes.")
-        args.discover_classes = False
         for flag, value in (
             ("--pick_place_target", args.pick_place_target),
             ("--place-target", args.place_target),
@@ -167,35 +159,19 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace, log
     elif args.robot_target:
         parser.error("--robot-target requires --mode full-scene-with-robot.")
 
-    if args.discover_classes is None:
-        args.discover_classes = not (
-            args.classes or args.pick_place_target or args.place_target
-        )
-
-    if args.discover_classes:
-        if args.classes:
-            parser.error("--discover-classes and --classes are mutually exclusive.")
-        if args.pick_place_target:
-            parser.error("--discover-classes and --pick_place_target are mutually exclusive.")
-        if args.place_target:
-            parser.error("--discover-classes and --place-target are mutually exclusive.")
-
     # pick-and-place picks a random pair unless the pick target is given or the scene agent chooses.
     args.random_pick_place = (
         args.mode == "pick-and-place" and not args.pick_place_target and not args.ai_scene_agent
     )
-    if args.random_pick_place and not args.classes and not args.discover_classes:
-        parser.error("--mode pick-and-place requires --classes or class discovery (--discover-classes).")
 
     classes = [c.strip() for c in args.classes.split(",")] if args.classes else []
 
+    # In pick-and-place mode, Stage 0b's Qwen3-VL pass always runs and always ends up populating
+    # `classes` (conditioned on --classes if given, else freely discovered) by the time Stage 1
+    # needs them, so per-class mesh reconstruction is never skipped there. It's only skipped in
+    # full-scene mode without --classes -- but --classes is required there (checked above), so
+    # `classes` is never empty at this point either.
     use_trellis = USE_TRELLIS
-    if use_trellis and not classes and not args.discover_classes and not args.ai_scene_agent:
-        logger.info(
-            "Note: --classes not set, so per-class mesh reconstruction (enabled by default) "
-            "does not apply to this run."
-        )
-        use_trellis = False
 
     if not MVSAM3D_VENDOR_DIR.is_dir():
         parser.error(f"Requires the vendored MV-SAM3D source at {MVSAM3D_VENDOR_DIR}.")
@@ -224,14 +200,6 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace, log
             parser.error("--ai-scene-agent and --pick_place_target are mutually exclusive.")
         if args.robot_target:
             parser.error("--ai-scene-agent and --robot-target are mutually exclusive.")
-        if not classes and not args.discover_classes and args.start_from_stage <= 3:
-            parser.error(
-                "--ai-scene-agent requires --classes or --discover-classes when "
-                "--start-from-stage <= 3 (Stage 1-3 need a class list to segment and mesh the "
-                "objects it asks about); pass one of them, or use --start-from-stage > 3 to "
-                "discover classes from "
-                f"existing meshes under {GENRECON_DIR / 'runs' / args.scene_name / 'image_to_3d_meshes'}."
-            )
         if not use_trellis:
             logger.info("Note: --ai-scene-agent requires a per-object mesh for every --classes label; overriding use_trellis to on for this run.")
             use_trellis = True
@@ -313,12 +281,12 @@ def main(argv: list[str] | None = None) -> None:
             logger.info(f"Stage 0: skipped (--start-from-stage {args.start_from_stage}), assuming existing export at {export_dir}")
         check_stop_after_stage(0)
 
-        if args.discover_classes:
+        if args.mode == "pick-and-place":
             # Cached to run_dir so a --start-from-stage rerun that skips Stage 1 (segmentation)
             # can't silently diverge from the class list Stage 1 actually segmented against --
-            # discovery is model-sampled (non-zero temperature) and can legitimately return
-            # different phrasing across calls on the same images, which would otherwise leave
-            # a later stage looking for masks under class names Stage 1 never produced.
+            # discovery is model-sampled and can legitimately return different phrasing across
+            # calls on the same images, which would otherwise leave a later stage looking for
+            # masks under class names Stage 1 never produced.
             discovered_classes_cache = run_dir / "discovered_classes.json"
             discovered_boxes_cache = run_dir / "discovered_boxes.json"
             if args.start_from_stage > 0 and discovered_classes_cache.exists() and discovered_boxes_cache.exists():
@@ -331,7 +299,9 @@ def main(argv: list[str] | None = None) -> None:
                 with stage(f"Stage 0b: object discovery + detection (model={DISCOVERY_HF_MODEL})"):
                     from genrecon.utils.object_discovery import discover_objects
 
-                    left_image, objects = discover_objects(export_dir / "images", model_id=DISCOVERY_HF_MODEL)
+                    left_image, objects = discover_objects(
+                        export_dir / "images", model_id=DISCOVERY_HF_MODEL, classes=classes or None,
+                    )
                     classes = [o["label"] for o in objects]
                     logger.info(f"Discovery: found {len(classes)} objects: {', '.join(classes)}")
                 discovered_classes_cache.write_text(json.dumps(classes, indent=2))
@@ -371,8 +341,6 @@ def main(argv: list[str] | None = None) -> None:
                         depth_edge_rtol=args.depth_edge_rtol,
                         seg_log=seg_log,
                         log_mirror=log_mirror,
-                        detector_backend=args.detector_backend,
-                        detection_hf_model=DETECTION_HF_MODEL,
                         detection_box_padding_frac=args.detection_box_padding_frac,
                         boxes_json=boxes_json,
                     )

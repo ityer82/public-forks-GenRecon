@@ -16,10 +16,6 @@ from track_utils import sample_points_from_masks
 from video_utils import create_video_from_images
 from groundingdino.util.inference import load_model, load_image
 from detection_utils import detect_frame_boxes, match_detections_to_classes, detect_classes_in_all_frames
-from gemma_detection_utils_hf import (
-    detect_frame_boxes_hf, detect_classes_in_frames_hf, match_detections_to_classes_hf,
-    PaliGemmaDetector, pad_box_xyxy,
-)
 
 from scene.colmap_loader import (
     read_extrinsics_binary, read_extrinsics_text,
@@ -31,9 +27,23 @@ from scene.frustum_utils import lift_box_to_frustum, reproject_frustum_area_frac
 import argparse
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-# Local checkpoint copy of google/paligemma2-3b-pt-448 (moved out of the HF cache into the repo
-# -- see checkpoints/paligemma/download_ckpts.sh-equivalent note in gemma_detection_utils_hf.py).
-DEFAULT_PALIGEMMA_CHECKPOINT = os.path.join(REPO_ROOT, "checkpoints", "paligemma", "paligemma2-3b-pt-448")
+
+
+def pad_box_xyxy(box, width, height, pad_frac):
+    """Expand a box outward by pad_frac of its own width/height on each side, clamped to
+    image bounds. Mitigates the undershoot failure mode found in testing (a box that
+    doesn't fully enclose its object makes SAM2 truncate the mask at the wrong edge) --
+    applied to boxes sourced from Stage 0b discovery (see --boxes_json below)."""
+    x1, y1, x2, y2 = box
+    w, h = x2 - x1, y2 - y1
+    dx, dy = w * pad_frac, h * pad_frac
+    return [
+        max(0.0, x1 - dx),
+        max(0.0, y1 - dy),
+        min(float(width), x2 + dx),
+        min(float(height), y2 + dy),
+    ]
+
 
 # FIXME: figure how does this influence the G-DINO model
 torch.autocast(device_type="cuda", dtype=torch.float16).__enter__()
@@ -81,28 +91,17 @@ parser.add_argument('--reproj_area_threshold', type=float, default=0.02,
 parser.add_argument('--frustum_box_margin', type=float, default=0.0,
                      help="Pixel margin added around a detection box when sampling COLMAP "
                           "points to estimate its 3D frustum's depth extent.")
-parser.add_argument('--detector_backend', choices=['groundingdino', 'hf'], default='groundingdino',
-                     help="Box-detection backend. 'groundingdino' (default) is unchanged "
-                          "existing behavior. 'hf' uses a locally-downloaded HF "
-                          "transformers PaliGemma checkpoint instead (see "
-                          "gemma_detection_utils_hf.py) -- Gemma-3 chat models were tested "
-                          "and don't reliably ground boxes; PaliGemma does.")
-parser.add_argument('--detection_hf_model', type=str, default=DEFAULT_PALIGEMMA_CHECKPOINT,
-                     help="HF PaliGemma model id, or a local checkpoint directory, used when "
-                          "--detector_backend hf. Defaults to the local copy at "
-                          "checkpoints/paligemma/paligemma2-3b-pt-448; falls back to "
-                          "downloading a HF Hub repo id if pointed at one instead.")
 parser.add_argument('--boxes_json', type=str, default=None,
                      help="JSON from Stage 0b discovery ({'left_image': name, 'objects': {label: "
                           "{'left_box': [x1,y1,x2,y2], ...}}}, pixel coords). With --classes, the "
-                          "class boxes are taken from here instead of running a detector.")
+                          "class boxes are taken from here instead of running Grounding DINO.")
 parser.add_argument('--detection_box_padding_frac', type=float, default=0.05,
-                     help="--detector_backend hf only: outward padding applied to each "
-                          "detected box (as a fraction of its own width/height) before it's "
-                          "used to prompt SAM2. Mitigates the undershoot failure mode found "
-                          "in testing, where a box that doesn't fully enclose its object "
-                          "makes SAM2 truncate the mask at the wrong edge. Grounding DINO's "
-                          "boxes get no padding (different failure mode, not needed).")
+                     help="Outward padding applied to each --boxes_json-sourced box (as a "
+                          "fraction of its own width/height) before it's used to prompt SAM2. "
+                          "Mitigates the undershoot failure mode found in testing, where a box "
+                          "that doesn't fully enclose its object makes SAM2 truncate the mask "
+                          "at the wrong edge. Grounding DINO's boxes get no padding (different "
+                          "failure mode, not needed).")
 args = parser.parse_args()
 
 multi_class = args.classes is not None
@@ -116,23 +115,15 @@ video_predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint)
 sam2_image_model = build_sam2(model_cfg, sam2_checkpoint)
 image_predictor = SAM2ImagePredictor(sam2_image_model)
 
-# build grounding dino model (skipped for --detector_backend hf, which loads PaliGemma
-# in-process below)
+# build grounding dino model (skipped when --boxes_json is given, which needs no detector)
 device = "cuda" if torch.cuda.is_available() else "cpu"
 grounding_model = None
-if args.detector_backend == 'groundingdino':
+if args.boxes_json is None:
     grounding_model = load_model(
         model_config_path=os.path.join(REPO_ROOT, "checkpoints", "groundingdino", "GroundingDINO_SwinB_cfg.py"),
         model_checkpoint_path=os.path.join(REPO_ROOT, "checkpoints", "groundingdino", "ckpts", "groundingdino_swinb_cogcoor.pth"),
         device=device
     )
-
-# --detector_backend hf: load the PaliGemma checkpoint once for the whole run (this script is
-# already its own subprocess -- see main_light.py -- so process exit frees its GPU memory, same
-# as grounding_model above; no persistent-worker/atexit machinery needed).
-hf_detector = None
-if args.detector_backend == 'hf' and args.boxes_json is None:
-    hf_detector = PaliGemmaDetector(args.detection_hf_model)
 # setup the input image and text prompt for SAM 2 and Grounding DINO
 # VERY important: text queries need to be lowercased + end with a dot
 
@@ -217,11 +208,6 @@ if args.classes is not None:
                 raise SystemExit(f"[error] class '{cls}' has no box in {args.boxes_json}")
             box = pad_box_xyxy(obj["left_box"], box_w, box_h, args.detection_box_padding_frac)
             class_to_detections[cls] = {"frame_idx": left_idx, "boxes": [box], "confidences": [1.0]}
-    elif args.detector_backend == 'hf':
-        class_to_detections = detect_classes_in_frames_hf(
-            video_dir, frame_names, candidate_classes, hf_detector,
-            box_padding_frac=args.detection_box_padding_frac,
-        )
     else:
         class_to_detections = detect_classes_in_all_frames(
             video_dir, frame_names, grounding_model, candidate_classes, detect_caption,
@@ -248,18 +234,10 @@ else:
     img_path = os.path.join(video_dir, frame_names[ann_frame_idx])
     image_source, image = load_image(img_path)
 
-    if args.detector_backend == 'hf':
-        anchor_height, anchor_width, _ = image_source.shape
-        hf_candidate_classes = candidate_classes if multi_class else [text]
-        input_boxes, confidences, class_names = detect_frame_boxes_hf(
-            img_path, hf_candidate_classes, anchor_width, anchor_height, hf_detector,
-            box_padding_frac=args.detection_box_padding_frac,
-        )
-    else:
-        input_boxes, confidences, class_names = detect_frame_boxes(
-            grounding_model, image_source, image, detect_caption,
-            box_threshold=0.3, text_threshold=0.45, remove_combined=multi_class,
-        )
+    input_boxes, confidences, class_names = detect_frame_boxes(
+        grounding_model, image_source, image, detect_caption,
+        box_threshold=0.3, text_threshold=0.45, remove_combined=multi_class,
+    )
 
     labels = [
         f"{class_name} {confidence:.2f}"
@@ -270,12 +248,8 @@ else:
     confidences_arr = np.array(confidences)
 
     if multi_class:
-        if args.detector_backend == 'hf':
-            kept_indices, OBJECT_CLASSES = match_detections_to_classes_hf(
-                class_names, candidate_classes)
-        else:
-            kept_indices, OBJECT_CLASSES = match_detections_to_classes(
-                class_names, confidences, candidate_classes)
+        kept_indices, OBJECT_CLASSES = match_detections_to_classes(
+            class_names, confidences, candidate_classes)
         high_confidence_indices = kept_indices
         max_confidence = np.max(confidences_arr) if len(confidences_arr) else 0.0
     else:
@@ -549,19 +523,12 @@ while global_idx < len(frame_names):
         img_path = os.path.join(video_dir, frame_names[global_idx])
         print(f"empty mask for classes {missing_classes}: " + img_path)
         image_source, image = load_image(img_path)
-        if args.detector_backend == 'hf':
-            redetect_height, redetect_width, _ = image_source.shape
-            input_boxes_det, confidences_det, class_names_det = detect_frame_boxes_hf(
-                img_path, missing_classes, redetect_width, redetect_height, hf_detector,
-                box_padding_frac=args.detection_box_padding_frac,
-            )
-        else:
-            input_boxes_det, confidences_det, class_names_det = detect_frame_boxes(
-                grounding_model, image_source, image, detect_caption,
-                box_threshold=0.5,
-                text_threshold=0.5,
-                remove_combined=multi_class,
-            )
+        input_boxes_det, confidences_det, class_names_det = detect_frame_boxes(
+            grounding_model, image_source, image, detect_caption,
+            box_threshold=0.5,
+            text_threshold=0.5,
+            remove_combined=multi_class,
+        )
         if len(input_boxes_det) == 0:
             global_idx += 1
             continue
@@ -571,12 +538,8 @@ while global_idx < len(frame_names):
         # whatever boxes come back in the detector's incidental order),
         # restricted to the classes actually missing here, so a re-detect
         # can never rebind one class's object_id to another class's box.
-        if args.detector_backend == 'hf':
-            kept_indices, matched_classes = match_detections_to_classes_hf(
-                class_names_det, missing_classes)
-        else:
-            kept_indices, matched_classes = match_detections_to_classes(
-                class_names_det, confidences_det, missing_classes)
+        kept_indices, matched_classes = match_detections_to_classes(
+            class_names_det, confidences_det, missing_classes)
         reseed_obj_ids = []
         reseed_boxes = []
         for kept_idx, matched_cls in zip(kept_indices, matched_classes):
