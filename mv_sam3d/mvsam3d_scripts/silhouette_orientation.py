@@ -4,7 +4,7 @@ Pick an object mesh's yaw by silhouette IoU against the real per-view object mas
 Used by collect_mvsam3d_outputs.py after the SAM3D pose has been mapped into the scene's
 gravity-aligned (Z-up) world frame. Candidates are the untouched SAM3D pose plus rotations
 about the vertical axis through the mesh centroid; each is rendered into the DA3 cameras
-(after the same bbox scale+translation fit Stage 10 applies, so orientation is the only
+(after the same bbox scale+translation fit Stage 8 applies, so orientation is the only
 difference) and scored by mean IoU with the object's SAM mask. Unlike a one-sided 3D ICP
 cost against a partial point cloud, the silhouettes make an upside-down or back-to-front
 pose score clearly worse.

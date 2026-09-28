@@ -40,7 +40,7 @@ def _split_classes(classes_csv: str | None) -> list[str]:
 def sanitize_label(label: str) -> str:
     """Mirrors labels.json's sanitize_label (spaces/slashes -> underscores), used wherever a
     scene-side artifact (shapes/, glb/) is keyed by the sanitized dirname instead of the raw
-    --classes spelling (image_to_3d_meshes/, mv_sam3d_input/) -- including the USD prim names
+    --classes spelling (stage_2_mv_sam3d/, stage_2_mv_sam3d/input/) -- including the USD prim names
     compose_isaac_scene.py derives from those dirnames, which is why run_full_pipeline.py also
     applies this to --pick-target/--place-target/--robot-target before invoking Isaac Sim: those
     prims are always named from the sanitized dirname, never the raw (possibly multi-word)
@@ -111,7 +111,12 @@ def stage0_vggt_export(
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    cameras_txt = export_dir / "sparse" / "0" / "cameras.txt"
+    # Rename to the layout GenRecon's image loader expects (<dir>/rgb next to <dir>/colmap).
+    (export_dir / "images").rename(export_dir / "rgb")
+    (export_dir / "sparse" / "0").rename(export_dir / "colmap")
+    (export_dir / "sparse").rmdir()
+
+    cameras_txt = export_dir / "colmap" / "cameras.txt"
     if not cameras_txt.exists():
         raise FileNotFoundError(f"Expected COLMAP export not found at {cameras_txt}")
 
@@ -134,7 +139,7 @@ def stage1_segmentation(
     detection_box_padding_frac: float = 0.05,
     boxes_json: Path | None = None,
 ) -> Path:
-    """Returns the COB-GS mask directory (output_root/masks/classes)."""
+    """Returns the COB-GS mask directory (output_root itself: labels.json + one dir per class)."""
     _ensure_on_path(GENRECON_DIR / "segmentation")
     from main_light import run_segmentation
 
@@ -155,7 +160,7 @@ def stage1_segmentation(
         )
     log_mirror.mirror(seg_log)
 
-    cobgs_mask_dir = output_root / "masks" / "classes"
+    cobgs_mask_dir = output_root
     labels_json = cobgs_mask_dir / "labels.json"
     if not labels_json.exists():
         raise FileNotFoundError(f"Expected segmentation labels.json not found at {labels_json}")
@@ -163,30 +168,18 @@ def stage1_segmentation(
 
 
 # ---------------------------------------------------------------------------
-# Stage 2: RGBA best-view mask export
+# Stage 2: per-class 3D reconstruction (MV-SAM3D backend)
 # ---------------------------------------------------------------------------
 
 
-def stage2_export_rgba_masks(images_dir: Path, masks_root: Path) -> None:
-    _ensure_on_path(GENRECON_DIR / "scripts")
-    from export_rgba_masks import export_rgba_masks
-
-    export_rgba_masks(images_dir, masks_root)
-
-
-# ---------------------------------------------------------------------------
-# Stage 3: per-class 3D reconstruction (MV-SAM3D backend)
-# ---------------------------------------------------------------------------
-
-
-def stage3_mvsam3d(
+def stage2_mvsam3d(
     run_dir: Path,
     scene_name: str,
     classes: list[str],
     image_to_3d_output_dir: Path,
     *,
     mvsam3d_vendor_dir: Path,
-    seg_log: Path,
+    log_file: Path,
     log_mirror: LogMirror,
     cobgs_mask_dir: Path | None = None,
     stage1_steps: int = 25,
@@ -197,12 +190,13 @@ def stage3_mvsam3d(
     from collect_mvsam3d_outputs import collect_mvsam3d_outputs
     from import_from_genrecon import import_from_genrecon
 
-    mvsam3d_input_dir = run_dir / f"{scene_name}_mvsam3d_input"
-    mvsam3d_dataset_name = mvsam3d_input_dir.name
+    mvsam3d_input_dir = image_to_3d_output_dir / "input"
+    # Must match run_inference_weighted._dataset_name_for(), which keys visualization/ by scene.
+    mvsam3d_dataset_name = f"{scene_name}_mvsam3d_input"
 
-    with redirect_fd_to_file(seg_log, append=True):
+    with redirect_fd_to_file(log_file, append=False):
         import_from_genrecon(run_dir, mvsam3d_input_dir, classes)
-    log_mirror.mirror(seg_log)
+    log_mirror.mirror(log_file)
 
     _ensure_on_path(mvsam3d_vendor_dir)
     from run_inference_weighted import run_multiobject_inference, run_weighted_inference
@@ -234,7 +228,7 @@ def stage3_mvsam3d(
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    with redirect_fd_to_file(seg_log, append=True):
+    with redirect_fd_to_file(log_file, append=True):
         failures = collect_mvsam3d_outputs(
             mvsam3d_vendor_dir / "visualization",
             mvsam3d_dataset_name,
@@ -243,7 +237,7 @@ def stage3_mvsam3d(
             scene_pointcloud_dir=cobgs_mask_dir,
             mvsam3d_input_dir=mvsam3d_input_dir,
         )
-    log_mirror.mirror(seg_log)
+    log_mirror.mirror(log_file)
     if failures:
         raise RuntimeError(f"MV-SAM3D collection failed for labels: {failures}")
 
@@ -333,7 +327,7 @@ def stageP1_align_meshes(
         out_dir = pick_place_glb_dir / sanitized_label
         out_dir.mkdir(parents=True, exist_ok=True)
 
-        trellis_glb = run_dir / "image_to_3d_meshes" / label / "mesh.glb"
+        trellis_glb = run_dir / "stage_2_mv_sam3d" / label / "mesh.glb"
         scale_ref_ply = cobgs_mask_dir / sanitized_label / "point_cloud" / f"{sanitized_label}.ply"
         if not trellis_glb.exists():
             raise FileNotFoundError(f"Expected TRELLIS.2 mesh not found at {trellis_glb}")
@@ -435,26 +429,11 @@ def stageP4_franka_pickplace(
 
 
 # ---------------------------------------------------------------------------
-# Stage 4: stage GenRecon scene dir
+# Stage 3: GenRecon reconstruction + GLB bake inputs (exp2 settings)
 # ---------------------------------------------------------------------------
 
 
-def stage4_stage_scene_dir(export_dir: Path, scene_dir: Path) -> None:
-    scene_dir.mkdir(parents=True, exist_ok=True)
-    rgb_link = scene_dir / "rgb"
-    rgb_link.unlink(missing_ok=True)
-    rgb_link.symlink_to(export_dir / "images")
-    colmap_link = scene_dir / "colmap"
-    colmap_link.unlink(missing_ok=True)
-    colmap_link.symlink_to(export_dir / "sparse" / "0")
-
-
-# ---------------------------------------------------------------------------
-# Stage 5: GenRecon reconstruction + GLB bake inputs (exp2 settings)
-# ---------------------------------------------------------------------------
-
-
-def stage5_reconstruct_scene(
+def stage3_reconstruct_scene(
     scene_dir: Path,
     output_dir: Path,
     classes: list[str],
@@ -487,11 +466,11 @@ def stage5_reconstruct_scene(
 
 
 # ---------------------------------------------------------------------------
-# Stage 6: reprojection validation
+# Stage 4: reprojection validation
 # ---------------------------------------------------------------------------
 
 
-def stage6_reprojection_validation(output_dir: Path, scene_dir: Path, classes: list[str]) -> None:
+def stage4_reprojection_validation(output_dir: Path, scene_dir: Path, classes: list[str], validation_dir: Path) -> None:
     _ensure_on_path(GENRECON_DIR / "scripts")
     from render_reprojection_validation import run_reprojection_validation
 
@@ -500,28 +479,13 @@ def stage6_reprojection_validation(output_dir: Path, scene_dir: Path, classes: l
         reprojection_mesh_ply,
         scene_dir / "colmap",
         scene_dir / "rgb",
-        output_dir / "synth_views",
-        output_dir / "compare_views",
+        validation_dir / "synth_views",
+        validation_dir / "compare_views",
     )
 
 
 # ---------------------------------------------------------------------------
-# Stage 7: collect shapes (reconstructed mesh + per-class point clouds)
-# ---------------------------------------------------------------------------
-
-
-def stage7_collect_shapes(output_dir: Path, classes: list[str], cobgs_mask_dir: Path | None) -> Path:
-    shapes_dir = output_dir / "shapes"
-    shapes_dir.mkdir(parents=True, exist_ok=True)
-    shutil.move(str(output_dir / "mesh.ply"), str(shapes_dir / "mesh.ply"))
-    if classes and cobgs_mask_dir is not None:
-        for ply in cobgs_mask_dir.glob("*/point_cloud/*.ply"):
-            shutil.copy2(ply, shapes_dir / ply.name)
-    return shapes_dir
-
-
-# ---------------------------------------------------------------------------
-# Stage 8: per-object mesh extraction (cascading convex hull crop)
+# Stage 5: per-object mesh extraction (cascading convex hull crop)
 # ---------------------------------------------------------------------------
 
 
@@ -530,7 +494,7 @@ FLOATER_CONTAINMENT_FRAC = 0.95
 FLOATER_MAX_FACES = 5000
 
 
-def stage8_extract_object_meshes(
+def stage5_extract_object_meshes(
     shapes_dir: Path,
     scene_dir: Path,
     cobgs_mask_dir: Path,
@@ -541,13 +505,13 @@ def stage8_extract_object_meshes(
     from extract_object_mesh import extract_object_mesh
     from remove_floater_mesh import remove_floater_mesh
 
+    shapes_dir.mkdir(parents=True, exist_ok=True)
     object_source_mesh = output_dir / "object_source_mesh.ply"
     background_mesh = shapes_dir / "background_mesh.ply"
-    shutil.copyfile(shapes_dir / "mesh.ply", background_mesh)
+    shutil.copyfile(output_dir / "mesh.ply", background_mesh)
 
-    for obj_ply in sorted(shapes_dir.glob("*.ply")):
-        obj_name = obj_ply.name
-        if obj_name in ("mesh.ply", "background.ply") or obj_name.endswith(("_mesh.ply", "_floaters.ply")):
+    for obj_ply in sorted(cobgs_mask_dir.glob("*/point_cloud/*.ply")):
+        if obj_ply.name == "background.ply":
             continue
         label = obj_ply.stem
 
@@ -561,7 +525,7 @@ def stage8_extract_object_meshes(
             masks_dir=cobgs_mask_dir / label / "mask_bin",
         )
         if not ok:
-            logger.warning(f"Stage 8: extract_object_mesh soft-failed for {label!r}, continuing.")
+            logger.warning(f"Stage 5: extract_object_mesh soft-failed for {label!r}, continuing.")
 
         remove_floater_mesh(
             background_mesh,
@@ -575,11 +539,11 @@ def stage8_extract_object_meshes(
 
 
 # ---------------------------------------------------------------------------
-# Stage 9: floor segmentation + friction inference
+# Stage 6: floor segmentation + friction inference
 # ---------------------------------------------------------------------------
 
 
-def stage9_floor_and_friction(
+def stage6_floor_and_friction(
     shapes_dir: Path,
     cobgs_mask_dir: Path,
     *,
@@ -602,11 +566,11 @@ def stage9_floor_and_friction(
 
 
 # ---------------------------------------------------------------------------
-# Stage 10: per-object mesh -> GLB (+ MV-SAM3D substitution)
+# Stage 7: per-object mesh -> GLB (+ MV-SAM3D substitution)
 # ---------------------------------------------------------------------------
 
 
-def stage10_mesh_to_glb(
+def stage7_mesh_to_glb(
     shapes_dir: Path,
     run_dir: Path,
     classes: list[str],
@@ -626,13 +590,13 @@ def stage10_mesh_to_glb(
     apply_zup_correction = False
     for label in classes:
         sanitized_label = sanitize_label(label)
-        trellis_glb = run_dir / "image_to_3d_meshes" / label / "mesh.glb"
+        trellis_glb = run_dir / "stage_2_mv_sam3d" / label / "mesh.glb"
         scene_crop_ply = shapes_dir / f"{sanitized_label}_mesh.ply"
         if not trellis_glb.exists():
-            logger.info(f"Stage 10: --use-trellis: no TRELLIS.2 mesh for '{label}' at {trellis_glb}, keeping scene-crop glb.")
+            logger.info(f"Stage 7: --use-trellis: no TRELLIS.2 mesh for '{label}' at {trellis_glb}, keeping scene-crop glb.")
             continue
         if not scene_crop_ply.exists():
-            logger.info(f"Stage 10: --use-trellis: no scene crop for '{label}' at {scene_crop_ply}, keeping scene-crop glb.")
+            logger.info(f"Stage 7: --use-trellis: no scene crop for '{label}' at {scene_crop_ply}, keeping scene-crop glb.")
             continue
 
         scene, _transform, diagnostics = align_trellis_mesh_to_scene(
@@ -641,15 +605,15 @@ def stage10_mesh_to_glb(
         out_glb = glb_dir / sanitized_label / "mesh.glb"
         out_glb.parent.mkdir(parents=True, exist_ok=True)
         scene.export(out_glb)
-        logger.info(f"Stage 10: substituted {out_glb} with TRELLIS mesh (scale={diagnostics['scale']:.4f})")
+        logger.info(f"Stage 7: substituted {out_glb} with TRELLIS mesh (scale={diagnostics['scale']:.4f})")
 
 
 # ---------------------------------------------------------------------------
-# Stage 11/12: convert_asset.py -> compose_isaac_scene.py (Isaac subprocess stages)
+# Stage 8/9: convert_asset.py -> compose_isaac_scene.py (Isaac subprocess stages)
 # ---------------------------------------------------------------------------
 
 
-def stage11_convert_asset(
+def stage8_convert_asset(
     shapes_dir: Path,
     classes: list[str],
     *,
@@ -665,7 +629,7 @@ def stage11_convert_asset(
         args += ["--friction-table", str(friction_json), "--friction-combine-mode", "max"]
 
     run_external_step(
-        "stage11_convert_asset",
+        "stage8_convert_asset",
         isaacsim_dir / "convert_asset.py",
         isaacsim_dir,
         args,
@@ -675,7 +639,7 @@ def stage11_convert_asset(
     )
 
 
-def stage12_compose_isaac_scene(
+def stage9_compose_isaac_scene(
     shapes_dir: Path,
     *,
     isaacsim_dir: Path,
@@ -685,7 +649,7 @@ def stage12_compose_isaac_scene(
     extra_args: list[str],
 ) -> None:
     run_external_step(
-        "stage12_compose_isaac_scene",
+        "stage9_compose_isaac_scene",
         isaacsim_dir / "compose_isaac_scene.py",
         isaacsim_dir,
         ["--input", str(shapes_dir / "glb"), "--output", str(shapes_dir / "glb" / "scene.usda"), "--background-label", "background", *extra_args],
@@ -696,11 +660,11 @@ def stage12_compose_isaac_scene(
 
 
 # ---------------------------------------------------------------------------
-# Stage 13: chunked GLB bake
+# Stage 10: chunked GLB bake
 # ---------------------------------------------------------------------------
 
 
-def stage13_chunked_to_glb(output_dir: Path, *, simplify_threshold: int, texture_size: int) -> None:
+def stage10_chunked_to_glb(output_dir: Path, *, simplify_threshold: int, texture_size: int) -> None:
     from chunked_to_glb import run_chunked_to_glb
 
     run_chunked_to_glb(
@@ -713,29 +677,29 @@ def stage13_chunked_to_glb(output_dir: Path, *, simplify_threshold: int, texture
 
 
 # ---------------------------------------------------------------------------
-# Stage 14: organize final per-object deliverables
+# Stage 11: organize final per-object deliverables
 # ---------------------------------------------------------------------------
 
 
-def stage14_organize_final_objects(run_dir: Path, output_dir: Path, shapes_dir: Path) -> None:
+def stage11_organize_final_objects(run_dir: Path, shapes_dir: Path) -> None:
     _ensure_on_path(GENRECON_DIR / "scripts")
     from organize_final_objects import organize_final_objects
 
     organize_final_objects(
         shapes_dir,
-        output_dir / "segmentation_raw",
-        run_dir / "mv_sam3d_input",
-        run_dir / "image_to_3d_meshes",
+        run_dir / "stage_1_segmentation",
+        run_dir / "stage_2_mv_sam3d" / "input",
+        run_dir / "stage_2_mv_sam3d",
         run_dir / "final_objects",
     )
 
 
 # ---------------------------------------------------------------------------
-# Stage 15: Isaac Sim robot-collision demo (subprocess)
+# Stage 12: Isaac Sim robot-collision demo (subprocess)
 # ---------------------------------------------------------------------------
 
 
-def stage15_robot_collide(
+def stage12_robot_collide(
     shapes_dir: Path,
     robot_target: str,
     robot_collision_dir: Path,
@@ -746,7 +710,7 @@ def stage15_robot_collide(
 ) -> None:
     robot_collision_dir.mkdir(parents=True, exist_ok=True)
     run_external_step(
-        "stage15_demo_robot_collide",
+        "stage12_demo_robot_collide",
         isaacsim_dir / "demo_robot_collide.py",
         isaacsim_dir,
         [

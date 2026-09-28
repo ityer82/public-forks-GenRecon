@@ -22,10 +22,10 @@ path as --mesh_ply).
 
 Usage:
     uv run python scripts/remove_floater_mesh.py \
-        --mesh_ply runs/<scene>/genrecon_output/shapes/background_mesh.ply \
-        --object_ply runs/<scene>/genrecon_output/shapes/printer.ply \
-        --out_ply runs/<scene>/genrecon_output/shapes/background_mesh.ply \
-        --floaters_out_ply runs/<scene>/genrecon_output/shapes/printer_floaters.ply
+        --mesh_ply runs/<scene>/stage_3_genrecon/shapes/background_mesh.ply \
+        --object_ply runs/<scene>/stage_3_genrecon/shapes/printer.ply \
+        --out_ply runs/<scene>/stage_3_genrecon/shapes/background_mesh.ply \
+        --floaters_out_ply runs/<scene>/stage_3_genrecon/shapes/printer_floaters.ply
 """
 import argparse
 import shutil

@@ -15,10 +15,10 @@ both keyed by the original image filename.
 Usage:
     uv run python scripts/render_reprojection_validation.py \
         --mesh_ply runs/<scene>/output/mesh.ply \
-        --colmap_dir runs/<scene>/scene/colmap \
-        --images_dir runs/<scene>/scene/rgb \
-        --out_synth_dir runs/<scene>/output/synth_views \
-        --out_compare_dir runs/<scene>/output/compare_views
+        --colmap_dir runs/<scene>/stage_0_vggt/colmap \
+        --images_dir runs/<scene>/stage_0_vggt/rgb \
+        --out_synth_dir runs/<scene>/stage_4_reproject_synth/synth_views \
+        --out_compare_dir runs/<scene>/stage_4_reproject_synth/compare_views
 """
 import argparse
 from pathlib import Path

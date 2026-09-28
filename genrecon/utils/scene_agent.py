@@ -1,6 +1,6 @@
 """LangGraph agent that interactively defines an Isaac Sim pick-and-place scene with the user,
 once mv-sam3d/TRELLIS.2 (see run_full_pipeline.sh's Stage 3) has produced a real-world-scale mesh
-for every --classes label at runs/<scene>/image_to_3d_meshes/<label>/mesh.glb.
+for every --classes label at runs/<scene>/stage_2_mv_sam3d/<label>/mesh.glb.
 
 Unlike genrecon.utils.friction_agent (a batch agent -- one graph.invoke() per class label, no
 human turns), this is a structured wizard: a fixed sequence of nodes, each asking the user one

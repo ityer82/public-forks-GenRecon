@@ -1,8 +1,8 @@
 """Crop a reconstructed scene mesh down to a single object using its COB-GS point cloud.
 
-Given the full scene mesh (shapes/mesh.ply, written by
+Given the full scene mesh (mesh.ply, written by
 genrecon/utils/mesh_utils.py::write_pbr_ply with per-vertex PBR properties)
-and one object's point cloud (shapes/<label>.ply, plain xyz+rgb COLMAP points
+and one object's point cloud (stage_1_segmentation/<label>/point_cloud/<label>.ply, plain xyz+rgb COLMAP points
 from COB-GS's segment_pointcloud.py) -- both already in the same world frame
 -- this builds a convex hull from the object's points, dilates it outward by
 --hull_padding to compensate for the point cloud being a sparse sample of the
@@ -41,12 +41,12 @@ the same scene (same world frame) to crop the object from instead --
 
 Usage:
     uv run python scripts/extract_object_mesh.py \
-        --mesh_ply runs/<scene>/genrecon_output/shapes/mesh.ply \
-        --object_ply runs/<scene>/genrecon_output/shapes/printer.ply \
-        --out_ply runs/<scene>/genrecon_output/shapes/printer_mesh.ply \
+        --mesh_ply runs/<scene>/stage_3_genrecon/mesh.ply \
+        --object_ply runs/<scene>/stage_3_genrecon/shapes/printer.ply \
+        --out_ply runs/<scene>/stage_3_genrecon/shapes/printer_mesh.ply \
         --hull_padding 0.02 \
-        --colmap_dir runs/<scene>/genrecon_input/colmap \
-        --masks_dir runs/<scene>/genrecon_output/segmentation_raw/masks/classes/printer/mask_bin
+        --colmap_dir runs/<scene>/stage_0_vggt/colmap \
+        --masks_dir runs/<scene>/stage_1_segmentation/printer/mask_bin
 """
 import argparse
 import shutil
@@ -288,30 +288,42 @@ def extract_object_mesh(
         logger.info(f"{object_ply}: stage-2 search chose hull_padding={padding:.4f} "
                     f"(searched [{hull_padding_min}, {hull_padding}])")
 
-    try:
-        object_equations = padded_hull_equations(points, padding)
-    except QhullError as e:
-        return skip(f"convex hull construction failed ({e}).")
+    # A sparse object point cloud (e.g. a thin pen) can have a hull that sits just inside the
+    # reconstructed surface, so the tight (stage-2 searched) padding may enclose no face at all.
+    # Retry with progressively looser padding, up to --hull_padding, before giving up.
+    retry_paddings = [padding] + [p for p in np.linspace(padding, hull_padding, 5)[1:] if p > padding]
+    for attempt_padding in retry_paddings:
+        try:
+            object_equations = padded_hull_equations(points, attempt_padding)
+        except QhullError as e:
+            return skip(f"convex hull construction failed ({e}).")
 
-    resolved_remainder_padding = remainder_padding if remainder_padding is not None else padding + remainder_margin
-    resolved_remainder_padding = max(resolved_remainder_padding, padding)
-    try:
-        remainder_equations = padded_hull_equations(points, resolved_remainder_padding)
-    except QhullError as e:
-        logger.warning(
-            f"{object_ply}: remainder-padding hull construction failed ({e}); "
-            "falling back to the object hull for the remainder cut too."
+        resolved_remainder_padding = (
+            remainder_padding if remainder_padding is not None else attempt_padding + remainder_margin
         )
-        remainder_equations = object_equations
-        resolved_remainder_padding = padding
+        resolved_remainder_padding = max(resolved_remainder_padding, attempt_padding)
+        try:
+            remainder_equations = padded_hull_equations(points, resolved_remainder_padding)
+        except QhullError as e:
+            logger.warning(
+                f"{object_ply}: remainder-padding hull construction failed ({e}); "
+                "falling back to the object hull for the remainder cut too."
+            )
+            remainder_equations = object_equations
+            resolved_remainder_padding = attempt_padding
 
-    bbox_margin = max(resolved_remainder_padding, 0.0)
-    bbox_min = points.min(axis=0) - bbox_margin
-    bbox_max = points.max(axis=0) + bbox_margin
-    object_vertex, object_faces, remainder_vertex, remainder_faces = crop_mesh(
-        mesh_ply, object_equations, remainder_equations, bbox_min, bbox_max,
-        object_mesh_ply=object_mesh_ply,
-    )
+        bbox_margin = max(resolved_remainder_padding, 0.0)
+        bbox_min = points.min(axis=0) - bbox_margin
+        bbox_max = points.max(axis=0) + bbox_margin
+        object_vertex, object_faces, remainder_vertex, remainder_faces = crop_mesh(
+            mesh_ply, object_equations, remainder_equations, bbox_min, bbox_max,
+            object_mesh_ply=object_mesh_ply,
+        )
+        if len(object_faces) > 0:
+            if attempt_padding != padding:
+                logger.info(f"{object_ply}: no faces at hull_padding={padding:.4f}; cropped at {attempt_padding:.4f}.")
+            break
+        logger.warning(f"{object_ply}: no mesh faces inside hull at padding={attempt_padding:.4f}.")
     if len(object_faces) == 0:
         return skip("no mesh faces fell inside the padded hull.")
 

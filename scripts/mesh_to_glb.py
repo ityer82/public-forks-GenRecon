@@ -1,6 +1,6 @@
 """Convert cropped object meshes in a shapes/ dir to per-object GLBs.
 
-Given a genrecon_output/shapes/ directory (written by run_full_pipeline.sh's Stage
+Given a stage_3_genrecon/shapes/ directory (written by run_full_pipeline.sh's Stage
 3.6/3.7), converts every <label>_mesh.ply (the per-object crops written by
 scripts/extract_object_mesh.py, e.g. chair_mesh.ply, background_mesh.ply) to
 <out_dir>/<label>/mesh.glb. The whole-scene mesh.ply and the plain per-class point
@@ -12,8 +12,8 @@ find_glb_assets() looks for <input_dir>/<asset_name>/mesh.glb).
 
 Usage:
     uv run python scripts/mesh_to_glb.py \
-        --shapes_dir runs/<scene>/genrecon_output/shapes \
-        --out_dir runs/<scene>/genrecon_output/shapes/glb
+        --shapes_dir runs/<scene>/stage_3_genrecon/shapes \
+        --out_dir runs/<scene>/stage_3_genrecon/shapes/glb
 """
 import argparse
 from pathlib import Path

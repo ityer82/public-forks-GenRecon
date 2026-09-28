@@ -136,7 +136,7 @@ def collect_mvsam3d_outputs(
     (empty on full success) instead of calling sys.exit(1), so a caller can decide policy.
 
     If both `scene_pointcloud_dir` (genrecon's COBGS_MASK_DIR, i.e.
-    <genrecon_output>/segmentation_raw/masks/classes) and `mvsam3d_input_dir` (the bridged
+    <run_dir>/stage_1_segmentation) and `mvsam3d_input_dir` (the bridged
     input dir holding da3_output.npz and the per-label masks) are given, each object's yaw is
     chosen by silhouette IoU against the real masks via silhouette_orientation.select_best_yaw().
     Missing masks/point clouds are skipped with a warning (not a failure): the object keeps
@@ -240,18 +240,18 @@ def _maybe_apply_silhouette_yaw(
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--visualization_dir", default="visualization", help="MV-SAM3D's visualization/ dir")
-    parser.add_argument("--dataset_name", required=True, help="Name of the bridged input dir (input_path.name)")
+    parser.add_argument("--dataset_name", required=True, help="Name of the bridged input dir (visualization/ key; <scene>_mvsam3d_input for GenRecon runs)")
     parser.add_argument("--labels", required=True, help="Comma-separated raw class labels")
     parser.add_argument("--out_dir", required=True, help="Where to write <label>/mesh.glb")
     parser.add_argument(
         "--scene_pointcloud_dir", default=None,
-        help="genrecon's COBGS_MASK_DIR (<genrecon_output>/segmentation_raw/masks/classes): "
+        help="genrecon's COBGS_MASK_DIR (<run_dir>/stage_1_segmentation): "
         "per-object segmented point clouds, used as the target for the bbox fit when scoring yaws. "
         "Needs --mvsam3d_input_dir too; omit both to keep the raw MV-SAM3D pose.",
     )
     parser.add_argument(
         "--mvsam3d_input_dir", default=None,
-        help="Bridged MV-SAM3D input dir (<run>/<scene>_mvsam3d_input: da3_output.npz + per-label "
+        help="Bridged MV-SAM3D input dir (<run>/stage_2_mv_sam3d/input: da3_output.npz + per-label "
         "masks). When given with --scene_pointcloud_dir, each object's yaw is chosen by silhouette "
         "IoU against the real masks -- see silhouette_orientation.py.",
     )

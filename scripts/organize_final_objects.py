@@ -1,7 +1,7 @@
 """Copy per-run reconstruction outputs into a single final_objects/ folder.
 
 Pulls together the artifacts that end up scattered across
-genrecon_output/segmentation_raw/, genrecon_output/shapes/, mv_sam3d_input/
+stage_1_segmentation/, stage_3_genrecon/shapes/, stage_2_mv_sam3d/input/
 and trellis2_meshes/ into one self-contained directory: the background point
 cloud and mesh at the root, and a subfolder per class holding that class's
 detection preview, point cloud, cropped mesh, TRELLIS.2 input image, and
@@ -9,9 +9,9 @@ TRELLIS.2 mesh (if TRELLIS.2 reconstruction was run).
 
 Usage:
     uv run python scripts/organize_final_objects.py \
-        --shapes_dir runs/<scene>/genrecon_output/shapes \
-        --segmentation_raw_dir runs/<scene>/genrecon_output/segmentation_raw \
-        --mv_sam3d_input_dir runs/<scene>/mv_sam3d_input \
+        --shapes_dir runs/<scene>/stage_3_genrecon/shapes \
+        --segmentation_raw_dir runs/<scene>/stage_1_segmentation \
+        --mv_sam3d_input_dir runs/<scene>/stage_2_mv_sam3d/input \
         --trellis2_meshes_dir runs/<scene>/trellis2_meshes \
         --out_dir runs/<scene>/final_objects
 """
@@ -43,7 +43,7 @@ def organize_final_objects(
     _copy(shapes_dir / "background.ply", out_dir / "background.ply", "background", "point cloud")
     _copy(shapes_dir / "background_mesh.ply", out_dir / "background_mesh.ply", "background", "mesh")
 
-    labels_json = segmentation_raw_dir / "masks" / "classes" / "labels.json"
+    labels_json = segmentation_raw_dir / "labels.json"
     labels = json.loads(labels_json.read_text())
 
     for label, dirname in labels.items():

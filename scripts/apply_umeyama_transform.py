@@ -23,7 +23,7 @@ fitted components are kept when writing the output:
 
 Usage:
     uv run python scripts/apply_umeyama_transform.py \
-        --src_sparse_dir runs/iphone_rgb_skip50/vggt_export/sparse/0 \
+        --src_sparse_dir runs/iphone_rgb_skip50/stage_0_vggt/colmap \
         --ref_colmap_dir /path/to/scannetpp/scene/iphone/colmap \
         --output_dir runs/iphone_rgb_skip50/colmap_scaled \
         [--apply_mode {full,scale_only,scale_translation}]

@@ -51,6 +51,15 @@ from loguru import logger
 # own historical `uv run python run_inference_weighted.py` invocation from mv_sam3d/.
 _MV_SAM3D_DIR = Path(__file__).resolve().parent
 
+
+def _dataset_name_for(input_path: Path) -> str:
+    """Key under visualization/ for an input dir. GenRecon stages its input at
+    runs/<scene>/stage_2_mv_sam3d/input, whose bare name ("input") would collide across scenes
+    in the shared visualization/ dir, so it's keyed as "<scene>_mvsam3d_input" instead."""
+    if input_path.name == "input":
+        return f"{input_path.resolve().parent.parent.name}_mvsam3d_input"
+    return input_path.name
+
 # Import inference code. Absolute (not "notebook", a path relative to cwd) so this
 # resolves regardless of the caller's cwd.
 _NOTEBOOK_DIR = _MV_SAM3D_DIR / "notebook"
@@ -1926,7 +1935,7 @@ def get_output_dir(
     visualization_dir = _MV_SAM3D_DIR / "visualization"
     
     # Level 1: Dataset name (last component of input_path)
-    dataset_name = input_path.name if input_path.is_dir() else input_path.parent.name
+    dataset_name = _dataset_name_for(input_path) if input_path.is_dir() else input_path.parent.name
     
     # Level 2: Mask prompt (or "default" if not specified)
     mask_name = mask_prompt if mask_prompt else "default"
@@ -2276,7 +2285,7 @@ def run_multiobject_inference(
     logger.info(f"{'='*70}\n")
     
     # Create multi-object output directory
-    dataset_name = input_path.name
+    dataset_name = _dataset_name_for(input_path)
     multiobj_name = "_".join(mask_prompts)
     
     # Build directory name similar to single-object mode

@@ -56,8 +56,8 @@ if torch.cuda.get_device_properties(0).major >= 8:
 parser = argparse.ArgumentParser(description='extract mask')
 parser.add_argument('--resolution', type=int, default=-1)
 parser.add_argument('--dataset_root', type=str, default='',
-                     help="Base directory containing this scene's images/ (and, for "
-                          "3D-reprojection gating, sparse/0/) -- e.g. a VGGT-Omega "
+                     help="Base directory containing this scene's rgb/ (and, for "
+                          "3D-reprojection gating, colmap/) -- e.g. a VGGT-Omega "
                           "--export-for-3dgs output dir. Used directly, no <scene> "
                           "subdir is appended.")
 parser.add_argument('--output', type=str, default='')
@@ -71,11 +71,11 @@ parser.add_argument('--classes', type=str, default=None,
                           "under its matched class instead of one merged mask.")
 parser.add_argument('--flat_output', action='store_true',
                      help="Skip the <scene> path segment: write directly under "
-                          "--output/masks/<text> instead of --output/<scene>/masks/<text>. "
+                          "--output directly instead of --output/<scene>/masks/<text>. "
                           "Useful when --output is already scene-specific.")
 parser.add_argument('--colmap_dir', type=str, default=None,
                      help="Path to a COLMAP sparse model (cameras.txt/images.txt/points3D.txt) "
-                          "for this scene. Defaults to <dataset_base_dir>/sparse/0, which is "
+                          "for this scene. Defaults to <dataset_base_dir>/colmap, which is "
                           "where upstream pipelines conventionally place it. Used to lift "
                           "detected boxes into 3D frustums that gate re-detection during "
                           "tracking (see --no_3d_reprojection).")
@@ -163,7 +163,7 @@ detect_caption = " . ".join(candidate_classes) + " ." if multi_class else text
 dataset_base_dir = args.dataset_root
 
 # `video_dir` a directory of JPEG frames with filenames like `<frame_index>.jpg`
-video_dir = os.path.join(dataset_base_dir, 'images')
+video_dir = os.path.join(dataset_base_dir, 'rgb')
 # scan all the JPEG frame names in this directory
 if resolution != -1:
     print(os.path.exists(video_dir+f"_{resolution}"))
@@ -272,7 +272,7 @@ object_frustums = {}  # obj_id -> 8 world-space corners, or None
 frustum_gating_active = False
 
 if not args.no_3d_reprojection:
-    colmap_dir = args.colmap_dir or os.path.join(dataset_base_dir, "sparse", "0")
+    colmap_dir = args.colmap_dir or os.path.join(dataset_base_dir, "colmap")
     if not os.path.isdir(colmap_dir):
         print(f"[3d_reprojection] No COLMAP model found at {colmap_dir}; "
               f"falling back to unconditional re-detection on empty-mask frames.")
@@ -641,7 +641,7 @@ Step 5: Visualize the segment results across the video and save them
 """
 
 save_dir = "."
-save_dir = os.path.join(save_dir, output_path, "masks", text) if args.flat_output \
+save_dir = os.path.join(save_dir, output_path) if args.flat_output \
     else os.path.join(save_dir, output_path, scene, "masks", text)
 if not os.path.exists(save_dir):
     os.makedirs(save_dir)

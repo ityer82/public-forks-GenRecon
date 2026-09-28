@@ -8,7 +8,7 @@ point-cloud segmentation via mask reprojection).
 
 Usage (class-based/open-world mode: separate masks/point clouds per sub-class):
     uv run python main_light.py --scene kitchen --text classes \
-        --classes "apple,banana,orange" --dataset_root path/to/vggt_export
+        --classes "apple,banana,orange" --dataset_root path/to/stage_0_vggt
 """
 import argparse
 import json
@@ -75,7 +75,8 @@ def run_segmentation(
     directly with typed args instead of building argv by hand."""
     output_path = output_root if flat_output else f"{output_root}/{scene}"
     label = text
-    mask_dir = Path(output_path) / "masks" / label
+    # flat_output: per-class results go directly under output_root (no masks/<label>/ nesting).
+    mask_dir = Path(output_path) if flat_output else Path(output_path) / "masks" / label
     py = ["uv", "run", "python"]
     multi_class = classes is not None
     classes_flag = ["--classes", classes] if multi_class else []
@@ -108,7 +109,8 @@ def run_segmentation(
             "Stage 1.5: Point-cloud segmentation",
             py + [str(SCRIPT_DIR / "segment_pointcloud.py"), "--dataset", dataset_root, "--output", output_path,
                   "--text", label, "--pc_mask_threshold", str(pc_mask_threshold),
-                  "--depth_tolerance", str(depth_tolerance)] + classes_flag + depth_flag,
+                  "--depth_tolerance", str(depth_tolerance)] + classes_flag + depth_flag
+                  + (["--mask_dir_override", str(mask_dir)] if flat_output else []),
             skip=stage_done(mask_dir, multi_class),
             skip_reason=mask_dir,
             read_from_drive=read_from_drive,
@@ -128,8 +130,8 @@ def main():
                               "label and each detected object is tracked/saved under "
                               "its matched class instead of one merged mask.")
     parser.add_argument("--dataset_root", type=str, default="dataset",
-                         help="Base directory containing this scene's images/ and "
-                              "sparse/0/ (e.g. a VGGT-Omega --export-for-3dgs output dir). "
+                         help="Base directory containing this scene's rgb/ and "
+                              "colmap/ (e.g. a VGGT-Omega --export-for-3dgs output dir). "
                               "Passed straight through to detect_and_segment.py/"
                               "segment_pointcloud.py, no <scene> subdir is appended.")
     parser.add_argument("--output_root", type=str, default="output")

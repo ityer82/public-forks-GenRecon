@@ -217,11 +217,8 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     run_dir = GENRECON_DIR / "runs" / args.scene_name
-    export_dir = run_dir / "vggt_export"
-    scene_dir = run_dir / "genrecon_input"
-    output_dir = run_dir / "genrecon_output"
-    export_dir.mkdir(parents=True, exist_ok=True)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    export_dir = run_dir / "stage_0_vggt"
+    output_dir = run_dir / "stage_3_genrecon"
 
     pipeline_log = run_dir / "pipeline.log"
     debug_config_log = run_dir / "debug_config.log"
@@ -253,7 +250,7 @@ def main(argv: list[str] | None = None) -> None:
 
     # compose_isaac_scene.py's --table defaults to on (it was built for the pick-and-place demo,
     # Stage P3 below, where a real table prop under the picked/placed objects is correct). The
-    # full-reconstruction path (Stage 12) already has its own reconstructed background/floor
+    # full-reconstruction path (Stage 9) already has its own reconstructed background/floor
     # mesh spanning the whole scene, so the same small fixed-size table prop would get centered
     # underneath that mesh's bounding box at floor height -- making the entire reconstructed
     # scene appear perched on a tiny table. Suppress it there.
@@ -266,6 +263,7 @@ def main(argv: list[str] | None = None) -> None:
         # ── Stage 0: VGGT-Omega export ──
         if args.start_from_stage <= 0:
             with stage(f"Stage 0: VGGT-Omega export -> {export_dir}"):
+                export_dir.mkdir(parents=True, exist_ok=True)
                 stages.stage0_vggt_export(
                     args.image_folder,
                     VGGT_CHECKPOINT,
@@ -300,7 +298,7 @@ def main(argv: list[str] | None = None) -> None:
                     from genrecon.utils.object_discovery import discover_objects
 
                     left_image, objects = discover_objects(
-                        export_dir / "images", model_id=DISCOVERY_HF_MODEL, classes=classes or None,
+                        export_dir / "rgb", model_id=DISCOVERY_HF_MODEL, classes=classes or None,
                     )
                     classes = [o["label"] for o in objects]
                     logger.info(f"Discovery: found {len(classes)} objects: {', '.join(classes)}")
@@ -324,18 +322,19 @@ def main(argv: list[str] | None = None) -> None:
                 f"place='{args.place_target}' (chosen from classes {classes})"
             )
 
-        cobgs_mask_dir = output_dir / "segmentation_raw" / "masks" / "classes"
-        seg_log = output_dir / "segmentation.log"
-        image_to_3d_output_dir = run_dir / "image_to_3d_meshes"
+        cobgs_mask_dir = run_dir / "stage_1_segmentation"
+        image_to_3d_output_dir = run_dir / "stage_2_mv_sam3d"
+        seg_log = run_dir / "stage_1_segmentation" / "segmentation.log"
+        mvsam3d_log = image_to_3d_output_dir / "mv_sam3d.log"
 
-        # ── Stage 1-3: segmentation + per-class 3D reconstruction (only if --classes) ──
+        # ── Stage 1-2: segmentation + per-class 3D reconstruction (only if --classes) ──
         if classes:
             if args.start_from_stage <= 1:
                 with stage(f"Stage 1: segmentation (classes: {classes})"):
                     cobgs_mask_dir = stages.stage1_segmentation(
                         args.scene_name,
                         export_dir,
-                        output_dir / "segmentation_raw",
+                        run_dir / "stage_1_segmentation",
                         classes,
                         depth_conf_thres=args.depth_conf_thres,
                         depth_edge_rtol=args.depth_edge_rtol,
@@ -345,25 +344,18 @@ def main(argv: list[str] | None = None) -> None:
                         boxes_json=boxes_json,
                     )
             else:
-                logger.info(f"Stage 1: skipped (--start-from-stage {args.start_from_stage}), assuming existing segmentation at {output_dir / 'segmentation_raw'}")
+                logger.info(f"Stage 1: skipped (--start-from-stage {args.start_from_stage}), assuming existing segmentation at {run_dir / 'stage_1_segmentation'}")
             check_stop_after_stage(1)
 
-            if args.start_from_stage <= 2:
-                with stage(f"Stage 2: RGBA mask export -> {cobgs_mask_dir}/<class>/mask_rgba"):
-                    stages.stage2_export_rgba_masks(export_dir / "images", cobgs_mask_dir)
-            else:
-                logger.info(f"Stage 2: skipped (--start-from-stage {args.start_from_stage})")
-            check_stop_after_stage(2)
-
-            if use_trellis and args.start_from_stage <= 3:
-                with stage(f"Stage 3: MV-SAM3D reconstruction -> {image_to_3d_output_dir}"):
-                    stages.stage3_mvsam3d(
+            if use_trellis and args.start_from_stage <= 2:
+                with stage(f"Stage 2: MV-SAM3D reconstruction -> {image_to_3d_output_dir}"):
+                    stages.stage2_mvsam3d(
                         run_dir,
                         args.scene_name,
                         classes,
                         image_to_3d_output_dir,
                         mvsam3d_vendor_dir=MVSAM3D_VENDOR_DIR,
-                        seg_log=seg_log,
+                        log_file=mvsam3d_log,
                         log_mirror=log_mirror,
                         cobgs_mask_dir=cobgs_mask_dir,
                         stage1_steps=args.mvsam3d_stage1_steps,
@@ -371,8 +363,8 @@ def main(argv: list[str] | None = None) -> None:
                         top_k_views=args.mvsam3d_top_k_views,
                     )
             else:
-                logger.info(f"Stage 3: skipped (use_trellis disabled, or --start-from-stage {args.start_from_stage})")
-            check_stop_after_stage(3)
+                logger.info(f"Stage 2: skipped (use_trellis disabled, or --start-from-stage {args.start_from_stage})")
+            check_stop_after_stage(2)
 
         # ── Stage P0 (only with --ai-scene-agent) ──
         pick_place_target = args.pick_place_target
@@ -446,7 +438,7 @@ def main(argv: list[str] | None = None) -> None:
                 _opt_eq("--camera-mode", camera.get("mode"))
                 _opt_eq("--camera-distance-multiplier", camera.get("distance_multiplier"))
 
-        # ── Stage P1-P4 (fast path, mutually exclusive with Stage 4-15) ──
+        # ── Stage P1-P4 (fast path, mutually exclusive with Stage 3-12) ──
         if pick_place_target:
             pick_place_dir = run_dir / "pick_place"
             pick_place_glb_dir = pick_place_dir / "glb"
@@ -506,19 +498,12 @@ def main(argv: list[str] | None = None) -> None:
             logger.info(f"Done: {pick_place_dir}/pick_place.mp4")
             return
 
-        # ── Stage 4: stage GenRecon scene dir ──
-        if args.start_from_stage <= 4:
-            with stage(f"Stage 4: staging {scene_dir}"):
-                stages.stage4_stage_scene_dir(export_dir, scene_dir)
-        else:
-            logger.info(f"Stage 4: skipped (--start-from-stage {args.start_from_stage}), assuming existing {scene_dir}")
-        check_stop_after_stage(4)
-
-        # ── Stage 5: GenRecon reconstruction ──
-        if args.start_from_stage <= 5:
-            with stage("Stage 5: reconstruct_scene.py"):
-                stages.stage5_reconstruct_scene(
-                    scene_dir,
+        # ── Stage 3: GenRecon reconstruction ──
+        if args.start_from_stage <= 3:
+            with stage("Stage 3: reconstruct_scene.py"):
+                output_dir.mkdir(parents=True, exist_ok=True)
+                stages.stage3_reconstruct_scene(
+                    export_dir,
                     output_dir,
                     classes,
                     cobgs_mask_dir if classes else None,
@@ -528,66 +513,59 @@ def main(argv: list[str] | None = None) -> None:
                     fix_num_chunks=args.fix_num_chunks,
                 )
         else:
-            logger.info(f"Stage 5: skipped (--start-from-stage {args.start_from_stage})")
-        check_stop_after_stage(5)
+            logger.info(f"Stage 3: skipped (--start-from-stage {args.start_from_stage})")
+        check_stop_after_stage(3)
 
-        # ── Stage 6: reprojection validation ──
-        if args.start_from_stage <= 6:
-            with stage("Stage 6: render_reprojection_validation.py"):
-                stages.stage6_reprojection_validation(output_dir, scene_dir, classes)
+        # ── Stage 4: reprojection validation ──
+        if args.start_from_stage <= 4:
+            with stage("Stage 4: render_reprojection_validation.py"):
+                stages.stage4_reprojection_validation(output_dir, export_dir, classes, run_dir / "stage_4_reproject_synth")
         else:
-            logger.info(f"Stage 6: skipped (--start-from-stage {args.start_from_stage})")
-        check_stop_after_stage(6)
+            logger.info(f"Stage 4: skipped (--start-from-stage {args.start_from_stage})")
+        check_stop_after_stage(4)
 
-        # ── Stage 7: collect shapes ──
-        if args.start_from_stage <= 7:
-            with stage(f"Stage 7: collecting shapes -> {output_dir}/shapes"):
-                shapes_dir = stages.stage7_collect_shapes(output_dir, classes, cobgs_mask_dir if classes else None)
-        else:
-            shapes_dir = output_dir / "shapes"
-            logger.info(f"Stage 7: skipped (--start-from-stage {args.start_from_stage}), assuming existing {shapes_dir}")
-        check_stop_after_stage(7)
+        shapes_dir = output_dir / "shapes"
 
-        # ── Stage 8: per-object mesh extraction ──
-        if classes and args.start_from_stage <= 8:
-            with stage(f"Stage 8: cascading per-object mesh extraction -> {shapes_dir}"):
-                stages.stage8_extract_object_meshes(
+        # ── Stage 5: per-object mesh extraction ──
+        if classes and args.start_from_stage <= 5:
+            with stage(f"Stage 5: cascading per-object mesh extraction -> {shapes_dir}"):
+                stages.stage5_extract_object_meshes(
                     shapes_dir,
-                    scene_dir,
+                    export_dir,
                     cobgs_mask_dir,
                     classes,
                     output_dir,
                 )
         else:
-            logger.info(f"Stage 8: skipped (no --classes, or --start-from-stage {args.start_from_stage})")
-        check_stop_after_stage(8)
+            logger.info(f"Stage 5: skipped (no --classes, or --start-from-stage {args.start_from_stage})")
+        check_stop_after_stage(5)
 
-        # ── Stage 9: floor segmentation + friction inference ──
-        if classes and args.start_from_stage <= 9:
-            with stage(f"Stage 9: extract_floor_mesh.py + infer_friction_assignments.py -> {shapes_dir}"):
-                stages.stage9_floor_and_friction(
+        # ── Stage 6: floor segmentation + friction inference ──
+        if classes and args.start_from_stage <= 6:
+            with stage(f"Stage 6: extract_floor_mesh.py + infer_friction_assignments.py -> {shapes_dir}"):
+                stages.stage6_floor_and_friction(
                     shapes_dir, cobgs_mask_dir,
                     friction_table_path=args.friction_table_path,
                     ollama_model=args.ollama_model,
                 )
         else:
-            logger.info(f"Stage 9: skipped (no --classes, or --start-from-stage {args.start_from_stage})")
-        check_stop_after_stage(9)
+            logger.info(f"Stage 6: skipped (no --classes, or --start-from-stage {args.start_from_stage})")
+        check_stop_after_stage(6)
 
-        # ── Stage 10/11/12: mesh -> GLB -> USD -> composed scene ──
+        # ── Stage 7/8/9: mesh -> GLB -> USD -> composed scene ──
         if args.run_usd:
-            if args.start_from_stage <= 10:
-                with stage(f"Stage 10: mesh_to_glb.py -> {shapes_dir}/glb"):
-                    stages.stage10_mesh_to_glb(
+            if args.start_from_stage <= 7:
+                with stage(f"Stage 7: mesh_to_glb.py -> {shapes_dir}/glb"):
+                    stages.stage7_mesh_to_glb(
                         shapes_dir, run_dir, classes, use_trellis=use_trellis
                     )
             else:
-                logger.info(f"Stage 10: skipped (--start-from-stage {args.start_from_stage})")
-            check_stop_after_stage(10)
+                logger.info(f"Stage 7: skipped (--start-from-stage {args.start_from_stage})")
+            check_stop_after_stage(7)
 
-            if args.start_from_stage <= 11:
-                with stage(f"Stage 11: convert_asset.py (collision_approximation={COLLISION_APPROXIMATION}) -> {shapes_dir}/glb/<label>/asset.usd"):
-                    stages.stage11_convert_asset(
+            if args.start_from_stage <= 8:
+                with stage(f"Stage 8: convert_asset.py (collision_approximation={COLLISION_APPROXIMATION}) -> {shapes_dir}/glb/<label>/asset.usd"):
+                    stages.stage8_convert_asset(
                         shapes_dir, classes,
                         isaacsim_dir=ISAACSIM_DIR,
                         collision_approximation=COLLISION_APPROXIMATION,
@@ -596,55 +574,55 @@ def main(argv: list[str] | None = None) -> None:
                         log_mirror=log_mirror,
                     )
             else:
-                logger.info(f"Stage 11: skipped (--start-from-stage {args.start_from_stage})")
-            check_stop_after_stage(11)
+                logger.info(f"Stage 8: skipped (--start-from-stage {args.start_from_stage})")
+            check_stop_after_stage(8)
 
-            if args.start_from_stage <= 12:
-                with stage(f"Stage 12: compose_isaac_scene.py -> {shapes_dir}/glb/scene.usda"):
-                    stages.stage12_compose_isaac_scene(
+            if args.start_from_stage <= 9:
+                with stage(f"Stage 9: compose_isaac_scene.py -> {shapes_dir}/glb/scene.usda"):
+                    stages.stage9_compose_isaac_scene(
                         shapes_dir, isaacsim_dir=ISAACSIM_DIR, output_dir=output_dir,
                         debug_config_log=debug_config_log, log_mirror=log_mirror,
                         extra_args=full_scene_compose_extra_args,
                     )
             else:
-                logger.info(f"Stage 12: skipped (--start-from-stage {args.start_from_stage})")
-            check_stop_after_stage(12)
+                logger.info(f"Stage 9: skipped (--start-from-stage {args.start_from_stage})")
+            check_stop_after_stage(9)
 
-        # ── Stage 13: chunked GLB bake ──
-        if RUN_GLB and args.start_from_stage <= 13:
-            with stage(f"Stage 13: chunked_to_glb.py (simplify_threshold={SIMPLIFY_THRESHOLD}, texture_size={TEXTURE_SIZE})"):
-                stages.stage13_chunked_to_glb(
+        # ── Stage 10: chunked GLB bake ──
+        if RUN_GLB and args.start_from_stage <= 10:
+            with stage(f"Stage 10: chunked_to_glb.py (simplify_threshold={SIMPLIFY_THRESHOLD}, texture_size={TEXTURE_SIZE})"):
+                stages.stage10_chunked_to_glb(
                     output_dir, simplify_threshold=SIMPLIFY_THRESHOLD, texture_size=TEXTURE_SIZE
                 )
             logger.info(f"Done: {output_dir}/scene.glb")
         elif RUN_GLB:
-            logger.info(f"Stage 13: skipped (--start-from-stage {args.start_from_stage})")
-            logger.info(f"Done: {shapes_dir}/mesh.ply")
+            logger.info(f"Stage 10: skipped (--start-from-stage {args.start_from_stage})")
+            logger.info(f"Done: {output_dir}/mesh.ply")
         else:
             logger.info("GLB bake disabled, skipping.")
-            logger.info(f"Done: {shapes_dir}/mesh.ply")
+            logger.info(f"Done: {output_dir}/mesh.ply")
 
-        # ── Stage 14: organize final per-object deliverables ──
+        # ── Stage 11: organize final per-object deliverables ──
         final_objects_dir = run_dir / "final_objects"
-        if classes and args.start_from_stage <= 14:
-            with stage(f"Stage 14: organizing final objects -> {final_objects_dir}"):
-                stages.stage14_organize_final_objects(run_dir, output_dir, shapes_dir)
+        if classes and args.start_from_stage <= 11:
+            with stage(f"Stage 11: organizing final objects -> {final_objects_dir}"):
+                stages.stage11_organize_final_objects(run_dir, shapes_dir)
         else:
-            logger.info(f"Stage 14: skipped (no --classes, or --start-from-stage {args.start_from_stage})")
-        check_stop_after_stage(14)
+            logger.info(f"Stage 11: skipped (no --classes, or --start-from-stage {args.start_from_stage})")
+        check_stop_after_stage(11)
 
-        # ── Stage 15: Isaac Sim robot-collision demo ──
+        # ── Stage 12: Isaac Sim robot-collision demo ──
         robot_collision_dir = run_dir / "robot_collision"
-        if args.run_usd and args.robot_target and args.start_from_stage <= 15:
+        if args.run_usd and args.robot_target and args.start_from_stage <= 12:
             sanitized_robot_target = stages.sanitize_label(args.robot_target)
-            with stage(f"Stage 15: demo_robot_collide.py (robot_target={sanitized_robot_target}) -> {robot_collision_dir}/robot_collide.mp4"):
-                stages.stage15_robot_collide(
+            with stage(f"Stage 12: demo_robot_collide.py (robot_target={sanitized_robot_target}) -> {robot_collision_dir}/robot_collide.mp4"):
+                stages.stage12_robot_collide(
                     shapes_dir, sanitized_robot_target, robot_collision_dir,
                     isaacsim_dir=ISAACSIM_DIR, debug_config_log=debug_config_log, log_mirror=log_mirror,
                 )
         else:
-            logger.info(f"Stage 15: skipped (no --robot-target, --skip_isaac, or --start-from-stage {args.start_from_stage})")
-        check_stop_after_stage(15)
+            logger.info(f"Stage 12: skipped (no --robot-target, --skip_isaac, or --start-from-stage {args.start_from_stage})")
+        check_stop_after_stage(12)
 
         elapsed = time.monotonic() - pipeline_t0
         logger.info(f"Pipeline finished for scene '{args.scene_name}' (total elapsed {_format_duration(elapsed)})")

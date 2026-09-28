@@ -14,9 +14,9 @@ objects.
 
 Usage:
     uv run python scripts/extract_floor_mesh.py \
-        --mesh_ply runs/<scene>/genrecon_output/shapes/background_mesh.ply \
-        --out_ply runs/<scene>/genrecon_output/shapes/floor_mesh.ply \
-        --remainder_out_ply runs/<scene>/genrecon_output/shapes/background_mesh.ply
+        --mesh_ply runs/<scene>/stage_3_genrecon/shapes/background_mesh.ply \
+        --out_ply runs/<scene>/stage_3_genrecon/shapes/floor_mesh.ply \
+        --remainder_out_ply runs/<scene>/stage_3_genrecon/shapes/background_mesh.ply
 """
 import argparse
 import shutil

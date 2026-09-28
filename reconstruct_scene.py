@@ -634,7 +634,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Directory of COB-GS's per-class 3D segmentation output (labels.json + "
         "<label>/point_cloud/<label>.ply + <label>/mask_bin/), e.g. "
-        "segmentation_raw/masks/classes. If set, each class's object is excluded from "
+        "stage_1_segmentation. If set, each class's object is excluded from "
         "generation itself: its padded, reprojection-tightened convex hull (same "
         "computation as scripts/extract_object_mesh.py's post-hoc crop) is used to drop "
         "sparse-structure voxel coords in that region before shape/texture SLat sampling "
@@ -664,7 +664,7 @@ def build_parser() -> argparse.ArgumentParser:
         "object_source_mesh.ply, in the same world frame as the primary run's "
         "mesh.ply (same chunk geometry), for scripts/extract_object_mesh.py's "
         "--object_mesh_ply to crop real per-object meshes from. Roughly doubles "
-        "Stage 5 GPU cost when set. mode=Iphone only.",
+        "Stage 3 GPU cost when set. mode=Iphone only.",
     )
     parser.add_argument(
         "--sampler_steps_scale",

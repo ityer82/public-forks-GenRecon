@@ -1,5 +1,5 @@
 """Diagnostic: score candidate orientations of an MV-SAM3D mesh by silhouette IoU against
-the real per-view object masks, using the DA3 cameras from <run_dir>/<scene>_mvsam3d_input.
+the real per-view object masks, using the DA3 cameras from <run_dir>/stage_2_mv_sam3d/input.
 
 Standalone and read-only with respect to the pipeline: it imports helpers from
 mv_sam3d/mvsam3d_scripts/collect_mvsam3d_outputs.py but never modifies or writes into the run.
@@ -105,7 +105,7 @@ def render_silhouette(pts, ext, K, hw, radius=2):
 
 
 def load_views(run_dir: Path, scene: str, label: str, max_views: int):
-    inp = run_dir / f"{scene}_mvsam3d_input"
+    inp = run_dir / "stage_2_mv_sam3d" / "input"
     d = np.load(inp / "da3_output.npz")
     stems = [Path(str(p)).stem for p in d["image_files"]]
     views = []
@@ -146,7 +146,7 @@ def main():
     scene = args.run_dir.name
     dataset = f"{scene}_mvsam3d_input"
     san = cmo.sanitize_label(args.label)
-    pc = args.run_dir / "genrecon_output/segmentation_raw/masks/classes" / san / "point_cloud" / f"{san}.ply"
+    pc = args.run_dir / "stage_1_segmentation" / san / "point_cloud" / f"{san}.ply"
     target = np.asarray(trimesh.load(str(pc)).vertices, dtype=np.float64)
 
     pts = load_sam3d_world_points(args.visualization_dir, dataset, args.label)
@@ -180,7 +180,7 @@ def main():
         tiles = []
         for stem, ext, K, mask in views[:4]:
             sil = render_silhouette(fitted, ext, K, mask.shape)
-            img = cv2.imread(str(args.run_dir / f"{scene}_mvsam3d_input/images/{stem}.jpg"))
+            img = cv2.imread(str(args.run_dir / f"stage_2_mv_sam3d/input/images/{stem}.jpg"))
             img = cv2.resize(img, (mask.shape[1], mask.shape[0]))
             img[mask & ~sil] = (0.5 * img[mask & ~sil] + 0.5 * np.array([0, 255, 0])).astype(np.uint8)   # mask only
             img[sil & ~mask] = (0.5 * img[sil & ~mask] + 0.5 * np.array([0, 0, 255])).astype(np.uint8)   # render only

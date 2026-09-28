@@ -563,7 +563,7 @@ def quarantine_rejected_frames(mask_dir, label_dirs, rejected_frames):
     into a sibling mask_bin_rejected/ (mask_overlay_rejected/) dir, then
     write an all-zero PNG of the same size/mode at the original path, so
     every downstream consumer that reads mask_bin/<frame>.png directly from
-    disk (apply_segmentation_mask.py, export_rgba_masks.py,
+    disk (apply_segmentation_mask.py,
     extract_object_mesh.py/reconstruct_scene.py's search_hull_padding, and
     this script's own export_debug_projections) sees "no detection" there
     with no code changes needed on their end. Idempotent across reruns."""
@@ -744,7 +744,7 @@ def export_debug_projections(cam_extrinsics, cam_intrinsics, mask_dir, label_dir
 
 def main():
     parser = argparse.ArgumentParser(description="Segment the raw input point cloud using 2D masks")
-    parser.add_argument("--dataset", type=str, required=True, help="Path to dataset/<scene> (contains sparse/0/)")
+    parser.add_argument("--dataset", type=str, required=True, help="Path to dataset/<scene> (contains colmap/)")
     parser.add_argument("--output", type=str, required=True, help="Path to output/<scene>")
     parser.add_argument("--text", type=str, required=True)
     parser.add_argument("--classes", type=str, default=None,
@@ -822,7 +822,7 @@ def main():
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    sparse_dir = os.path.join(args.dataset, "sparse", "0")
+    sparse_dir = os.path.join(args.dataset, "colmap")
     mask_dir = args.mask_dir_override or os.path.join(args.output, "masks", args.text)
 
     cam_extrinsics, cam_intrinsics, xyz_np, rgb_np = read_colmap_model(sparse_dir)
@@ -856,7 +856,7 @@ def main():
     with open(os.path.join(mask_dir, "labels.json")) as f:
         label_dirs = json.load(f)  # {class_name: sanitized_dirname}
 
-    images_dir = os.path.join(args.dataset, "images")
+    images_dir = os.path.join(args.dataset, "rgb")
 
     # Direct 2D->3D lifting: unproject each class's mask-foreground pixels
     # to new world-space points via per-pixel depth, instead of classifying

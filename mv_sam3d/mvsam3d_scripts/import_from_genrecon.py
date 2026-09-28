@@ -10,12 +10,12 @@ geometry without running Depth Anything 3 at all.
 
 Expected genrecon run directory layout:
     <genrecon_run>/
-      vggt_export/
-        images/frame_NNNNNN.jpg
+      stage_0_vggt/
+        rgb/frame_NNNNNN.jpg
         depth/frame_NNNNNN_depth.npy        (H, W, 1) float32
-        sparse/0/cameras.txt                COLMAP text, PINHOLE per frame
-        sparse/0/images.txt                 COLMAP text, w2c poses
-      genrecon_output/segmentation_raw/masks/classes/
+        colmap/cameras.txt                COLMAP text, PINHOLE per frame
+        colmap/images.txt                 COLMAP text, w2c poses
+      stage_1_segmentation/
         labels.json                         {class_name: dir_name}
         <class>/mask_bin/frame_NNNNNN.png   binary uint8 mask, every frame
 
@@ -143,7 +143,7 @@ def parse_images_txt(path: Path) -> List[dict]:
 
 
 def load_labels(segmentation_dir: Path) -> Dict[str, str]:
-    labels_path = segmentation_dir / "masks" / "classes" / "labels.json"
+    labels_path = segmentation_dir / "labels.json"
     if not labels_path.exists():
         return {}
     return json.loads(labels_path.read_text())
@@ -155,21 +155,21 @@ def import_from_genrecon(genrecon_run: Path, output_dir: Path, objects: List[str
     (default: all classes in labels.json)."""
     genrecon_run = Path(genrecon_run)
     output_dir = Path(output_dir)
-    vggt_export = genrecon_run / "vggt_export"
-    segmentation_dir = genrecon_run / "genrecon_output" / "segmentation_raw"
+    vggt_export = genrecon_run / "stage_0_vggt"
+    segmentation_dir = genrecon_run / "stage_1_segmentation"
 
     if not vggt_export.exists():
-        raise FileNotFoundError(f"vggt_export/ not found under {genrecon_run}")
+        raise FileNotFoundError(f"stage_0_vggt/ not found under {genrecon_run}")
 
-    print(f"[import_from_genrecon] Reading cameras from {vggt_export / 'sparse/0/cameras.txt'}")
-    cameras = parse_cameras_txt(vggt_export / "sparse" / "0" / "cameras.txt")
+    print(f"[import_from_genrecon] Reading cameras from {vggt_export / 'colmap/cameras.txt'}")
+    cameras = parse_cameras_txt(vggt_export / "colmap" / "cameras.txt")
 
-    print(f"[import_from_genrecon] Reading poses from {vggt_export / 'sparse/0/images.txt'}")
-    image_entries = parse_images_txt(vggt_export / "sparse" / "0" / "images.txt")
+    print(f"[import_from_genrecon] Reading poses from {vggt_export / 'colmap/images.txt'}")
+    image_entries = parse_images_txt(vggt_export / "colmap" / "images.txt")
     print(f"[import_from_genrecon] Found {len(image_entries)} frames")
 
     depth_dir = vggt_export / "depth"
-    images_src_dir = vggt_export / "images"
+    images_src_dir = vggt_export / "rgb"
 
     output_dir.mkdir(parents=True, exist_ok=True)
     images_dst_dir = output_dir / "images"
@@ -245,7 +245,7 @@ def import_from_genrecon(genrecon_run: Path, output_dir: Path, objects: List[str
 
     for class_name in object_names:
         dir_name = labels.get(class_name, class_name)
-        mask_bin_dir = segmentation_dir / "masks" / "classes" / dir_name / "mask_bin"
+        mask_bin_dir = segmentation_dir / dir_name / "mask_bin"
         if not mask_bin_dir.exists():
             print(f"[import_from_genrecon]   WARNING: no mask_bin/ for class '{class_name}' (dir '{dir_name}') at {mask_bin_dir}, skipping")
             continue

@@ -97,8 +97,8 @@ def main():
     run_dir = args.run_dir.resolve()
     scene_name = run_dir.name
     dataset = f"{scene_name}_mvsam3d_input"
-    mask_dir = run_dir / "genrecon_output" / "segmentation_raw" / "masks" / "classes"
-    shapes_dir = run_dir / "genrecon_output" / "shapes"
+    mask_dir = run_dir / "stage_1_segmentation"
+    shapes_dir = run_dir / "stage_3_genrecon" / "shapes"
     out_dir = (args.out_dir or run_dir / "debug_alignment").resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -114,7 +114,7 @@ def main():
         cmo.collect_mvsam3d_outputs(args.visualization_dir, dataset, labels, raw_dir)
         cmo.collect_mvsam3d_outputs(
             args.visualization_dir, dataset, labels, aligned_dir,
-            scene_pointcloud_dir=mask_dir, mvsam3d_input_dir=run_dir / dataset,
+            scene_pointcloud_dir=mask_dir, mvsam3d_input_dir=run_dir / "stage_2_mv_sam3d" / "input",
         )
 
         for label in labels:
@@ -151,8 +151,8 @@ def main():
                 "extent_unaligned_xyz": ext(un_geoms).round(3).tolist(),
                 "extent_yaw_aligned_xyz": ext(al_geoms).round(3).tolist(),
                 "replication": [
-                    compare_with_run("image_to_3d_meshes(pre-fit)", dumped(trimesh.load(str(aligned_glb), force="scene")),
-                                     run_dir / "image_to_3d_meshes" / label / "mesh.glb"),
+                    compare_with_run("stage_2_mv_sam3d(pre-fit)", dumped(trimesh.load(str(aligned_glb), force="scene")),
+                                     run_dir / "stage_2_mv_sam3d" / label / "mesh.glb"),
                     compare_with_run("shapes/glb(post-fit)", al_geoms, shapes_dir / "glb" / san / "mesh.glb"),
                 ],
             }

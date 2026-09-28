@@ -11,7 +11,7 @@ segment_pointcloud.py, this writes:
 
 Usage:
     uv run python scripts/apply_segmentation_mask.py \
-        --images_dir runs/<scene>/vggt_export/images \
+        --images_dir runs/<scene>/stage_0_vggt/rgb \
         --masks_root COB-GS/output/<scene>/masks/<label> \
         --background_ply COB-GS/output/<scene>/masks/<label>/background/point_cloud/background.ply \
         --out_rgb_dir runs/<scene>/segmentation/masked_rgb \

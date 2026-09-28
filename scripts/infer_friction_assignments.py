@@ -20,9 +20,9 @@ no honest label to match against the table. It stays on convert_asset.py's own
 
 Usage:
     uv run python scripts/infer_friction_assignments.py \
-        --labels_json runs/<scene>/genrecon_output/segmentation_raw/masks/classes/labels.json \
+        --labels_json runs/<scene>/stage_1_segmentation/labels.json \
         --friction_table configs/materials/friction_table.example.yaml \
-        --out_json runs/<scene>/genrecon_output/shapes/friction_assignments.json
+        --out_json runs/<scene>/stage_3_genrecon/shapes/friction_assignments.json
 """
 import argparse
 import json

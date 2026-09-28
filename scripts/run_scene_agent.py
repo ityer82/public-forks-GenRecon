@@ -3,7 +3,7 @@ local Ollama LLM (genrecon.utils.scene_agent), for run_full_pipeline.sh's --ai-s
 P0 to consume.
 
 Must run after Stage 3 (mv-sam3d/TRELLIS.2 per-object mesh reconstruction) has populated
-runs/<scene>/image_to_3d_meshes/<label>/mesh.glb for every --classes label -- the agent describes
+runs/<scene>/stage_2_mv_sam3d/<label>/mesh.glb for every --classes label -- the agent describes
 each object's real-world size to the user from those meshes before asking anything.
 
 Writes a single scene_spec.json capturing every decision (pick/place target, approach side,
@@ -13,7 +13,7 @@ self-documenting like manifest.json/friction_assignments.json already are.
 Usage:
     uv run python scripts/run_scene_agent.py \
         --classes "banana,bowl" \
-        --mesh_dir runs/<scene>/image_to_3d_meshes \
+        --mesh_dir runs/<scene>/stage_2_mv_sam3d \
         --out_json runs/<scene>/pick_place/scene_spec.json
 """
 import argparse
@@ -27,7 +27,7 @@ from genrecon.utils.scene_agent import run_scene_agent
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--classes", required=True, help="Comma-separated class labels, same spelling as run_full_pipeline.sh's --classes.")
-    parser.add_argument("--mesh_dir", type=Path, required=True, help="Directory containing <label>/mesh.glb per class (runs/<scene>/image_to_3d_meshes).")
+    parser.add_argument("--mesh_dir", type=Path, required=True, help="Directory containing <label>/mesh.glb per class (runs/<scene>/stage_2_mv_sam3d).")
     parser.add_argument("--out_json", type=Path, required=True)
     parser.add_argument("--ollama_model", default="llama3.1:8b")
     parser.add_argument("--ollama_host", default="http://localhost:11434")
