@@ -115,15 +115,22 @@ video_predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint)
 sam2_image_model = build_sam2(model_cfg, sam2_checkpoint)
 image_predictor = SAM2ImagePredictor(sam2_image_model)
 
-# build grounding dino model (skipped when --boxes_json is given, which needs no detector)
+# build grounding dino model (deferred when --boxes_json is given: seeding needs no
+# detector, but empty-mask re-detection still does, so it is loaded on first use)
 device = "cuda" if torch.cuda.is_available() else "cpu"
 grounding_model = None
-if args.boxes_json is None:
-    grounding_model = load_model(
+
+
+def _load_grounding_model():
+    return load_model(
         model_config_path=os.path.join(REPO_ROOT, "checkpoints", "groundingdino", "GroundingDINO_SwinB_cfg.py"),
         model_checkpoint_path=os.path.join(REPO_ROOT, "checkpoints", "groundingdino", "ckpts", "groundingdino_swinb_cogcoor.pth"),
         device=device
     )
+
+
+if args.boxes_json is None:
+    grounding_model = _load_grounding_model()
 # setup the input image and text prompt for SAM 2 and Grounding DINO
 # VERY important: text queries need to be lowercased + end with a dot
 
@@ -523,6 +530,8 @@ while global_idx < len(frame_names):
         img_path = os.path.join(video_dir, frame_names[global_idx])
         print(f"empty mask for classes {missing_classes}: " + img_path)
         image_source, image = load_image(img_path)
+        if grounding_model is None:
+            grounding_model = _load_grounding_model()
         input_boxes_det, confidences_det, class_names_det = detect_frame_boxes(
             grounding_model, image_source, image, detect_caption,
             box_threshold=0.5,

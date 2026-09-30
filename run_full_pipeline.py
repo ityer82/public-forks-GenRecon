@@ -9,6 +9,7 @@ still runs in its own separate uv env.
 
 Usage:
     uv run python run_full_pipeline.py <image_folder> <scene_name> [options...]
+    uv run python run_full_pipeline.py <video_file> <scene_name> --video [options...]
 
 Example:
     uv run python run_full_pipeline.py /path/to/images food2_vggt --classes "banana,bowl" --mode pick-and-place \\
@@ -20,7 +21,10 @@ import argparse
 import json
 import os
 import random
+import shutil
+import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -36,6 +40,8 @@ TEXTURE_SIZE = 2048
 USE_TRELLIS = True
 MODES = ("pick-and-place", "full-scene", "full-scene-with-robot")
 FULL_SCENE_MODES = ("full-scene", "full-scene-with-robot")
+VIDEO_FPS = 5
+VIDEO_WIDTH, VIDEO_HEIGHT = 960, 540  # matches ../fisheye/data/food
 DISCOVERY_HF_MODEL = "Qwen/Qwen3-VL-8B-Instruct"  # one-shot object labels + boxes (Stage 0b)
 
 
@@ -46,11 +52,32 @@ def _place_offset(s: str) -> tuple[float, float, float]:
     return (parts[0], parts[1], parts[2])
 
 
+def extract_video_frames(video: Path, out_dir: Path) -> int:
+    """ffmpeg: sample `video` at VIDEO_FPS, resize to VIDEO_WIDTHxVIDEO_HEIGHT, write JPEGs to out_dir."""
+    if shutil.which("ffmpeg") is None:
+        raise RuntimeError("--video requires ffmpeg on PATH.")
+    subprocess.run(
+        [
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(video),
+            "-vf", f"fps={VIDEO_FPS},scale={VIDEO_WIDTH}:{VIDEO_HEIGHT}",
+            "-q:v", "2", str(out_dir / "frame_%06d.jpg"),
+        ],
+        check=True,
+    )
+    return len(list(out_dir.glob("frame_*.jpg")))
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("image_folder", type=Path)
+    parser.add_argument("image_folder", type=Path, help="Folder of images (or a video file with --video).")
     parser.add_argument("scene_name", type=str)
 
+    parser.add_argument(
+        "--video", action="store_true", default=False,
+        help=f"Treat the first positional argument as a video file: extract frames at {VIDEO_FPS} fps, "
+        f"resized to {VIDEO_WIDTH}x{VIDEO_HEIGHT}, into a temporary folder (deleted when the run "
+        "ends) that Stage 0 reads instead. All later stages use Stage 0's outputs.",
+    )
     parser.add_argument("--num_imgs_per_scene", type=int, default=32)
     parser.add_argument("--skip-frames", dest="skip_frames", type=int, default=-1)
     parser.add_argument(
@@ -149,7 +176,12 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace, log
     --classes list and the effective use_trellis flag (derived from USE_TRELLIS, overridden per
     the same rules bash silently applied). Calls parser.error() (exit 2) on invalid combinations,
     matching bash's exit-1-with-message behavior closely enough for a CLI tool."""
-    if not args.image_folder.is_dir():
+    if args.video:
+        if not args.image_folder.is_file():
+            parser.error(f"Video file not found: {args.image_folder}")
+        if args.stage_0_use_stereo:
+            parser.error("--video cannot be combined with --stage-0-use-stereo.")
+    elif not args.image_folder.is_dir():
         parser.error(f"Image folder not found: {args.image_folder}")
 
     full_scene_mode = args.mode in FULL_SCENE_MODES
@@ -296,7 +328,18 @@ def main(argv: list[str] | None = None) -> None:
     pipeline_t0 = time.monotonic()
     logger.info(f"Pipeline started for scene '{args.scene_name}'")
 
+    video_tmp_dir: Path | None = None
     try:
+        # ── Video input: extract + downsample + resize into a temp image folder for Stage 0 ──
+        if args.video and args.start_from_stage <= 0:
+            video_tmp_dir = Path(tempfile.mkdtemp(prefix=f"{args.scene_name}_frames_"))
+            with stage(f"Extracting frames from {args.image_folder} ({VIDEO_FPS} fps, {VIDEO_WIDTH}x{VIDEO_HEIGHT}) -> {video_tmp_dir}"):
+                n_frames = extract_video_frames(args.image_folder, video_tmp_dir)
+                if n_frames == 0:
+                    raise RuntimeError(f"ffmpeg extracted no frames from {args.image_folder}")
+                logger.info(f"Extracted {n_frames} frames")
+            args.image_folder = video_tmp_dir
+
         # ── Stage 0: VGGT-Omega export (or FoundationStereo with --stage-0-use-stereo) ──
         if args.start_from_stage <= 0 and args.stage_0_use_stereo:
             with stage(f"Stage 0: FoundationStereo export -> {export_dir}"):
@@ -680,6 +723,9 @@ def main(argv: list[str] | None = None) -> None:
     except Exception:
         logger.exception(f"Pipeline failed for scene '{args.scene_name}'")
         sys.exit(1)
+    finally:
+        if video_tmp_dir is not None:
+            shutil.rmtree(video_tmp_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":
