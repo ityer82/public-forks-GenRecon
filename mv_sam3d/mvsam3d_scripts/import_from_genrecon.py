@@ -197,6 +197,11 @@ def import_from_genrecon(genrecon_run: Path, output_dir: Path, objects: List[str
             raise ValueError(f"Depth shape {depth.shape} != camera size ({H}, {W}) for {stem}")
 
         pointmap = depth_to_pointmap(depth, K)
+        # Pixels without a depth estimate (stereo occlusions/invalid disparity; VGGT never emits
+        # any) must be NaN, not (0, 0, 0): SAM3D's intrinsics inference only skips non-finite
+        # points, and a zero-depth point makes its focal/shift solve fail with "Residuals are not
+        # finite in the initial point".
+        pointmap[depth <= 0] = np.nan
         pointmap_sam3d = pointmap.transpose(2, 0, 1)  # (3, H, W)
 
         all_depth.append(depth.astype(np.float32))

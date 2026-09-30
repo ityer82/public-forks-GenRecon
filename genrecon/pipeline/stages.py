@@ -111,6 +111,10 @@ def stage0_vggt_export(
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+    _finalize_stage0_layout(export_dir)
+
+
+def _finalize_stage0_layout(export_dir: Path) -> None:
     # Rename to the layout GenRecon's image loader expects (<dir>/rgb next to <dir>/colmap).
     (export_dir / "images").rename(export_dir / "rgb")
     (export_dir / "sparse" / "0").rename(export_dir / "colmap")
@@ -119,6 +123,45 @@ def stage0_vggt_export(
     cameras_txt = export_dir / "colmap" / "cameras.txt"
     if not cameras_txt.exists():
         raise FileNotFoundError(f"Expected COLMAP export not found at {cameras_txt}")
+
+
+def stage0_stereo_export(
+    image_folder: Path,
+    checkpoint: Path,
+    conf_path: Path,
+    export_dir: Path,
+    *,
+    align_to_gravity: bool,
+    rotate_horizontal_deg: float,
+    conf_thres: float,
+) -> None:
+    """Stage 0 alternative for a rectified stereo pair: FoundationStereo depth for both views,
+    written in exactly the layout stage0_vggt_export produces (rgb/, depth/, colmap/)."""
+    _ensure_on_path(GENRECON_DIR / "vggt")  # demo_rerun's gravity alignment + COLMAP export
+    _ensure_on_path(GENRECON_DIR / "foundation_stereo")
+    import torch
+    from demo_rerun import apply_gravity_alignment, export_colmap_dataset
+    from stereo_export import find_stereo_pair, load_model, run_stereo
+
+    left_path, right_path = find_stereo_pair(image_folder)
+    logger.info(f"Loading FoundationStereo checkpoint from {checkpoint}")
+    model = load_model(str(checkpoint))
+    try:
+        predictions = run_stereo(left_path, right_path, model, conf_path)
+        predictions = apply_gravity_alignment(predictions, align_to_gravity, rotate_horizontal_deg)
+        export_colmap_dataset(
+            predictions,
+            str(export_dir),
+            conf_thres=conf_thres,
+            max_points=1_000_000,
+            save_depth=True,
+        )
+    finally:
+        del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    _finalize_stage0_layout(export_dir)
 
 
 # ---------------------------------------------------------------------------

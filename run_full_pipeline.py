@@ -28,6 +28,7 @@ GENRECON_DIR = Path(__file__).resolve().parent
 ISAACSIM_DIR = GENRECON_DIR.parent / "IsaacSim"
 MVSAM3D_VENDOR_DIR = GENRECON_DIR / "mv_sam3d"
 VGGT_CHECKPOINT = GENRECON_DIR / "checkpoints" / "vggt_omega" / "ckpts" / "vggt_omega_1b_512.pt"
+FOUNDATION_STEREO_CHECKPOINT = GENRECON_DIR / "checkpoints" / "foundation_stereo" / "11-33-40" / "model_best_bp2.pth"
 COLLISION_APPROXIMATION = "convexDecomposition"
 RUN_GLB = False
 SIMPLIFY_THRESHOLD = 250_000
@@ -111,6 +112,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="Spawn the rerun point-cloud viewer after Stage 0's export (background thread). Off "
         "by default -- nothing downstream reads from it, and it adds nothing to a headless run.",
     )
+    parser.add_argument(
+        "--stage-0-use-stereo", dest="stage_0_use_stereo", action="store_true", default=False,
+        help="Run FoundationStereo instead of VGGT-Omega in Stage 0. image_folder must hold exactly "
+        "one left and one right image (filenames containing 'left'/'right') from a rectified stereo "
+        "pair, plus a ZED .conf calibration (see --stereo-conf). pick-and-place mode only. "
+        "Everything after Stage 0 is unchanged.",
+    )
+    parser.add_argument(
+        "--stereo-conf", dest="stereo_conf", type=Path, default=None,
+        help="ZED .conf calibration file for --stage-0-use-stereo. Default: the single *.conf in image_folder.",
+    )
     parser.add_argument("--pick_place_target", default=None)
     parser.add_argument("--place-offset", dest="place_offset", type=_place_offset, default=(0.3, 0.0, 0.0))
     parser.add_argument("--place-target", dest="place_target", default=None)
@@ -141,6 +153,31 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace, log
         parser.error(f"Image folder not found: {args.image_folder}")
 
     full_scene_mode = args.mode in FULL_SCENE_MODES
+
+    if args.stage_0_use_stereo:
+        if args.mode != "pick-and-place":
+            parser.error("--stage-0-use-stereo is only valid with --mode pick-and-place.")
+        for flag, used in (
+            ("--skip-frames", args.skip_frames != -1),
+            ("--max-frames", args.max_frames != -1),
+            ("--vggt-viewer", args.vggt_viewer),
+        ):
+            if used:
+                parser.error(f"{flag} cannot be combined with --stage-0-use-stereo.")
+        if args.start_from_stage <= 0 and not FOUNDATION_STEREO_CHECKPOINT.is_file():
+            parser.error(f"FoundationStereo checkpoint not found at {FOUNDATION_STEREO_CHECKPOINT}.")
+        if args.stereo_conf is None:
+            confs = sorted(args.image_folder.glob("*.conf"))
+            if len(confs) != 1:
+                parser.error(
+                    f"--stage-0-use-stereo needs --stereo-conf, or exactly one *.conf in {args.image_folder} "
+                    f"(found {len(confs)})."
+                )
+            args.stereo_conf = confs[0]
+        elif not args.stereo_conf.is_file():
+            parser.error(f"--stereo-conf file not found: {args.stereo_conf}")
+    elif args.stereo_conf is not None:
+        parser.error("--stereo-conf requires --stage-0-use-stereo.")
 
     if full_scene_mode:
         if not args.classes:
@@ -260,8 +297,20 @@ def main(argv: list[str] | None = None) -> None:
     logger.info(f"Pipeline started for scene '{args.scene_name}'")
 
     try:
-        # ── Stage 0: VGGT-Omega export ──
-        if args.start_from_stage <= 0:
+        # ── Stage 0: VGGT-Omega export (or FoundationStereo with --stage-0-use-stereo) ──
+        if args.start_from_stage <= 0 and args.stage_0_use_stereo:
+            with stage(f"Stage 0: FoundationStereo export -> {export_dir}"):
+                export_dir.mkdir(parents=True, exist_ok=True)
+                stages.stage0_stereo_export(
+                    args.image_folder,
+                    FOUNDATION_STEREO_CHECKPOINT,
+                    args.stereo_conf,
+                    export_dir,
+                    align_to_gravity=True,
+                    rotate_horizontal_deg=args.rotate_horizontal_deg,
+                    conf_thres=args.vggt_conf_thres,
+                )
+        elif args.start_from_stage <= 0:
             with stage(f"Stage 0: VGGT-Omega export -> {export_dir}"):
                 export_dir.mkdir(parents=True, exist_ok=True)
                 stages.stage0_vggt_export(

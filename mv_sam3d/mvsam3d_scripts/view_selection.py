@@ -88,6 +88,7 @@ def compute_object_centroid_from_pointmaps(
             # Sizes must line up; skip this view rather than guess a resize.
             continue
         pts_cam = pointmap[mask_bool]  # (M, 3)
+        pts_cam = pts_cam[np.isfinite(pts_cam).all(axis=1)]  # stereo exports leave invalid pixels as NaN
         if pts_cam.size == 0:
             continue
         c2w = np.asarray(pose["c2w"])  # (4, 4)
