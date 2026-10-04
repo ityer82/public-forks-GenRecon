@@ -118,10 +118,11 @@ def build_parser() -> argparse.ArgumentParser:
                              "MV-SAM3D's main diffusion pass. Pass 0 or a value >= the scene's "
                              "view count to disable pruning (use every view with a mask).")
     parser.add_argument("--mvsam3d-align-shape-latents", dest="mvsam3d_align_shape_latents",
-                        action="store_true", default=False,
+                        action=argparse.BooleanOptionalAction, default=True,
                         help="MV-SAM3D stage 1: align each view's canonical frame (cube rotation found "
                              "from a single-view pre-pass) to the reference view before fusing, "
-                             "fixing crossed slabs when views disagree on the canonical frame.")
+                             "fixing crossed slabs when views disagree on the canonical frame. "
+                             "On by default; pass --no-mvsam3d-align-shape-latents to disable.")
     parser.add_argument("--skip_isaac", dest="run_usd", action="store_false", default=True)
     parser.add_argument(
         "--friction-table-path", type=Path,

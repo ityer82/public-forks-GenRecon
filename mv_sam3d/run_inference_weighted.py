@@ -4158,11 +4158,11 @@ Examples:
                              "whose pose prediction is used, and whose extrinsic is saved as ref_extrinsic): "
                              "'best_mask' = largest un-clipped mask (default), 'first' = first view "
                              "with a mask (old behaviour).")
-    parser.add_argument("--align_shape_latents", action="store_true",
+    parser.add_argument("--align_shape_latents", action=argparse.BooleanOptionalAction, default=True,
                         help="Stage 1: per view, run a cheap single-view pre-pass, find the cube rotation "
                              "mapping that view's canonical frame onto view 0's, and fuse views in the "
                              "aligned frame (fixes crossed slabs from views disagreeing on the canonical "
-                             "frame). Default: off.")
+                             "frame). On by default; pass --no-align_shape_latents to disable.")
     parser.add_argument("--view_selection_pointcloud_dir", type=str, default=None,
                         help="Optional dir of per-object segmentation point clouds "
                              "(<dir>/<label>/point_cloud/<label>.ply) used as the object centroid "
