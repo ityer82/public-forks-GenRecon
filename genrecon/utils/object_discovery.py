@@ -26,7 +26,7 @@ from genrecon.utils.logger import logger
 
 DETECTION_PROMPT = (
     "This is a tabletop scene. Ignore robot arms, the table and background. List every distinct "
-    "object on the table. Give each a short, visually specific label (start with its most "
+    "object on the table; if several instances of the same kind exist, list each one separately. Give each a short, visually specific label (start with its most "
     "distinctive color or material, so similar objects such as a plate and a bowl can be told "
     "apart) and a tight bounding box. Output only JSON: "
     "[{\"label\": str, \"bbox_2d\": [x1, y1, x2, y2]}] with coordinates relative to the image on "
@@ -46,6 +46,7 @@ def _build_prompt(classes: list[str] | None) -> str:
         "This is a tabletop scene. Ignore robot arms, the table and background. Find each of "
         f"the following objects if it is present on the table: {class_list}. For each one "
         "found, give its exact label copied verbatim from that list and a tight bounding box. "
+        "If several instances of one listed object exist, report each one separately. "
         "Do not report any object that isn't in the list. Output only JSON: "
         "[{\"label\": str, \"bbox_2d\": [x1, y1, x2, y2]}] with coordinates relative to the "
         "image on a 0-1000 grid."
@@ -204,7 +205,7 @@ def discover_objects(
         )
         paired = [(label, box, box) for label, box in per_view[0]]
 
-    objects, seen = [], set()
+    named = []
     for label, left_box, right_box in paired:
         if classes:
             matched = next((c for c in classes if c.strip().lower() == label), None)
@@ -212,14 +213,24 @@ def discover_objects(
                 logger.warning(f"Discovery: dropping detection '{label}' -- not in --classes")
                 continue
             label = matched
-        if label in seen:
-            logger.warning(f"Discovery: dropping duplicate label '{label}'")
-            continue
-        seen.add(label)
+        named.append((label, left_box, right_box))
+
+    # Several instances of one label (e.g. two knives) become separate classes "<label> 1",
+    # "<label> 2", ... in left-to-right order, because every later stage keys masks, meshes and
+    # prims by a single label per object. A label seen once keeps its plain name.
+    counts = {}
+    for label, _, _ in named:
+        counts[label] = counts.get(label, 0) + 1
+    objects, next_index = [], {}
+    for label, left_box, right_box in sorted(named, key=lambda d: d[1][0]):
+        if counts[label] > 1:
+            next_index[label] = next_index.get(label, 0) + 1
+            label = f"{label} {next_index[label]}"
         objects.append({"label": label, "left_box": left_box, "right_box": right_box})
+    seen_base = {l for l, _, _ in named}
 
     if classes:
-        missing = [c for c in classes if c not in seen]
+        missing = [c for c in classes if c not in seen_base]
         if missing:
             logger.warning(f"Discovery: requested class(es) not detected: {', '.join(missing)}")
 
