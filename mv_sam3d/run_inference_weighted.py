@@ -2268,7 +2268,6 @@ def run_multiobject_inference(
     # Reference view (view 0 = pose source): 'best_mask' or 'first' (old behaviour)
     ref_view_policy: str = "best_mask",
     # Stage 1: give each view the rotation state in its own camera frame (from DA3 extrinsics)
-    pose_from_extrinsics: bool = False,
     align_shape_latents: bool = False,
 ):
     """
@@ -2382,7 +2381,6 @@ def run_multiobject_inference(
                 top_k_views=top_k_views,
                 view_selection_pointcloud_dir=view_selection_pointcloud_dir,
                 ref_view_policy=ref_view_policy,
-                pose_from_extrinsics=pose_from_extrinsics,
                 align_shape_latents=align_shape_latents,
             )
 
@@ -2483,7 +2481,6 @@ def run_single_object_for_multiobject(
     # Reference view (view 0 = pose source): 'best_mask' or 'first' (old behaviour)
     ref_view_policy: str = "best_mask",
     # Stage 1: give each view the rotation state in its own camera frame (from DA3 extrinsics)
-    pose_from_extrinsics: bool = False,
     align_shape_latents: bool = False,
 ) -> Optional[dict]:
     """
@@ -2538,7 +2535,6 @@ def run_single_object_for_multiobject(
         top_k_views=top_k_views,
         view_selection_pointcloud_dir=view_selection_pointcloud_dir,
         ref_view_policy=ref_view_policy,
-        pose_from_extrinsics=pose_from_extrinsics,
         align_shape_latents=align_shape_latents,
     )
 
@@ -2648,7 +2644,6 @@ def run_weighted_inference(
     # Reference view (view 0 = pose source): 'best_mask' or 'first' (old behaviour)
     ref_view_policy: str = "best_mask",
     # Stage 1: give each view the rotation state in its own camera frame (from DA3 extrinsics)
-    pose_from_extrinsics: bool = False,
     align_shape_latents: bool = False,
 ):
     """
@@ -2921,13 +2916,6 @@ def run_weighted_inference(
         logger.warning("Single view detected - weighting is not applicable, using standard inference")
         stage1_weighting = False
         stage2_weighting = False
-
-    if pose_from_extrinsics and (is_single_view or da3_extrinsics is None):
-        logger.warning(
-            "[PoseTransport] --pose_from_extrinsics needs >1 view and DA3 extrinsics "
-            "(--da3_output); ignoring it."
-        )
-        pose_from_extrinsics = False
 
     # Check parameter conflicts
     # 1. --merge_da3_glb requires --da3_output
@@ -3203,7 +3191,6 @@ def run_weighted_inference(
             ss_entropy_layer=stage1_entropy_layer,
             ss_entropy_alpha=stage1_entropy_alpha,
             ss_warmup_steps=1,  # Fixed at 1 for stability
-            view_extrinsics=da3_extrinsics if pose_from_extrinsics else None,
             align_shape_latents=align_shape_latents,
         )
         weight_manager = result.get("weight_manager")
@@ -4171,11 +4158,6 @@ Examples:
                              "whose pose prediction is used, and whose extrinsic is saved as ref_extrinsic): "
                              "'best_mask' = largest un-clipped mask (default), 'first' = first view "
                              "with a mask (old behaviour).")
-    parser.add_argument("--pose_from_extrinsics", action="store_true",
-                        help="Stage 1: express the rotation state in each view's own camera frame "
-                             "(from the DA3 extrinsics) and average the rotation velocity over all "
-                             "views, instead of feeding view 0's rotation to every view and keeping "
-                             "only view 0's pose velocity. Requires --da3_output. Default: off.")
     parser.add_argument("--align_shape_latents", action="store_true",
                         help="Stage 1: per view, run a cheap single-view pre-pass, find the cube rotation "
                              "mapping that view's canonical frame onto view 0's, and fuse views in the "
@@ -4270,7 +4252,6 @@ Examples:
                 top_k_views=args.top_k_views,
                 view_selection_pointcloud_dir=args.view_selection_pointcloud_dir,
                 ref_view_policy=args.ref_view_policy,
-                pose_from_extrinsics=args.pose_from_extrinsics,
                 align_shape_latents=args.align_shape_latents,
             )
         else:
@@ -4322,7 +4303,6 @@ Examples:
                 top_k_views=args.top_k_views,
                 view_selection_pointcloud_dir=args.view_selection_pointcloud_dir,
                 ref_view_policy=args.ref_view_policy,
-                pose_from_extrinsics=args.pose_from_extrinsics,
                 align_shape_latents=args.align_shape_latents,
             )
     except Exception as e:

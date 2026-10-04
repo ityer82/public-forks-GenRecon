@@ -350,7 +350,6 @@ def inject_ss_generator_with_collector(
     num_steps: int,
     attention_collector: SSAttentionCollector,
     attention_logger=None,
-    rotation_transport=None,
     latent_aligner=None,
 ):
     """
@@ -365,7 +364,6 @@ def inject_ss_generator_with_collector(
         num_steps: Number of inference steps
         attention_collector: SSAttentionCollector instance
         attention_logger: Optional CrossAttentionLogger for saving attention to files
-        rotation_transport: Optional RotationTransport, same meaning as in inject_generator_multi_view
         latent_aligner: Optional LatentAligner, same meaning as in inject_generator_multi_view
     
     Yields:
@@ -430,7 +428,7 @@ def inject_ss_generator_with_collector(
                         logger.info(f"[SSAttentionCollector] Hooked layer {idx} for attention collection")
     
     # Import POSE_KEYS from multi_view_utils
-    from sam3d_objects.pipeline.multi_view_utils import POSE_KEYS, ROTATION_KEY
+    from sam3d_objects.pipeline.multi_view_utils import POSE_KEYS
     
     def _new_dynamics_with_collection(x_t, t, *args_conditionals, **kwargs_conditionals):
         """Multidiffusion with attention collection for SS."""
@@ -471,12 +469,9 @@ def inject_ss_generator_with_collector(
                     attention_logger.set_view(view_idx)
                 
                 x_t_view = x_t
-                if isinstance(x_t, dict) and (rotation_transport is not None or latent_aligner is not None):
+                if latent_aligner is not None and isinstance(x_t, dict) and "shape" in x_t:
                     x_t_view = dict(x_t)
-                    if rotation_transport is not None and ROTATION_KEY in x_t:
-                        x_t_view[ROTATION_KEY] = rotation_transport.state_to_view(x_t[ROTATION_KEY], view_idx)
-                    if latent_aligner is not None and "shape" in x_t:
-                        x_t_view["shape"] = latent_aligner.to_view(x_t["shape"], view_idx)
+                    x_t_view["shape"] = latent_aligner.to_view(x_t["shape"], view_idx)
                 pred = original_dynamics(x_t_view, t, *new_args, **kwargs_conditionals)
                 preds.append(pred)
             
@@ -488,12 +483,7 @@ def inject_ss_generator_with_collector(
                 fused_pred = {}
                 for key in preds[0].keys():
                     stacked = torch.stack([p[key] for p in preds])
-                    if key == ROTATION_KEY and rotation_transport is not None:
-                        fused_pred[key] = torch.stack([
-                            rotation_transport.velocity_to_ref(x_t[key], p[key], i)
-                            for i, p in enumerate(preds)
-                        ]).mean(dim=0)
-                    elif key in POSE_KEYS:
+                    if key in POSE_KEYS:
                         fused_pred[key] = preds[0][key]
                     else:
                         fused_pred[key] = stacked.mean(dim=0)

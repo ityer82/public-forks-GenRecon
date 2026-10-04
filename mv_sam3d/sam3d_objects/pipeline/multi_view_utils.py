@@ -15,8 +15,6 @@ POSE_KEYS = {
     'quaternion',
 }
 
-ROTATION_KEY = '6drotation_normalized'
-
 
 @contextmanager
 def inject_generator_multi_view(
@@ -26,7 +24,6 @@ def inject_generator_multi_view(
     mode: Literal['stochastic', 'multidiffusion'] = 'multidiffusion',
     attention_logger=None,
     shape_weights: Optional[torch.Tensor] = None,
-    rotation_transport=None,
     latent_aligner=None,
 ):
     """
@@ -42,9 +39,6 @@ def inject_generator_multi_view(
             - If None: use simple average
             - If [num_views]: use per-view weights (same weight for all latent points)
             - If [num_views, num_latent_points]: use per-view-per-latent weights
-        rotation_transport: Optional pose_transport.RotationTransport. When given, view i is fed
-            the rotation state expressed in its own camera frame and its rotation velocity is
-            brought back to the view-0 frame and averaged over views.
         latent_aligner: Optional latent_alignment.LatentAligner. When given, view i runs in its own
             canonical frame (shape state permuted in, shape velocity permuted back before fusion).
     
@@ -54,8 +48,7 @@ def inject_generator_multi_view(
     Multi-view Iteration Strategy:
     ------------------------------
     - Shape: Weighted average (or simple average if no weights)
-    - Pose: Only View 0's velocity is used (other views' pose velocity ignored), except the
-      rotation when `rotation_transport` is given (transported per view, then averaged)
+    - Pose: Only View 0's velocity is used (other views' pose velocity ignored)
     - Output: shape + View 0's pose
     """
     all_view_states_storage = None
@@ -154,12 +147,9 @@ def inject_generator_multi_view(
                 if attention_logger is not None:
                     attention_logger.set_view(view_idx)
                 x_t_view = x_t
-                if isinstance(x_t, dict) and (rotation_transport is not None or latent_aligner is not None):
+                if latent_aligner is not None and isinstance(x_t, dict) and "shape" in x_t:
                     x_t_view = dict(x_t)
-                    if rotation_transport is not None and ROTATION_KEY in x_t:
-                        x_t_view[ROTATION_KEY] = rotation_transport.state_to_view(x_t[ROTATION_KEY], view_idx)
-                    if latent_aligner is not None and "shape" in x_t:
-                        x_t_view["shape"] = latent_aligner.to_view(x_t["shape"], view_idx)
+                    x_t_view["shape"] = latent_aligner.to_view(x_t["shape"], view_idx)
                 pred = original_dynamics(x_t_view, t, *new_args, **kwargs_conditionals)
                 preds.append(pred)
             
@@ -185,13 +175,7 @@ def inject_generator_multi_view(
                 fused_pred = {}
                 for key in preds[0].keys():
                     stacked = torch.stack([p[key] for p in preds])  # [num_views, bs, num_latent, dim]
-                    if key == ROTATION_KEY and rotation_transport is not None:
-                        # Rotation: each view's velocity back in the view-0 frame, then mean
-                        fused_pred[key] = torch.stack([
-                            rotation_transport.velocity_to_ref(x_t[key], p[key], i)
-                            for i, p in enumerate(preds)
-                        ]).mean(dim=0)
-                    elif key in POSE_KEYS:
+                    if key in POSE_KEYS:
                         # Pose: View 0 only
                         fused_pred[key] = preds[0][key]
                     else:

@@ -117,11 +117,6 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Prune to the k views that best cover each object angularly before "
                              "MV-SAM3D's main diffusion pass. Pass 0 or a value >= the scene's "
                              "view count to disable pruning (use every view with a mask).")
-    parser.add_argument("--mvsam3d-pose-from-extrinsics", dest="mvsam3d_pose_from_extrinsics",
-                        action="store_true", default=False,
-                        help="MV-SAM3D stage 1: give each view the rotation state in its own camera "
-                             "frame (from the stage 0 extrinsics) and average the rotation velocity "
-                             "over views, instead of using view 0's rotation/velocity only.")
     parser.add_argument("--mvsam3d-align-shape-latents", dest="mvsam3d_align_shape_latents",
                         action="store_true", default=False,
                         help="MV-SAM3D stage 1: align each view's canonical frame (cube rotation found "
@@ -463,7 +458,6 @@ def main(argv: list[str] | None = None) -> None:
                         stage1_steps=args.mvsam3d_stage1_steps,
                         stage2_steps=args.mvsam3d_stage2_steps,
                         top_k_views=args.mvsam3d_top_k_views,
-                        pose_from_extrinsics=args.mvsam3d_pose_from_extrinsics,
                         align_shape_latents=args.mvsam3d_align_shape_latents,
                     )
             else:
