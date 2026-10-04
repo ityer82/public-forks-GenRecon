@@ -228,6 +228,8 @@ def stage2_mvsam3d(
     stage1_steps: int = 25,
     stage2_steps: int = 12,
     top_k_views: int | None = 5,
+    pose_from_extrinsics: bool = False,
+    align_shape_latents: bool = False,
 ) -> None:
     _ensure_on_path(mvsam3d_vendor_dir / "mvsam3d_scripts")
     from collect_mvsam3d_outputs import collect_mvsam3d_outputs
@@ -254,6 +256,8 @@ def stage2_mvsam3d(
             stage2_steps=stage2_steps,
             top_k_views=top_k_views,
             view_selection_pointcloud_dir=cobgs_mask_dir,
+            pose_from_extrinsics=pose_from_extrinsics,
+            align_shape_latents=align_shape_latents,
         )
     else:
         run_weighted_inference(
@@ -264,6 +268,8 @@ def stage2_mvsam3d(
             stage2_steps=stage2_steps,
             top_k_views=top_k_views,
             view_selection_pointcloud_dir=cobgs_mask_dir,
+            pose_from_extrinsics=pose_from_extrinsics,
+            align_shape_latents=align_shape_latents,
         )
 
     import torch

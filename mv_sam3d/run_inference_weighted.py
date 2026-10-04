@@ -2267,6 +2267,9 @@ def run_multiobject_inference(
     view_selection_pointcloud_dir: Optional[Path] = None,
     # Reference view (view 0 = pose source): 'best_mask' or 'first' (old behaviour)
     ref_view_policy: str = "best_mask",
+    # Stage 1: give each view the rotation state in its own camera frame (from DA3 extrinsics)
+    pose_from_extrinsics: bool = False,
+    align_shape_latents: bool = False,
 ):
     """
     Run multi-object inference: process each object sequentially, then merge.
@@ -2379,6 +2382,8 @@ def run_multiobject_inference(
                 top_k_views=top_k_views,
                 view_selection_pointcloud_dir=view_selection_pointcloud_dir,
                 ref_view_policy=ref_view_policy,
+                pose_from_extrinsics=pose_from_extrinsics,
+                align_shape_latents=align_shape_latents,
             )
 
             if result:
@@ -2477,6 +2482,9 @@ def run_single_object_for_multiobject(
     view_selection_pointcloud_dir: Optional[Path] = None,
     # Reference view (view 0 = pose source): 'best_mask' or 'first' (old behaviour)
     ref_view_policy: str = "best_mask",
+    # Stage 1: give each view the rotation state in its own camera frame (from DA3 extrinsics)
+    pose_from_extrinsics: bool = False,
+    align_shape_latents: bool = False,
 ) -> Optional[dict]:
     """
     Wrapper for run_weighted_inference that returns GLB path and pose for multi-object merging.
@@ -2530,6 +2538,8 @@ def run_single_object_for_multiobject(
         top_k_views=top_k_views,
         view_selection_pointcloud_dir=view_selection_pointcloud_dir,
         ref_view_policy=ref_view_policy,
+        pose_from_extrinsics=pose_from_extrinsics,
+        align_shape_latents=align_shape_latents,
     )
 
     # Copy result files to object_output_dir
@@ -2637,6 +2647,9 @@ def run_weighted_inference(
     view_selection_pointcloud_dir: Optional[Path] = None,
     # Reference view (view 0 = pose source): 'best_mask' or 'first' (old behaviour)
     ref_view_policy: str = "best_mask",
+    # Stage 1: give each view the rotation state in its own camera frame (from DA3 extrinsics)
+    pose_from_extrinsics: bool = False,
+    align_shape_latents: bool = False,
 ):
     """
     Run weighted inference with adaptive multi-view fusion.
@@ -2908,7 +2921,14 @@ def run_weighted_inference(
         logger.warning("Single view detected - weighting is not applicable, using standard inference")
         stage1_weighting = False
         stage2_weighting = False
-    
+
+    if pose_from_extrinsics and (is_single_view or da3_extrinsics is None):
+        logger.warning(
+            "[PoseTransport] --pose_from_extrinsics needs >1 view and DA3 extrinsics "
+            "(--da3_output); ignoring it."
+        )
+        pose_from_extrinsics = False
+
     # Check parameter conflicts
     # 1. --merge_da3_glb requires --da3_output
     if merge_da3_glb and da3_output_path is None:
@@ -3183,6 +3203,8 @@ def run_weighted_inference(
             ss_entropy_layer=stage1_entropy_layer,
             ss_entropy_alpha=stage1_entropy_alpha,
             ss_warmup_steps=1,  # Fixed at 1 for stability
+            view_extrinsics=da3_extrinsics if pose_from_extrinsics else None,
+            align_shape_latents=align_shape_latents,
         )
         weight_manager = result.get("weight_manager")
         
@@ -4149,6 +4171,16 @@ Examples:
                              "whose pose prediction is used, and whose extrinsic is saved as ref_extrinsic): "
                              "'best_mask' = largest un-clipped mask (default), 'first' = first view "
                              "with a mask (old behaviour).")
+    parser.add_argument("--pose_from_extrinsics", action="store_true",
+                        help="Stage 1: express the rotation state in each view's own camera frame "
+                             "(from the DA3 extrinsics) and average the rotation velocity over all "
+                             "views, instead of feeding view 0's rotation to every view and keeping "
+                             "only view 0's pose velocity. Requires --da3_output. Default: off.")
+    parser.add_argument("--align_shape_latents", action="store_true",
+                        help="Stage 1: per view, run a cheap single-view pre-pass, find the cube rotation "
+                             "mapping that view's canonical frame onto view 0's, and fuse views in the "
+                             "aligned frame (fixes crossed slabs from views disagreeing on the canonical "
+                             "frame). Default: off.")
     parser.add_argument("--view_selection_pointcloud_dir", type=str, default=None,
                         help="Optional dir of per-object segmentation point clouds "
                              "(<dir>/<label>/point_cloud/<label>.ply) used as the object centroid "
@@ -4238,6 +4270,8 @@ Examples:
                 top_k_views=args.top_k_views,
                 view_selection_pointcloud_dir=args.view_selection_pointcloud_dir,
                 ref_view_policy=args.ref_view_policy,
+                pose_from_extrinsics=args.pose_from_extrinsics,
+                align_shape_latents=args.align_shape_latents,
             )
         else:
             # Single-object mode (original behavior)
@@ -4288,6 +4322,8 @@ Examples:
                 top_k_views=args.top_k_views,
                 view_selection_pointcloud_dir=args.view_selection_pointcloud_dir,
                 ref_view_policy=args.ref_view_policy,
+                pose_from_extrinsics=args.pose_from_extrinsics,
+                align_shape_latents=args.align_shape_latents,
             )
     except Exception as e:
         logger.error(f"Inference failed: {e}")

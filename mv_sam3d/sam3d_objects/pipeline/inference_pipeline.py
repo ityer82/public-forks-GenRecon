@@ -1010,6 +1010,30 @@ class InferencePipeline:
         
         return (all_conditions,), {}
 
+    def _estimate_latent_alignment(
+        self, ss_generator, ss_decoder, latent_shape_dict, device, condition_args, condition_kwargs, num_views
+    ):
+        """Single-view Stage 1 per view (same noise, RNG restored afterwards) -> per-view cube rotation
+        onto view 0's canonical frame, from decoded occupancy overlap."""
+        from sam3d_objects.pipeline.latent_alignment import LatentAligner
+
+        all_conditions = condition_args[0]
+        rng_state = torch.get_rng_state()
+        cuda_rng_state = torch.cuda.get_rng_state() if torch.cuda.is_available() else None
+        occupancies = []
+        for i in range(num_views):
+            torch.set_rng_state(rng_state)
+            if cuda_rng_state is not None:
+                torch.cuda.set_rng_state(cuda_rng_state)
+            out = ss_generator(latent_shape_dict, device, all_conditions[i], *condition_args[1:], **condition_kwargs)
+            shape = out["shape"] if isinstance(out, dict) else out
+            ss = ss_decoder(shape.permute(0, 2, 1).contiguous().view(shape.shape[0], 8, 16, 16, 16))
+            occupancies.append((ss[0, 0] > 0).cpu().numpy())
+        torch.set_rng_state(rng_state)
+        if cuda_rng_state is not None:
+            torch.cuda.set_rng_state(cuda_rng_state)
+        return LatentAligner.estimate(occupancies)
+
     def sample_sparse_structure_multi_view(
         self, 
         view_ss_input_dicts: List[dict], 
@@ -1022,6 +1046,8 @@ class InferencePipeline:
         ss_entropy_layer: int = 9,
         ss_entropy_alpha: float = 60.0,
         ss_warmup_steps: int = 1,
+        view_extrinsics: Optional[Any] = None,
+        align_shape_latents: bool = False,
     ):
         """
         Multi-view sparse structure generation
@@ -1035,6 +1061,13 @@ class InferencePipeline:
             ss_weighting: Whether to use entropy-based weighting for SS
             ss_entropy_layer: Which layer to use for entropy computation
             ss_entropy_alpha: Alpha parameter for softmax weighting
+            view_extrinsics: Optional per-view world-to-camera extrinsics. When given, each view
+                sees the rotation state in its own camera frame and the rotation velocity is
+                averaged over views (see pose_transport.py); otherwise view 0's rotation and
+                pose velocity are used for every view.
+            align_shape_latents: If True, run a cheap single-view pre-pass per view, find the cube
+                rotation that maps each view's canonical frame onto view 0's (see
+                latent_alignment.py) and fuse the views in that aligned frame.
         """
         from sam3d_objects.pipeline.multi_view_utils import inject_generator_multi_view
         from sam3d_objects.pipeline.multi_view_weighted import (
@@ -1046,6 +1079,13 @@ class InferencePipeline:
         ss_generator = self.models["ss_generator"]
         ss_decoder = self.models["ss_decoder"]
         num_views = len(view_ss_input_dicts)
+        rotation_transport = None
+        if view_extrinsics is not None and num_views > 1:
+            from sam3d_objects.pipeline.pose_transport import RotationTransport
+
+            assert len(view_extrinsics) == num_views, "Number of extrinsics must match number of views"
+            rotation_transport = RotationTransport(view_extrinsics)
+            logger.info("[Stage 1] Rotation state transported per view from DA3 extrinsics")
         if attention_logger is not None:
             attention_logger.start_stage("ss")
             attention_logger.set_num_views(num_views)
@@ -1090,6 +1130,15 @@ class InferencePipeline:
                     self.ss_condition_input_mapping,
                 )
                 
+                latent_aligner = None
+                if align_shape_latents and num_views > 1:
+                    latent_aligner = self._estimate_latent_alignment(
+                        ss_generator, ss_decoder, latent_shape_dict, image.device,
+                        condition_args, condition_kwargs, num_views,
+                    )
+                    if latent_aligner.is_identity:
+                        latent_aligner = None
+
                 # SS Weighting: Two-pass approach
                 shape_weights = None
                 if ss_weighting and num_views > 1:
@@ -1118,6 +1167,8 @@ class InferencePipeline:
                         num_steps=warmup_steps,
                         attention_collector=ss_attention_collector,
                         attention_logger=attention_logger,
+                        rotation_transport=rotation_transport,
+                        latent_aligner=latent_aligner,
                     ):
                         _ = ss_generator(
                             latent_shape_dict,
@@ -1138,6 +1189,7 @@ class InferencePipeline:
                         shape_weights = compute_ss_entropy_weights(
                             collected_attentions,
                             alpha=ss_entropy_alpha,
+                            latent_aligner=latent_aligner,
                         )
                         if shape_weights is not None:
                             logger.info(f"[Stage 1 Weighted] Computed shape weights: {shape_weights.shape}")
@@ -1164,6 +1216,8 @@ class InferencePipeline:
                     mode=mode,
                     attention_logger=attention_logger,
                     shape_weights=shape_weights,  # Pass computed weights
+                    rotation_transport=rotation_transport,
+                    latent_aligner=latent_aligner,
                 ) as all_view_poses_storage:
                     return_dict = ss_generator(
                         latent_shape_dict,
@@ -1552,6 +1606,8 @@ class InferencePipeline:
         ss_entropy_layer: int = 9,
         ss_entropy_alpha: float = 60.0,
         ss_warmup_steps: int = 1,
+        view_extrinsics: Optional[Any] = None,  # per-view w2c extrinsics -> per-view rotation state
+        align_shape_latents: bool = False,  # align each view's canonical frame before Stage 1 fusion
     ) -> dict:
         """
         Main multi-view inference function
@@ -1707,6 +1763,8 @@ class InferencePipeline:
             ss_entropy_layer=ss_entropy_layer,
             ss_entropy_alpha=ss_entropy_alpha,
             ss_warmup_steps=ss_warmup_steps,
+            view_extrinsics=view_extrinsics,
+            align_shape_latents=align_shape_latents,
         )
         
         # Get pointmap scale/shift from the first view for pose decoding
