@@ -358,6 +358,27 @@ def stageP0_scene_agent(
 # ---------------------------------------------------------------------------
 
 
+def _write_stage2_previews(scene, stage2_label_dir: Path, label: str, point_cloud_ply: Path) -> None:
+    """MeshLab previews next to the raw Stage 2 mesh: `<label>_MESH.ply` (simplified aligned mesh,
+    same world pose as the GLB Isaac gets) and `<label>_PCL.ply` (copy of the Stage 1 point cloud).
+    Failures only warn -- these are conveniences and must not break the stage."""
+    from align_meshes_to_scene import write_preview_ply
+
+    mesh_ply = stage2_label_dir / f"{label}_MESH.ply"
+    try:
+        write_preview_ply(scene, mesh_ply)
+        logger.info(f"wrote preview mesh {mesh_ply}")
+    except Exception as e:
+        logger.warning(f"failed to write preview mesh {mesh_ply}: {e}")
+
+    pcl_ply = stage2_label_dir / f"{label}_PCL.ply"
+    try:
+        shutil.copyfile(point_cloud_ply, pcl_ply)
+        logger.info(f"copied point cloud to {pcl_ply}")
+    except Exception as e:
+        logger.warning(f"failed to copy point cloud {point_cloud_ply} -> {pcl_ply}: {e}")
+
+
 def stageP1_align_meshes(
     run_dir: Path,
     classes: list[str],
@@ -386,6 +407,8 @@ def stageP1_align_meshes(
         out_glb = out_dir / "mesh.glb"
         scene.export(out_glb)
         logger.info(f"stageP1: wrote {out_glb} (scale={diagnostics['scale']:.4f})")
+
+        _write_stage2_previews(scene, trellis_glb.parent, label, scale_ref_ply)
 
 
 # ---------------------------------------------------------------------------
@@ -429,6 +452,33 @@ def stageP3_compose_isaac_scene(
         isaacsim_dir,
         ["--input", str(pick_place_glb_dir), "--output", str(scene_usda), *extra_args],
         log_file=log_file,
+        debug_config_log=debug_config_log,
+        log_mirror=log_mirror,
+    )
+
+
+def stage_penetration_check(
+    name: str,
+    scene_usda: Path,
+    report_json: Path,
+    *,
+    isaacsim_dir: Path,
+    fix: bool,
+    log_file: Path,
+    debug_config_log: Path,
+    log_mirror: LogMirror,
+) -> None:
+    """Detects inter-object penetration in the composed scene (PhysX contacts) and, with `fix`, writes
+    back the +z lifts that cleared their pair (scripts/isaac_detect_penetration.py). Report goes to
+    `report_json`; a backup of the scene is kept next to it before the first change."""
+    script = GENRECON_DIR / "scripts" / "isaac_detect_penetration.py"
+    run_external_step(
+        name,
+        script,
+        isaacsim_dir,
+        ["--scene", str(scene_usda), "--out_json", str(report_json), *(["--fix"] if fix else [])],
+        log_file=log_file,
+        runner=["uv", "run", str(script)],
         debug_config_log=debug_config_log,
         log_mirror=log_mirror,
     )
@@ -652,6 +702,9 @@ def stage7_mesh_to_glb(
         out_glb.parent.mkdir(parents=True, exist_ok=True)
         scene.export(out_glb)
         logger.info(f"Stage 7: substituted {out_glb} with TRELLIS mesh (scale={diagnostics['scale']:.4f})")
+
+        scale_ref_ply = run_dir / "stage_1_segmentation" / sanitized_label / "point_cloud" / f"{sanitized_label}.ply"
+        _write_stage2_previews(scene, trellis_glb.parent, label, scale_ref_ply)
 
 
 # ---------------------------------------------------------------------------

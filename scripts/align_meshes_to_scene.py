@@ -161,6 +161,31 @@ def align_trellis_mesh_to_scene(
     return scene, combined_transform, diagnostics
 
 
+def write_preview_ply(scene: trimesh.Scene, out_ply: Path, target_faces: int = 5000) -> None:
+    """Cheap MeshLab-friendly copy of an aligned `scene`: node transforms baked into the vertices
+    (so it sits in the same world pose Isaac gets), texture baked to per-vertex colors (PLY has no
+    standard texture linkage), and quadric-decimated to ~target_faces."""
+    mesh = scene.to_mesh()
+    if hasattr(mesh.visual, "to_color"):
+        mesh.visual = mesh.visual.to_color()
+
+    if len(mesh.faces) > target_faces:
+        o3d_mesh = o3d.geometry.TriangleMesh(
+            o3d.utility.Vector3dVector(mesh.vertices), o3d.utility.Vector3iVector(mesh.faces)
+        )
+        o3d_mesh.vertex_colors = o3d.utility.Vector3dVector(mesh.visual.vertex_colors[:, :3] / 255.0)
+        o3d_mesh = o3d_mesh.simplify_quadric_decimation(target_number_of_triangles=target_faces)
+        mesh = trimesh.Trimesh(
+            np.asarray(o3d_mesh.vertices),
+            np.asarray(o3d_mesh.triangles),
+            vertex_colors=(np.asarray(o3d_mesh.vertex_colors) * 255).astype(np.uint8),
+            process=False,
+        )
+
+    out_ply.parent.mkdir(parents=True, exist_ok=True)
+    mesh.export(out_ply)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--trellis_glb", type=Path, required=True)

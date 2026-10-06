@@ -125,6 +125,17 @@ def build_parser() -> argparse.ArgumentParser:
                              "On by default; pass --no-mvsam3d-align-shape-latents to disable.")
     parser.add_argument("--skip_isaac", dest="run_usd", action="store_false", default=True)
     parser.add_argument(
+        "--penetration-check", dest="penetration_check", action=argparse.BooleanOptionalAction, default=True,
+        help="After composing the Isaac scene, detect inter-object penetration (PhysX contacts) and write "
+        "penetration.json next to the scene's logs. On by default (~10 s); pass --no-penetration-check to skip.",
+    )
+    parser.add_argument(
+        "--penetration-fix", dest="penetration_fix", action=argparse.BooleanOptionalAction, default=True,
+        help="With the penetration check: write back the +z lifts that cleared their pair into scene.usda "
+        "(backup: scene.pre_penetration_fix.usda). Pairs no lift clears are reported but never moved. "
+        "On by default; pass --no-penetration-fix to only report.",
+    )
+    parser.add_argument(
         "--friction-table-path", type=Path,
         default=GENRECON_DIR / "configs" / "materials" / "friction_table.example.yaml",
     )
@@ -569,6 +580,19 @@ def main(argv: list[str] | None = None) -> None:
                     extra_args=compose_scene_extra_args,
                 )
 
+            if args.penetration_check:
+                with stage(f"Stage P3b: penetration check (fix={args.penetration_fix}) -> {pick_place_dir}/penetration.json"):
+                    stages.stage_penetration_check(
+                        "stageP3b_penetration_check",
+                        pick_place_scene_usda,
+                        pick_place_dir / "penetration.json",
+                        isaacsim_dir=ISAACSIM_DIR,
+                        fix=args.penetration_fix,
+                        log_file=pick_place_dir / "penetration.log",
+                        debug_config_log=debug_config_log,
+                        log_mirror=log_mirror,
+                    )
+
             # Sanitized here (space/slash -> underscore), not earlier: compose_isaac_scene.py always
             # names USD prims from the sanitized <label> dirname stageP1 wrote under pick_place_glb_dir
             # (see stages.sanitize_label), never the raw --classes spelling -- so a multi-word label
@@ -686,6 +710,19 @@ def main(argv: list[str] | None = None) -> None:
             else:
                 logger.info(f"Stage 9: skipped (--start-from-stage {args.start_from_stage})")
             check_stop_after_stage(9)
+
+            if args.penetration_check and args.start_from_stage <= 9:
+                with stage(f"Stage 9b: penetration check (fix={args.penetration_fix}) -> {output_dir}/penetration.json"):
+                    stages.stage_penetration_check(
+                        "stage9b_penetration_check",
+                        shapes_dir / "glb" / "scene.usda",
+                        output_dir / "penetration.json",
+                        isaacsim_dir=ISAACSIM_DIR,
+                        fix=args.penetration_fix,
+                        log_file=output_dir / "penetration.log",
+                        debug_config_log=debug_config_log,
+                        log_mirror=log_mirror,
+                    )
 
         # ── Stage 10: chunked GLB bake ──
         if RUN_GLB and args.start_from_stage <= 10:
