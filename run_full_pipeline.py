@@ -4,7 +4,7 @@ segmentation] -> GenRecon reconstruction -> GLB bake.
 
 Python port of run_full_pipeline.sh: same CLI surface, but every non-Isaac, non-TRELLIS.2 stage
 runs in-process as a typed Python function call instead of a subprocess with a hand-built argv
-string (see genrecon/pipeline/stages.py). Isaac Sim (../IsaacSim) remains a subprocess, since it
+string (see genrecon/pipeline/stages.py). Isaac Sim (./isaacsim) remains a subprocess, since it
 still runs in its own separate uv env.
 
 Usage:
@@ -29,7 +29,7 @@ import time
 from pathlib import Path
 
 GENRECON_DIR = Path(__file__).resolve().parent
-ISAACSIM_DIR = GENRECON_DIR.parent / "IsaacSim"
+ISAACSIM_DIR = GENRECON_DIR / "isaacsim"
 MVSAM3D_VENDOR_DIR = GENRECON_DIR / "mv_sam3d"
 VGGT_CHECKPOINT = GENRECON_DIR / "checkpoints" / "vggt_omega" / "ckpts" / "vggt_omega_1b_512.pt"
 FOUNDATION_STEREO_CHECKPOINT = GENRECON_DIR / "checkpoints" / "foundation_stereo" / "11-33-40" / "model_best_bp2.pth"
