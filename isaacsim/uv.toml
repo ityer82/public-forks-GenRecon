@@ -1,0 +1,2 @@
+# Empty on purpose: stops uv from discovering the GenRecon root [tool.uv] config
+# (PyTorch cu128 index, overrides, workspace), which breaks resolving isaacsim==5.1.0.

@@ -5,7 +5,8 @@ written by compose_isaac_scene.py with convert_asset.py's rigid-body/collision a
 gravity, steps the sim a few frames, and aggregates PhysX contact points per object pair. A
 contact point with negative `separation` is a penetration of that depth. For each penetrating
 pair the smaller object is lifted along +z (binary search, whole mm) to find the smallest lift that
-clears the pair, then all lifts are applied together as a joint check.
+clears it. Movers are processed bottom-up: an object resting on another mover is searched with that mover
+already at its final lift. All lifts are then applied together as a joint check.
 
 By default nothing is modified: results go to stdout and an optional JSON. With --fix, the lifts
 that worked are written back into the scene file (a backup `<scene>.pre_penetration_fix.<ext>` is
@@ -391,33 +392,49 @@ def main():
         depths = {pair: depth_mm(first_frame_points(f)) for pair, f in after.items()}
         return {pair: d for pair, d in depths.items() if d >= args.min_depth_mm}
 
-    # Up-lift search: smallest +z lift (whole mm) at which this pair no longer penetrates, by binary search
-    # (assumes clearance is monotonic in lift; if even --max_lift_mm does not clear, lift_mm stays None).
-    def clears(r, dz):
-        return tuple(r["pair"]) not in penetrating_depths({r["movable"]: dz})
+    # Bottom-up up-lift search: each mover's smallest +z lift (whole mm) at which it no longer penetrates anything
+    # that is static or already decided, by binary search (assumes clearance is monotonic in lift; if even
+    # --max_lift_mm does not clear, the mover gets no lift). Obstacles that are themselves movers (a phone on a
+    # book on the table) are decided first, so the lift of the object resting on them is searched against their
+    # final lifted pose instead of their authored one.
+    movers = {r["movable"] for r in results}
+    zmin = {o: cache.ComputeWorldBound(stage.GetPrimAtPath(o)).ComputeAlignedRange().GetMin()[2] for o in movers}
+    below = {m: {r["obstacle"] for r in results if r["movable"] == m and r["obstacle"] in movers} for m in movers}
+    order, pending = [], set(movers)
+    while pending:
+        ready = [m for m in pending if not (below[m] & pending)] or list(pending)  # cycle: lowest first
+        m = min(ready, key=lambda o: (zmin[o], volume[o]))
+        order.append(m)
+        pending.discard(m)
 
-    for r in results:
-        r["lift_mm"] = None
-        if not clears(r, args.max_lift_mm):
-            continue
-        lo, hi = 0, args.max_lift_mm  # invariant: hi clears; answer in (lo, hi] unless 0 clears
-        if clears(r, 0):
-            r["lift_mm"] = 0
-            continue
-        while hi - lo > 1:
-            mid = (lo + hi) // 2
-            if clears(r, mid):
-                hi = mid
-            else:
-                lo = mid
-        r["lift_mm"] = hi
+    decided: dict[str, float] = {}
+    for m in order:
+        waiting = {o for o in movers if o not in decided and o != m}
+        pairs = [tuple(r["pair"]) for r in results if r["movable"] == m and r["obstacle"] not in waiting]
 
-    # Joint check: lift every movable object by the max of its per-pair lifts, all at once, and re-run.
-    lifts = defaultdict(float)
+        def clears(pair, dz):
+            return pair not in penetrating_depths({**decided, m: dz})
+
+        # Per pair, so a pair no lift clears (case under headphones) does not veto the lift that clears the others.
+        needed = [0]
+        for pair in pairs:
+            if clears(pair, 0):
+                continue
+            if not clears(pair, args.max_lift_mm):
+                continue
+            lo, hi = 0, args.max_lift_mm  # invariant: hi clears, lo does not
+            while hi - lo > 1:
+                mid = (lo + hi) // 2
+                lo, hi = (lo, mid) if clears(pair, mid) else (mid, hi)
+            needed.append(hi)
+        decided[m] = float(max(needed))
+
+    final = penetrating_depths(decided)
     for r in results:
-        if r["lift_mm"] is not None:
-            lifts[r["movable"]] = max(lifts[r["movable"]], r["lift_mm"])
-    joint_remaining = {pair_key(pair): round(d, 2) for pair, d in penetrating_depths(dict(lifts)).items()}
+        r["lift_mm"] = int(decided[r["movable"]]) if tuple(r["pair"]) not in final else None
+
+    lifts = dict(decided)
+    joint_remaining = {pair_key(pair): round(d, 2) for pair, d in final.items()}
 
     print(f"\n{'pair (movable / fixed)':<44}{'depth':>7}  required +z lift")
     for r in results:
