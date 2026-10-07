@@ -11,6 +11,12 @@ By default nothing is modified: results go to stdout and an optional JSON. With 
 that worked are written back into the scene file (a backup `<scene>.pre_penetration_fix.<ext>` is
 kept), except for lifts that would make another pair worse, which are dropped.
 
+With --settle (default) the +z lift is only a transient "clear the overlap" step, and EVERY dynamic object (not just
+the lifted ones) is then dropped under gravity, everything static frozen, until it comes to rest. The settled poses
+are written back as `xformOp:translate:settle` / `xformOp:orient:settle` ops ahead of each object's existing ops.
+This also lands objects that start floating above their support (which no overlap test can see), so nothing falls
+when the simulation starts. There are no limits on how far or how much a settle moves/rotates an object.
+
 Run from the IsaacSim project (it owns the isaacsim environment):
     cd /home/ss/Work/GitHub/IsaacSim && uv run \
         /home/ss/Work/GitHub/public-forks-GenRecon/scripts/isaac_detect_penetration.py \
@@ -52,6 +58,19 @@ def parse_args():
         default=20,
         help="With --fix, never write a lift larger than this (convex colliders can inflate the needed lift).",
     )
+    parser.add_argument(
+        "--settle",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="With --fix: after lifting, let every dynamic object settle under gravity and write back the settled poses "
+        "(lifts up to --max_lift_mm are then allowed, since they are transient). --no-settle writes lift-only results.",
+    )
+    parser.add_argument("--settle_steps", type=int, default=300, help="Max physics frames of the settle pass.")
+    parser.add_argument(
+        "--settle_max_speed", type=float, default=0.1,
+        help="Linear speed cap (m/s) of the settling bodies, to keep each physics substep well under a thin shell's thickness.",
+    )
+    parser.add_argument("--trace_settle", action="store_true", help="Print per-frame pose / contact depth of the settle pass.")
     parser.add_argument("--gui", action="store_true")
     return parser.parse_args()
 
@@ -78,8 +97,9 @@ def object_of(path: str, object_paths: list[str]) -> str | None:
     return None
 
 
-def run_pass(object_paths, steps):
-    """Plays the timeline `steps` frames and returns {pair: {frame: [contact dicts]}}."""
+def run_pass(object_paths, steps, on_frame=None):
+    """Plays the timeline `steps` frames and returns {pair: {frame: [contact dicts]}}. `on_frame(i)` is called
+    after each frame (while the simulated poses are still in place) and may return True to stop early."""
     frame = {"i": 0}
     contacts = defaultdict(lambda: defaultdict(list))
 
@@ -104,6 +124,8 @@ def run_pass(object_paths, steps):
     for i in range(steps):
         frame["i"] = i
         simulation_app.update()
+        if on_frame is not None and on_frame(i):
+            break
     timeline.stop()  # restores authored poses
     del sub
     return contacts
@@ -138,9 +160,142 @@ def set_lifts(stage, orig, lifts_mm):
         outer_translate_op(stage, obj).Set(base + Gf.Vec3d(0.0, 0.0, lifts_mm.get(obj, 0.0) / 1000.0))
 
 
-def write_back(scene_path: Path, applied_mm: dict[str, float]) -> Path:
-    """Adds each lift to the object's outer translate in the scene file itself. Run on a fresh stage
-    (the search stage's temporary edits live only in its session layer and are never saved)."""
+class TempEdits:
+    """Session-layer attribute edits that can be undone (the search stage is reused after the settle pass)."""
+
+    def __init__(self):
+        self.saved = []
+
+    def set(self, attr, value):
+        self.saved.append((attr, attr.Get()))
+        attr.Set(value)
+
+    def restore(self):
+        for attr, old in reversed(self.saved):
+            attr.Set(old) if old is not None else attr.Clear()
+        self.saved.clear()
+
+
+def world_matrix(stage, obj_path):
+    """Current composed local-to-world matrix (fresh cache: poses change every frame while playing)."""
+    return UsdGeom.XformCache().GetLocalToWorldTransform(stage.GetPrimAtPath(obj_path))
+
+
+def run_settle(stage, scene, orig, object_paths, lifts_mm, startup_world):
+    """Applies `lifts_mm` ({object: +z lift mm}, 0 for the rest), then lets exactly the objects in it fall and come to rest under
+    gravity while every other rigid body is frozen (kinematic). Returns ({object: info}, {pair: final depth mm}).
+    info: lift_mm, displacement_mm (object center), rotation_deg, steps, converged, delta (4x4 rows, world-frame rigid delta authored pose -> settled pose,
+    row-vector convention: p_settled = p_authored * delta)."""
+    settle_objs = list(lifts_mm)
+    bbox_cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), [UsdGeom.Tokens.default_])
+    authored = {o: startup_world[o] for o in settle_objs}  # the file's poses, before any play touched the stage
+    center = {o: bbox_cache.ComputeWorldBound(stage.GetPrimAtPath(o)).ComputeCentroid() for o in settle_objs}
+
+    edits = TempEdits()
+    for o in object_paths:
+        for prim in Usd.PrimRange(stage.GetPrimAtPath(o)):
+            if not prim.HasAPI(UsdPhysics.RigidBodyAPI):
+                continue
+            if o in settle_objs:
+                body = PhysxSchema.PhysxRigidBodyAPI(prim)
+                edits.set(body.CreateDisableGravityAttr(), False)
+                edits.set(body.CreateMaxDepenetrationVelocityAttr(), 0.5)
+                edits.set(body.CreateLinearDampingAttr(), 1.0)
+                edits.set(body.CreateAngularDampingAttr(), 1.0)
+                # No tunneling through thin shells (plate floors are a few mm thick; a free fall reaches ~10 mm
+                # per 1/60 s substep): CCD plus a velocity cap well under the shell thickness per substep.
+                edits.set(body.CreateEnableCCDAttr(), True)
+                edits.set(body.CreateMaxLinearVelocityAttr(), args.settle_max_speed)
+                edits.set(body.CreateMaxAngularVelocityAttr(), 90.0)  # deg/s
+            else:
+                edits.set(UsdPhysics.RigidBodyAPI(prim).CreateKinematicEnabledAttr(), True)
+    edits.set(scene.CreateGravityMagnitudeAttr(), 9.81)
+    edits.set(PhysxSchema.PhysxSceneAPI.Apply(scene.GetPrim()).CreateEnableCCDAttr(), True)
+
+    state = {"prev": None, "stable": 0, "steps": 0, "mats": {}, "trace": []}
+
+    def on_frame(i):
+        mats = {o: world_matrix(stage, o) for o in settle_objs}
+        state["steps"] = i + 1
+        state["mats"] = mats
+        if args.trace_settle:
+            state["trace"].append({o: (m.ExtractTranslation(), (authored[o].GetInverse() * m).ExtractRotation().GetAngle()) for o, m in mats.items()})
+        prev = state["prev"]
+        state["prev"] = mats
+        if prev is None:
+            return False
+        moved = False
+        for o in settle_objs:
+            d_pos = (mats[o].ExtractTranslation() - prev[o].ExtractTranslation()).GetLength()
+            d_rot = (prev[o].GetInverse() * mats[o]).ExtractRotation().GetAngle()  # degrees
+            moved = moved or d_pos > 1e-5 or d_rot > 0.01
+        state["stable"] = 0 if moved else state["stable"] + 1
+        return state["stable"] >= 10
+
+    try:
+        set_lifts(stage, orig, lifts_mm)
+        if args.trace_settle:
+            for o in settle_objs:
+                pre = world_matrix(stage, o)
+                print(f"trace pre-play {o.split('/')[-1]}: rot vs startup {(startup_world[o].GetInverse() * pre).ExtractRotation().GetAngle():.2f} deg, "
+                      f"rot authored(at settle start) vs startup {(startup_world[o].GetInverse() * authored[o]).ExtractRotation().GetAngle():.2f} deg, "
+                      f"dz vs startup {(pre.ExtractTranslation() - startup_world[o].ExtractTranslation())[2]*1000:.2f} mm")
+        contacts = run_pass(object_paths, args.settle_steps, on_frame)
+    finally:
+        edits.restore()
+        set_lifts(stage, orig, {})
+
+    if args.trace_settle:
+        for i, poses in enumerate(state["trace"]):
+            if i % 3 and i != len(state["trace"]) - 1:
+                continue
+            deps = {pair_key(p): round(depth_mm(f[i]), 2) for p, f in contacts.items() if i in f}
+            print(f"trace {i:3d}: " + "; ".join(f"{o.split('/')[-1]} z={t[2]*1000:.2f}mm rot={a:.1f}deg" for o, (t, a) in poses.items()) + f" | depth {deps}")
+    converged = state["stable"] >= 10
+    info = {}
+    for o in settle_objs:
+        delta = authored[o].GetInverse() * state["mats"][o]
+        moved_center = delta.Transform(center[o]) - center[o]
+        displacement_mm = moved_center.GetLength() * 1000.0
+        rotation_deg = delta.ExtractRotation().GetAngle()
+        info[o] = {
+            "lift_mm": lifts_mm[o],
+            "displacement_mm": round(displacement_mm, 2),
+            "rotation_deg": round(rotation_deg, 2),
+            "steps": state["steps"],
+            "converged": converged,
+            "delta": [list(row) for row in delta],
+        }
+    final = {pair: depth_mm(per_frame[max(per_frame)]) for pair, per_frame in contacts.items()}
+    return info, {pair: d for pair, d in final.items() if d >= args.min_depth_mm}
+
+
+def apply_settle_ops(prim, delta):
+    """Composes the world-frame rigid `delta` outside everything the object already has, via two new outermost
+    ops `xformOp:translate:settle` + `xformOp:orient:settle` (p' = T * O * existing chain). An existing pair of
+    settle ops (earlier fix) is updated in place. The asset's own ops and `outer_translate_op` are untouched."""
+    xf = UsdGeom.Xformable(prim)
+    ops = {o.GetOpName(): o for o in xf.GetOrderedXformOps()}
+    t_name, o_name = "xformOp:translate:settle", "xformOp:orient:settle"
+    if t_name in ops and o_name in ops:
+        old = Gf.Matrix4d(1.0)
+        old.SetRotate(Gf.Quatd(ops[o_name].Get()))
+        old.SetTranslateOnly(Gf.Vec3d(ops[t_name].Get()))
+        delta = old * delta
+        t_op, o_op = ops[t_name], ops[o_name]
+    else:
+        t_op = xf.AddTranslateOp(opSuffix="settle")
+        o_op = xf.AddOrientOp(opSuffix="settle", precision=UsdGeom.XformOp.PrecisionDouble)
+        rest = [o for o in xf.GetOrderedXformOps() if o.GetOpName() not in (t_name, o_name)]
+        xf.SetXformOpOrder([t_op, o_op] + rest)
+    t_op.Set(Gf.Vec3d(delta.ExtractTranslation()))
+    o_op.Set(Gf.Quatd(delta.ExtractRotationQuat()))
+
+
+def write_back(scene_path: Path, applied_mm: dict[str, float], settled: dict | None = None) -> Path:
+    """Adds each lift-only object's lift to its outer translate in the scene file itself, and applies each settled
+    object's pose delta (which already contains its lift) as settle ops. Run on a fresh stage (the search stage's
+    temporary edits live only in its session layer and are never saved)."""
     backup = scene_path.with_name(f"{scene_path.stem}.pre_penetration_fix{scene_path.suffix}")
     if not backup.exists():
         shutil.copy2(scene_path, backup)
@@ -148,6 +303,8 @@ def write_back(scene_path: Path, applied_mm: dict[str, float]) -> Path:
     for obj, dz in applied_mm.items():
         op = outer_translate_op(stage, obj)
         op.Set(op.Get() + Gf.Vec3d(0.0, 0.0, dz / 1000.0))
+    for obj, info in (settled or {}).items():
+        apply_settle_ops(stage.GetPrimAtPath(obj), Gf.Matrix4d(*[v for row in info["delta"] for v in row]))
     stage.GetRootLayer().Save()
     return backup
 
@@ -196,6 +353,8 @@ def main():
     def pick_movable(pair):
         candidates = [o for o in pair if o in dynamic]
         return min(candidates or pair, key=lambda o: volume[o])
+
+    startup_world = {o: world_matrix(stage, o) for o in object_paths}
 
     # The first play after loading reports contacts that were already partly resolved (a 13 mm floor
     # overlap showed up as 0), and stopping does not restore authored poses. So discard one warm-up pass and
@@ -272,32 +431,37 @@ def main():
     payload = {"scene": str(args.scene), "pairs": results, "joint_lift_mm": dict(lifts), "joint_remaining_mm": joint_remaining}
 
     if args.fix:
-        payload.update(fix_lifts(results, penetrating_depths))
+        settle_fn = (lambda lifts: run_settle(stage, scene, orig, object_paths, {**{o: 0.0 for o in sorted(dynamic)}, **lifts}, startup_world)) if args.settle else None
+        payload.update(fix_lifts(results, penetrating_depths, settle_fn))
 
     if args.out_json:
         args.out_json.parent.mkdir(parents=True, exist_ok=True)
         args.out_json.write_text(json.dumps(payload, indent=2))
         print(f"\nwrote {args.out_json}")
 
-    if args.fix and payload["applied_lifts_mm"]:
+    if args.fix and (payload["applied_lifts_mm"] or payload["settled"]):
         ctx.close_stage()  # release the search stage before editing the file
-        backup = write_back(args.scene, payload["applied_lifts_mm"])
+        backup = write_back(args.scene, payload["applied_lifts_mm"], payload["settled"])
         print(f"fix: wrote {args.scene} (backup: {backup})")
 
 
-def fix_lifts(results, penetrating_depths):
-    """Chooses which lifts to write: only lifts that cleared their pair and are <= --max_fix_lift_mm, minus any
-    object whose lift makes another pair worse than before (e.g. a case lifted off a printer pushed deeper into
-    headphones). Mutates `results` with `fixed` / `skipped_reason`; returns the JSON fields to add."""
+def fix_lifts(results, penetrating_depths, settle_fn=None):
+    """Chooses which lifts to write: only lifts that cleared their pair and are <= the cap (--max_lift_mm when
+    settling, since the lift is transient; else --max_fix_lift_mm), minus any object whose lift makes another pair
+    worse than before (e.g. a case lifted off a printer pushed deeper into headphones). With `settle_fn`
+    (offsets -> (info, final depths), see run_settle) every dynamic object is then settled under gravity (kept
+    lifts are only the starting poses) and the settled poses replace the lifts, unconditionally. Mutates `results` with `fixed` / `skipped_reason`; returns the JSON
+    fields to add."""
     baseline = {tuple(r["pair"]): r["max_penetration_mm"] for r in results}
+    cap = args.max_lift_mm if settle_fn else args.max_fix_lift_mm
 
     candidates: dict[str, float] = {}
     for r in results:
         r["fixed"] = False
         if r["lift_mm"] is None:
             r["skipped_reason"] = f"no +z lift up to {args.max_lift_mm} mm clears it"
-        elif r["lift_mm"] > args.max_fix_lift_mm:
-            r["skipped_reason"] = f"needed lift {r['lift_mm']} mm exceeds --max_fix_lift_mm {args.max_fix_lift_mm}"
+        elif r["lift_mm"] > cap:
+            r["skipped_reason"] = f"needed lift {r['lift_mm']} mm exceeds {cap} mm"
         else:
             candidates[r["movable"]] = max(candidates.get(r["movable"], 0), r["lift_mm"])
 
@@ -314,21 +478,41 @@ def fix_lifts(results, penetrating_depths):
             dropped[o] = f"lift {candidates.pop(o):g} mm would worsen {reason}"
         after = dict(baseline)  # re-evaluated on the next iteration (or stays baseline if nothing is left)
 
+    settled: dict[str, dict] = {}
+    settle_depths: dict = {}
+    if settle_fn:
+        info, settle_depths = settle_fn(dict(candidates))
+        for o, i in info.items():
+            moved = i["displacement_mm"] >= 0.01 or i["rotation_deg"] >= 0.01
+            print(f"settle: {o.split('/')[-1]}: lift {i['lift_mm']:g} mm -> moved {i['displacement_mm']} mm, rotated {i['rotation_deg']} deg, "
+                  f"{i['steps']} frames, converged={i['converged']}")
+            if moved:
+                settled[o] = i
+        candidates = {}  # the settled poses replace every lift
+        after = {}
+
     for r in results:
-        if r["movable"] in dropped:
-            r["skipped_reason"] = dropped[r["movable"]]
-        elif r["movable"] in candidates:
+        o = r["movable"]
+        if settle_fn:
+            r["fixed"] = settle_depths.get(tuple(r["pair"]), 0.0) < args.min_depth_mm
+            if not r["fixed"]:
+                r["skipped_reason"] = dropped.get(o) or f"still penetrating {settle_depths[tuple(r['pair'])]:.2f} mm after the settle"
+        elif o in dropped:
+            r["skipped_reason"] = dropped[o]
+        elif o in candidates:
             r["fixed"] = tuple(r["pair"]) not in after
             if not r["fixed"]:
                 r["skipped_reason"] = "still penetrating after the lift"
 
-    remaining = {pair_key(p): round(d, 2) for p, d in after.items()}
-    print("\nfix: applied lifts (mm):", {k.split("/")[-1]: v for k, v in candidates.items()} or "none")
+    lift_only = dict(candidates)
+    remaining = {pair_key(p): round(d, 2) for p, d in (settle_depths if settle_fn else after).items()}
+    print("\nfix: applied lifts (mm):", {k.split("/")[-1]: v for k, v in lift_only.items()} or "none")
+    print("fix: settled objects:", [k.split("/")[-1] for k in settled] or "none")
     for r in results:
         if not r["fixed"]:
             print(f"WARNING: not fixed: {pair_key(r['pair'])} ({r['max_penetration_mm']:.2f} mm): {r.get('skipped_reason')}")
     print("fix: remaining overlaps after fix:", remaining or "none")
-    return {"applied_lifts_mm": dict(candidates), "remaining_after_fix_mm": remaining}
+    return {"applied_lifts_mm": lift_only, "settled": settled, "remaining_after_fix_mm": remaining}
 
 
 try:

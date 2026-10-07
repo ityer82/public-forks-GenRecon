@@ -229,6 +229,7 @@ def stage2_mvsam3d(
     stage2_steps: int = 12,
     top_k_views: int | None = 5,
     align_shape_latents: bool = False,
+    seed: int = 42,
 ) -> None:
     _ensure_on_path(mvsam3d_vendor_dir / "mvsam3d_scripts")
     from collect_mvsam3d_outputs import collect_mvsam3d_outputs
@@ -256,6 +257,7 @@ def stage2_mvsam3d(
             top_k_views=top_k_views,
             view_selection_pointcloud_dir=cobgs_mask_dir,
             align_shape_latents=align_shape_latents,
+            seed=seed,
         )
     else:
         run_weighted_inference(
@@ -267,6 +269,7 @@ def stage2_mvsam3d(
             top_k_views=top_k_views,
             view_selection_pointcloud_dir=cobgs_mask_dir,
             align_shape_latents=align_shape_latents,
+            seed=seed,
         )
 
     import torch
@@ -464,24 +467,38 @@ def stage_penetration_check(
     *,
     isaacsim_dir: Path,
     fix: bool,
+    settle: bool = True,
     log_file: Path,
     debug_config_log: Path,
     log_mirror: LogMirror,
 ) -> None:
-    """Detects inter-object penetration in the composed scene (PhysX contacts) and, with `fix`, writes
-    back the +z lifts that cleared their pair (scripts/isaac_detect_penetration.py). Report goes to
-    `report_json`; a backup of the scene is kept next to it before the first change."""
+    """Detects inter-object penetration in the composed scene (PhysX contacts) and, with `fix`, lifts the
+    penetrating objects clear and (with `settle`) lets every dynamic object come to rest under gravity, writing
+    the settled poses back (scripts/isaac_detect_penetration.py). Report goes to `report_json`; a backup of the scene is
+    kept next to it before the first change. Logs a warning for every pair that is still penetrating."""
     script = GENRECON_DIR / "scripts" / "isaac_detect_penetration.py"
     run_external_step(
         name,
         script,
         isaacsim_dir,
-        ["--scene", str(scene_usda), "--out_json", str(report_json), *(["--fix"] if fix else [])],
+        [
+            "--scene", str(scene_usda), "--out_json", str(report_json),
+            *(["--fix"] if fix else []), *([] if settle else ["--no-settle"]),
+        ],
         log_file=log_file,
         runner=["uv", "run", str(script)],
         debug_config_log=debug_config_log,
         log_mirror=log_mirror,
     )
+    report = json.loads(report_json.read_text())
+    for pair in report["pairs"]:
+        if fix and pair.get("fixed"):
+            continue
+        a, b = (p.split("/")[-1] for p in pair["pair"])
+        logger.warning(
+            f"Penetration check: {a} vs {b} penetrates {pair['max_penetration_mm']:.1f} mm"
+            + (f" and was NOT fixed: {pair.get('skipped_reason')}" if fix else " (report only, --no-penetration-fix)")
+        )
 
 
 def stageP4_franka_pickplace(

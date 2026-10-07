@@ -117,6 +117,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="Prune to the k views that best cover each object angularly before "
                              "MV-SAM3D's main diffusion pass. Pass 0 or a value >= the scene's "
                              "view count to disable pruning (use every view with a mask).")
+    parser.add_argument("--mvsam3d-seed", dest="mvsam3d_seed", type=int, default=42,
+                        help="MV-SAM3D random seed (shape/texture diffusion noise). Default 42.")
     parser.add_argument("--mvsam3d-align-shape-latents", dest="mvsam3d_align_shape_latents",
                         action=argparse.BooleanOptionalAction, default=True,
                         help="MV-SAM3D stage 1: align each view's canonical frame (cube rotation found "
@@ -134,6 +136,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="With the penetration check: write back the +z lifts that cleared their pair into scene.usda "
         "(backup: scene.pre_penetration_fix.usda). Pairs no lift clears are reported but never moved. "
         "On by default; pass --no-penetration-fix to only report.",
+    )
+    parser.add_argument(
+        "--penetration-settle", dest="penetration_settle", action=argparse.BooleanOptionalAction, default=True,
+        help="With the penetration fix: after lifting, let every dynamic object settle under gravity (static objects "
+        "frozen) and write back the settled poses, which also lands objects that start floating, with no limit on how far "
+        "or how much they may move/tilt. On by default; pass "
+        "--no-penetration-settle for lift-only fixes (capped at 20 mm).",
     )
     parser.add_argument(
         "--friction-table-path", type=Path,
@@ -471,6 +480,7 @@ def main(argv: list[str] | None = None) -> None:
                         stage2_steps=args.mvsam3d_stage2_steps,
                         top_k_views=args.mvsam3d_top_k_views,
                         align_shape_latents=args.mvsam3d_align_shape_latents,
+                        seed=args.mvsam3d_seed,
                     )
             else:
                 logger.info(f"Stage 2: skipped (use_trellis disabled, or --start-from-stage {args.start_from_stage})")
@@ -588,6 +598,7 @@ def main(argv: list[str] | None = None) -> None:
                         pick_place_dir / "penetration.json",
                         isaacsim_dir=ISAACSIM_DIR,
                         fix=args.penetration_fix,
+                        settle=args.penetration_settle,
                         log_file=pick_place_dir / "penetration.log",
                         debug_config_log=debug_config_log,
                         log_mirror=log_mirror,
@@ -719,6 +730,7 @@ def main(argv: list[str] | None = None) -> None:
                         output_dir / "penetration.json",
                         isaacsim_dir=ISAACSIM_DIR,
                         fix=args.penetration_fix,
+                        settle=args.penetration_settle,
                         log_file=output_dir / "penetration.log",
                         debug_config_log=debug_config_log,
                         log_mirror=log_mirror,
