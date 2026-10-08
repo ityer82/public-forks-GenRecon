@@ -205,16 +205,17 @@ if args.classes is not None:
     if args.boxes_json is not None:
         with open(args.boxes_json) as f:
             boxes_spec = json.load(f)
-        left_idx = frame_names.index(boxes_spec["left_image"])
-        with Image.open(os.path.join(video_dir, frame_names[left_idx])) as im:
-            box_w, box_h = im.size
         class_to_detections = {}
         for cls in candidate_classes:
             obj = boxes_spec["objects"].get(cls)
             if obj is None:
                 raise SystemExit(f"[error] class '{cls}' has no box in {args.boxes_json}")
+            # An object may name its own seed frame ("image"); default: the shared "left_image".
+            seed_idx = frame_names.index(obj.get("image", boxes_spec["left_image"]))
+            with Image.open(os.path.join(video_dir, frame_names[seed_idx])) as im:
+                box_w, box_h = im.size
             box = pad_box_xyxy(obj["left_box"], box_w, box_h, args.detection_box_padding_frac)
-            class_to_detections[cls] = {"frame_idx": left_idx, "boxes": [box], "confidences": [1.0]}
+            class_to_detections[cls] = {"frame_idx": seed_idx, "boxes": [box], "confidences": [1.0]}
     else:
         class_to_detections = detect_classes_in_all_frames(
             video_dir, frame_names, grounding_model, candidate_classes, detect_caption,

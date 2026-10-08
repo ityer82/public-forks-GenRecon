@@ -10,6 +10,7 @@ still runs in its own separate uv env.
 Usage:
     uv run python run_full_pipeline.py <image_folder> <scene_name> [options...]
     uv run python run_full_pipeline.py <video_file> <scene_name> --video [options...]
+    uv run python run_full_pipeline.py <scene_images> <scene_name> --mimic-robot episode.mp4   # video caption chooses the pick/place pair
 
 Example:
     uv run python run_full_pipeline.py /path/to/images food2_vggt --classes "banana,bowl" --mode pick-and-place \\
@@ -176,6 +177,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--stereo-conf", dest="stereo_conf", type=Path, default=None,
         help="ZED .conf calibration file for --stage-0-use-stereo. Default: the single *.conf in image_folder.",
     )
+    parser.add_argument(
+        "--mimic-robot", dest="mimic_robot", type=Path, default=None, metavar="VIDEO",
+        help="pick-and-place mode only: path to a video of a robot pick-and-place episode. After Stage 0b, "
+        "evenly spaced frames of the video are shown to the Qwen3-VL model, conditioned on the objects "
+        "detected in image_folder, and its caption chooses the picked object and its target instead of "
+        "a random pair. The caption is written to runs/<scene>/caption.json. Without this flag, the "
+        "pick/place pair is chosen randomly.",
+    )
+    parser.add_argument(
+        "--caption-num-frames", dest="caption_num_frames", type=int, default=8,
+        help="With --mimic-robot: number of frames sampled evenly from the video. Default: 8.",
+    )
     parser.add_argument("--pick_place_target", default=None)
     parser.add_argument("--place-offset", dest="place_offset", type=_place_offset, default=(0.3, 0.0, 0.0))
     parser.add_argument("--place-target", dest="place_target", default=None)
@@ -253,6 +266,16 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace, log
             parser.error("--mode full-scene-with-robot cannot be combined with --skip_isaac.")
     elif args.robot_target:
         parser.error("--robot-target requires --mode full-scene-with-robot.")
+
+    if args.mimic_robot is not None:
+        if args.mode != "pick-and-place":
+            parser.error("--mimic-robot is only valid with --mode pick-and-place.")
+        if not args.mimic_robot.is_file():
+            parser.error(f"--mimic-robot video not found: {args.mimic_robot}")
+        if args.pick_place_target or args.ai_scene_agent:
+            parser.error("--mimic-robot chooses the pick/place targets itself; it cannot be combined with --pick_place_target or --ai-scene-agent.")
+        if args.caption_num_frames < 1:
+            parser.error("--caption-num-frames must be >= 1.")
 
     # pick-and-place picks a random pair unless the pick target is given or the scene agent chooses.
     args.random_pick_place = (
@@ -355,6 +378,7 @@ def main(argv: list[str] | None = None) -> None:
     logger.info(f"Pipeline started for scene '{args.scene_name}'")
 
     video_tmp_dir: Path | None = None
+    mimic_tmp_dir: Path | None = None
     try:
         # ── Video input: extract + downsample + resize into a temp image folder for Stage 0 ──
         if args.video and args.start_from_stage <= 0:
@@ -429,6 +453,47 @@ def main(argv: list[str] | None = None) -> None:
             boxes_json = discovered_boxes_cache
         else:
             boxes_json = None
+
+        # ── Stage 0c (only with --mimic-robot): caption the episode to choose the pick/place pair ──
+        if args.mimic_robot is not None:
+            from genrecon.utils.pick_place_caption import caption_pick_and_place, sample_frames, select_pick_place
+
+            caption_cache = run_dir / "caption.json"
+            cached_caption = json.loads(caption_cache.read_text()) if caption_cache.exists() else None
+            # A cache from a different video (or from before --mimic-robot took a video) must not be reused.
+            cache_matches = cached_caption is not None and cached_caption.get("video") == str(args.mimic_robot)
+            if args.start_from_stage > 0 and cache_matches:
+                caption = cached_caption
+                logger.info(f"Stage 0c: skipped (--start-from-stage {args.start_from_stage}), reusing cached caption from {caption_cache}")
+            else:
+                if args.start_from_stage > 0 and cached_caption is not None:
+                    logger.info(f"Stage 0c: ignoring stale {caption_cache} (made from video {cached_caption.get('video')!r}, not {str(args.mimic_robot)!r}); re-captioning.")
+                with stage(f"Stage 0c: pick-and-place captioning of {args.mimic_robot} (model={DISCOVERY_HF_MODEL})"):
+                    mimic_tmp_dir = Path(tempfile.mkdtemp(prefix=f"{args.scene_name}_mimic_frames_"))
+                    extract_video_frames(args.mimic_robot, mimic_tmp_dir)
+                    frame_paths = sample_frames(sorted(mimic_tmp_dir.glob("frame_*.jpg")), args.caption_num_frames)
+                    if len(frame_paths) < 2:
+                        raise RuntimeError(f"--mimic-robot needs a video with at least 2 frames; extracted {len(frame_paths)} from {args.mimic_robot}.")
+                    caption = {
+                        "video": str(args.mimic_robot),
+                        "frames": [p.stem for p in frame_paths], "model": DISCOVERY_HF_MODEL, "detected_objects": classes,
+                        **caption_pick_and_place(frame_paths, DISCOVERY_HF_MODEL, objects=classes),
+                    }
+                    caption_cache.write_text(json.dumps(caption, indent=2))
+            logger.info(
+                f"Caption: picked '{caption['picked_object']}' with the {caption['hand']} hand, "
+                f"placed at '{caption['placed_location']}'. {caption['summary']}"
+            )
+            pick, place = select_pick_place(caption, classes)
+            if pick is None:
+                logger.warning(f"Caption: picked object {caption['picked_object']!r} is not one of {classes}; falling back to a random pick/place pair.")
+            else:
+                args.pick_place_target, args.place_target = pick, place
+                args.random_pick_place = False
+                logger.info(
+                    f"Caption-selected pick-and-place: pick='{pick}', "
+                    + (f"place='{place}'" if place else f"no placement object, using --place-offset {args.place_offset}")
+                )
 
         if args.random_pick_place:
             if len(classes) < 2:
@@ -782,6 +847,8 @@ def main(argv: list[str] | None = None) -> None:
     finally:
         if video_tmp_dir is not None:
             shutil.rmtree(video_tmp_dir, ignore_errors=True)
+        if mimic_tmp_dir is not None:
+            shutil.rmtree(mimic_tmp_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":
