@@ -565,9 +565,9 @@ def stage3_reconstruct_scene(
     run_reconstruct_scene(
         scene_dir,
         output_dir,
-        ss_ckpt=GENRECON_DIR / "checkpoints/sparse_structure/ckpts/sparse_structure.pt",
-        shape_ckpt=GENRECON_DIR / "checkpoints/shape_slat/ckpts/shape_slat.pt",
-        tex_ckpt=GENRECON_DIR / "checkpoints/texture_slat/ckpts/texture_slat.pt",
+        ss_ckpt=GENRECON_DIR / "checkpoints/genrecon/sparse_structure/ckpts/sparse_structure.pt",
+        shape_ckpt=GENRECON_DIR / "checkpoints/genrecon/shape_slat/ckpts/shape_slat.pt",
+        tex_ckpt=GENRECON_DIR / "checkpoints/genrecon/texture_slat/ckpts/texture_slat.pt",
         num_imgs_per_scene=num_imgs_per_scene,
         colmap_subdir="colmap",
         max_chunks_per_group=max_chunks_per_group,
