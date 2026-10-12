@@ -34,6 +34,7 @@ ISAACSIM_DIR = GENRECON_DIR / "isaacsim"
 MVSAM3D_VENDOR_DIR = GENRECON_DIR / "mv_sam3d"
 VGGT_CHECKPOINT = GENRECON_DIR / "checkpoints" / "vggt_omega" / "ckpts" / "vggt_omega_1b_512.pt"
 FOUNDATION_STEREO_CHECKPOINT = GENRECON_DIR / "checkpoints" / "foundation_stereo" / "11-33-40" / "model_best_bp2.pth"
+MVSAM3D_CHECKPOINT_DIR = GENRECON_DIR / "checkpoints" / "mv_sam3d"
 COLLISION_APPROXIMATION = "convexDecomposition"
 RUN_GLB = False
 SIMPLIFY_THRESHOLD = 250_000
@@ -44,6 +45,19 @@ FULL_SCENE_MODES = ("full-scene", "full-scene-with-robot")
 VIDEO_FPS = 5
 VIDEO_WIDTH, VIDEO_HEIGHT = 960, 540  # matches ../fisheye/data/food
 DISCOVERY_HF_MODEL = "Qwen/Qwen3-VL-8B-Instruct"  # one-shot object labels + boxes (Stage 0b)
+
+
+def _ensure_mvsam3d_checkpoint_link(logger) -> None:
+    """Make mv_sam3d/checkpoints -> ../checkpoints/mv_sam3d, where the vendored code looks for weights."""
+    link = MVSAM3D_VENDOR_DIR / "checkpoints"
+    if link.exists():
+        return
+    if not MVSAM3D_CHECKPOINT_DIR.is_dir():
+        raise FileNotFoundError(f"MV-SAM3D weights not found at {MVSAM3D_CHECKPOINT_DIR}; download them there first.")
+    if link.is_symlink():  # broken symlink
+        link.unlink()
+    link.symlink_to(os.path.relpath(MVSAM3D_CHECKPOINT_DIR, MVSAM3D_VENDOR_DIR))
+    logger.info(f"Created symlink {link} -> {os.readlink(link)}")
 
 
 def _place_offset(s: str) -> tuple[float, float, float]:
@@ -532,6 +546,7 @@ def main(argv: list[str] | None = None) -> None:
 
             if use_trellis and args.start_from_stage <= 2:
                 with stage(f"Stage 2: MV-SAM3D reconstruction -> {image_to_3d_output_dir}"):
+                    _ensure_mvsam3d_checkpoint_link(logger)
                     stages.stage2_mvsam3d(
                         run_dir,
                         args.scene_name,
