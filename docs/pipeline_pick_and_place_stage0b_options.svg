@@ -1,0 +1,68 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="1157" viewBox="0 0 900 1157" font-family="DejaVu Sans, Arial, Helvetica, sans-serif" font-size="15">
+<defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#333"/></marker></defs>
+<rect width="900" height="1157" fill="white"/>
+<polyline points="715.0,69.0 715.0,108.0" fill="none" stroke="#333" stroke-width="1.5" marker-end="url(#a)"/>
+<polyline points="715.0,158.0 715.0,197.0" fill="none" stroke="#333" stroke-width="1.5" marker-end="url(#a)"/>
+<polyline points="255.0,69.0 255.0,197.0" fill="none" stroke="#333" stroke-width="1.5" marker-end="url(#a)"/>
+<polyline points="255.0,178.0 565.0,178.0 565.0,197.0" fill="none" stroke="#333" stroke-width="1.5" marker-end="url(#a)"/>
+<circle cx="255.0" cy="178.0" r="3.5" fill="#333"/>
+<polyline points="255.0,267.0 645.0,267.0" fill="none" stroke="#333" stroke-width="1.5"/>
+<polyline points="255.0,247.0 255.0,267.0" fill="none" stroke="#333" stroke-width="1.5"/>
+<polyline points="645.0,247.0 645.0,267.0" fill="none" stroke="#333" stroke-width="1.5"/>
+<polyline points="255.0,267.0 255.0,286.0" fill="none" stroke="#333" stroke-width="1.5" marker-end="url(#a)"/>
+<polyline points="645.0,267.0 645.0,286.0" fill="none" stroke="#333" stroke-width="1.5" marker-end="url(#a)"/>
+<polyline points="134.7,356.0 773.9,356.0" fill="none" stroke="#333" stroke-width="1.5"/>
+<polyline points="255.0,336.0 255.0,356.0" fill="none" stroke="#333" stroke-width="1.5"/>
+<polyline points="645.0,336.0 645.0,356.0" fill="none" stroke="#333" stroke-width="1.5"/>
+<polyline points="134.7,356.0 134.7,375.0" fill="none" stroke="#333" stroke-width="1.5" marker-end="url(#a)"/>
+<polyline points="458.6,356.0 458.6,375.0" fill="none" stroke="#333" stroke-width="1.5" marker-end="url(#a)"/>
+<polyline points="773.9,356.0 773.9,375.0" fill="none" stroke="#333" stroke-width="1.5" marker-end="url(#a)"/>
+<polyline points="134.7,445.0 773.9,445.0" fill="none" stroke="#333" stroke-width="1.5"/>
+<polyline points="134.7,425.0 134.7,445.0" fill="none" stroke="#333" stroke-width="1.5"/>
+<polyline points="458.6,425.0 458.6,445.0" fill="none" stroke="#333" stroke-width="1.5"/>
+<polyline points="773.9,425.0 773.9,445.0" fill="none" stroke="#333" stroke-width="1.5"/>
+<polyline points="450.0,445.0 450.0,464.0" fill="none" stroke="#333" stroke-width="1.5" marker-end="url(#a)"/>
+<polyline points="450.0,514.0 450.0,553.0" fill="none" stroke="#333" stroke-width="1.5" marker-end="url(#a)"/>
+<polyline points="450.0,603.0 450.0,642.0" fill="none" stroke="#333" stroke-width="1.5" marker-end="url(#a)"/>
+<polyline points="450.0,692.0 450.0,731.0" fill="none" stroke="#333" stroke-width="1.5" marker-end="url(#a)"/>
+<polyline points="450.0,781.0 450.0,820.0" fill="none" stroke="#333" stroke-width="1.5" marker-end="url(#a)"/>
+<polyline points="450.0,870.0 450.0,909.0" fill="none" stroke="#333" stroke-width="1.5" marker-end="url(#a)"/>
+<polyline points="450.0,959.0 450.0,998.0" fill="none" stroke="#333" stroke-width="1.5" marker-end="url(#a)"/>
+<polyline points="450.0,1048.0 450.0,1087.0" fill="none" stroke="#333" stroke-width="1.5" marker-end="url(#a)"/>
+<polygon points="133.5,20.0 390.5,20.0 376.5,69.0 119.5,69.0" fill="#eef3ff" stroke="#333" stroke-width="1.5"/>
+<text x="255.0" y="46.8" text-anchor="middle" fill="#111">Image folder + scene_name</text>
+<polygon points="602.1,20.0 841.9,20.0 827.9,69.0 588.1,69.0" fill="#eef3ff" stroke="#333" stroke-width="1.5"/>
+<text x="715.0" y="46.8" text-anchor="middle" fill="#111">Video file + scene_name</text>
+<rect x="601.0" y="109.0" width="228.0" height="49.0" rx="4" fill="#f4f4f4" stroke="#333" stroke-width="1.5"/>
+<text x="715.0" y="135.8" text-anchor="middle" fill="#111" font-weight="bold">Extract video frames</text>
+<rect x="89.4" y="198.0" width="331.2" height="49.0" rx="4" fill="#f4f4f4" stroke="#333" stroke-width="1.5"/>
+<text x="255.0" y="224.8" text-anchor="middle" fill="#111" font-weight="bold">Stage 0: FoundationStereo export</text>
+<rect x="505.2" y="198.0" width="279.6" height="49.0" rx="4" fill="#f4f4f4" stroke="#333" stroke-width="1.5"/>
+<text x="645.0" y="224.8" text-anchor="middle" fill="#111" font-weight="bold">Stage 0: VGGT-Omega export</text>
+<rect x="85.1" y="287.0" width="339.8" height="49.0" rx="4" fill="#f4f4f4" stroke="#333" stroke-width="1.5"/>
+<text x="255.0" y="313.8" text-anchor="middle" fill="#111" font-weight="bold">Stage 0b: Qwen3-VL free discovery</text>
+<rect x="483.7" y="287.0" width="322.6" height="49.0" rx="4" fill="#f4f4f4" stroke="#333" stroke-width="1.5"/>
+<text x="645.0" y="313.8" text-anchor="middle" fill="#111" font-weight="bold">Stage 0b: Qwen3-VL on --classes</text>
+<rect x="12.1" y="376.0" width="245.2" height="49.0" rx="4" fill="#f4f4f4" stroke="#333" stroke-width="1.5"/>
+<text x="134.7" y="402.8" text-anchor="middle" fill="#111" font-weight="bold">Random pick/place pair</text>
+<rect x="297.3" y="376.0" width="322.6" height="49.0" rx="4" fill="#f4f4f4" stroke="#333" stroke-width="1.5"/>
+<text x="458.6" y="402.8" text-anchor="middle" fill="#111" font-weight="bold">Stage 0c: --mimic-robot caption</text>
+<rect x="659.9" y="376.0" width="228.0" height="49.0" rx="4" fill="#f4f4f4" stroke="#333" stroke-width="1.5"/>
+<text x="773.9" y="402.8" text-anchor="middle" fill="#111" font-weight="bold">P0: --ai-scene-agent</text>
+<rect x="275.8" y="465.0" width="348.4" height="49.0" rx="4" fill="#f4f4f4" stroke="#333" stroke-width="1.5"/>
+<text x="450.0" y="491.8" text-anchor="middle" fill="#111" font-weight="bold">Stage 1: GroundedSAM2 segmentation</text>
+<rect x="284.4" y="554.0" width="331.2" height="49.0" rx="4" fill="#f4f4f4" stroke="#333" stroke-width="1.5"/>
+<text x="450.0" y="580.8" text-anchor="middle" fill="#111" font-weight="bold">Stage 2: MV-SAM3D reconstruction</text>
+<rect x="288.7" y="643.0" width="322.6" height="49.0" rx="4" fill="#f4f4f4" stroke="#333" stroke-width="1.5"/>
+<text x="450.0" y="669.8" text-anchor="middle" fill="#111" font-weight="bold">P1: align meshes to scene scale</text>
+<rect x="336.0" y="732.0" width="228.0" height="49.0" rx="4" fill="#f4f4f4" stroke="#333" stroke-width="1.5"/>
+<text x="450.0" y="758.8" text-anchor="middle" fill="#111" font-weight="bold">P2: convert_asset.py</text>
+<rect x="310.2" y="821.0" width="279.6" height="49.0" rx="4" fill="#f4f4f4" stroke="#333" stroke-width="1.5"/>
+<text x="450.0" y="847.8" text-anchor="middle" fill="#111" font-weight="bold">P3: compose_isaac_scene.py</text>
+<rect x="327.4" y="910.0" width="245.2" height="49.0" rx="4" fill="#f4f4f4" stroke="#333" stroke-width="1.5"/>
+<text x="450.0" y="936.8" text-anchor="middle" fill="#111" font-weight="bold">P3b: penetration check</text>
+<rect x="301.6" y="999.0" width="296.8" height="49.0" rx="4" fill="#f4f4f4" stroke="#333" stroke-width="1.5"/>
+<text x="450.0" y="1025.8" text-anchor="middle" fill="#111" font-weight="bold">P4: demo_franka_pickplace.py</text>
+<polygon points="375.8,1088.0 538.2,1088.0 524.2,1137.0 361.8,1137.0" fill="#eef3ff" stroke="#333" stroke-width="1.5"/>
+<text x="450.0" y="1114.8" text-anchor="middle" fill="#111">pick_place.mp4</text>
+</svg>
