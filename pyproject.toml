@@ -104,6 +104,7 @@ sam2 = ["torch==2.7.1"]
 groundingdino = ["torch==2.7.1"]
 pytorch3d = ["torch==2.7.1"]
 gsplat = ["torch==2.7.1"]
+flash-attn = ["torch==2.7.1"]
 
 [tool.black]
 line-length = 120
