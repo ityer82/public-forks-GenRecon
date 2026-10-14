@@ -105,6 +105,7 @@ groundingdino = ["torch==2.7.1"]
 pytorch3d = ["torch==2.7.1"]
 gsplat = ["torch==2.7.1"]
 flash-attn = ["torch==2.7.1"]
+nvdiffrast = ["torch==2.7.1"]
 
 [tool.black]
 line-length = 120
