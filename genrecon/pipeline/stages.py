@@ -486,7 +486,7 @@ def stage_penetration_check(
             *(["--fix"] if fix else []), *([] if settle else ["--no-settle"]),
         ],
         log_file=log_file,
-        runner=["uv", "run", str(script)],
+        runner=["uv", "run", "--project", str(isaacsim_dir), str(script)],
         debug_config_log=debug_config_log,
         log_mirror=log_mirror,
     )
