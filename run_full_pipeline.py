@@ -30,7 +30,7 @@ import time
 from pathlib import Path
 
 GENRECON_DIR = Path(__file__).resolve().parent
-ISAACSIM_DIR = GENRECON_DIR / "isaacsim"
+ISAACSIM_DIR = GENRECON_DIR / "isaacsim_venv"
 MVSAM3D_VENDOR_DIR = GENRECON_DIR / "mv_sam3d"
 VGGT_CHECKPOINT = GENRECON_DIR / "checkpoints" / "vggt_omega" / "ckpts" / "vggt_omega_1b_512.pt"
 FOUNDATION_STEREO_CHECKPOINT = GENRECON_DIR / "checkpoints" / "foundation_stereo" / "11-33-40" / "model_best_bp2.pth"

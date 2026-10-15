@@ -18,7 +18,7 @@ are written back as `xformOp:translate:settle` / `xformOp:orient:settle` ops ahe
 This also lands objects that start floating above their support (which no overlap test can see), so nothing falls
 when the simulation starts. There are no limits on how far or how much a settle moves/rotates an object.
 
-Run from the isaacsim/ project (it owns the isaacsim environment):
+Run from the isaacsim_venv/ project (it owns the isaacsim environment):
     cd /home/ss/Work/GitHub/public-forks-GenRecon/isaacsim && uv run \
         /home/ss/Work/GitHub/public-forks-GenRecon/scripts/isaac_detect_penetration.py \
         --scene /home/ss/Work/GitHub/public-forks-GenRecon/runs/kitchen_plates/pick_place/glb/scene.usda \

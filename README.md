@@ -77,6 +77,18 @@ pip install https://github.com/Dao-AILab/flash-attention/releases/download/v2.7.
 ```
 </details>
 
+### Isaac Sim environment
+
+The Isaac Sim stages (asset conversion, scene composition, penetration check, pick-and-place demo) run
+as `uv run` subprocesses inside `isaacsim_venv/`, which is its own uv project with its own Python 3.11 venv,
+separate from the main environment. `uv run run_full_pipeline.py` does **not** sync it, so build it once:
+```sh
+cd isaacsim_venv && uv sync
+```
+Isaac Sim's NVIDIA Omniverse EULA must be accepted once, either interactively
+(`cd isaacsim_venv && uv run python -c "import isaacsim"`) or by exporting `OMNI_KIT_ACCEPT_EULA=YES`.
+Keep `isaacsim_venv/uv.toml` (intentionally empty): it stops uv from picking up the root `[tool.uv]` config.
+
 ## 🗂️ Data
 
 We are grateful to the authors of the following datasets, whose data made this work
@@ -191,6 +203,36 @@ python chunked_to_glb.py \
     --output_dir "${OUT_DIR}"
 ```
 
+
+### Stereo input (pick-and-place)
+For a rectified stereo pair (e.g. ZED X Mini), Stage 0 can use [FoundationStereo](https://github.com/NVlabs/FoundationStereo)
+instead of VGGT-Omega. Put one `*left*` and one `*right*` image plus the ZED `.conf` calibration in the
+image folder and pass `--stage-0-use-stereo` (optionally `--stereo-conf path/to/file.conf`); all later stages
+are unchanged. The checkpoint is expected at `checkpoints/foundation_stereo/11-33-40/model_best_bp2.pth`
+(with its `cfg.yaml`); the model code is vendored in `foundation_stereo/`.
+```sh
+uv run python run_full_pipeline.py "${IMAGE_DIR}" my_scene --mode pick-and-place --stage-0-use-stereo \
+    --classes "banana,bowl" --pick_place_target banana --place-target bowl
+```
+
+### Penetration check (Isaac scene)
+After the Isaac scene is composed (Stage P3b for pick-and-place, Stage 9b for the full pipeline), objects that
+interpenetrate (e.g. a knife stuck into a plate) are detected from PhysX contact reports by
+`scripts/isaac_detect_penetration.py`. For each pair the smaller dynamic object is lifted along +z to the smallest
+whole-mm lift that clears it (up to 30 mm). With settling on (default) that lift is only a transient: then *every*
+dynamic object (also ones that are not penetrating, e.g. floating a few mm above the table) is dropped under gravity,
+with static objects frozen, until it comes to rest, and the *settled* poses are written into `scene.usda` as
+`xformOp:translate:settle` / `xformOp:orient:settle` ops (backup: `scene.pre_penetration_fix.usda`). There are no limits on
+how far an object may move or tilt while settling. Pairs that no lift clears, or whose lift would worsen another pair, are
+reported, and the pipeline logs a warning for every pair still penetrating after the settle.
+Results: `penetration.json` / `penetration.log` next to the scene's other logs.
+Pass `--no-penetration-settle` for lift-only fixes (capped at 20 mm), `--no-penetration-fix` to only report, or `--no-penetration-check` to skip.
+It can also be run standalone (`--trace_settle` prints the per-frame settle):
+```sh
+cd isaacsim_venv && uv run ../scripts/isaac_detect_penetration.py --scene <scene.usda> [--fix] [--no-settle]
+```
+Colliders are convex-decomposition approximations of the meshes, so depths are conservative and a settled object
+rests a few mm above the true mesh surface.
 
 ## 🙏 Acknowledgements
 
