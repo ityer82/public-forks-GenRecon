@@ -39,7 +39,6 @@ COLLISION_APPROXIMATION = "convexDecomposition"
 RUN_GLB = False
 SIMPLIFY_THRESHOLD = 250_000
 TEXTURE_SIZE = 2048
-USE_TRELLIS = True
 MODES = ("pick-and-place", "full-scene", "full-scene-with-robot")
 FULL_SCENE_MODES = ("full-scene", "full-scene-with-robot")
 VIDEO_FPS = 5
@@ -224,11 +223,10 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace, logger) -> tuple[list[str], bool]:
+def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace, logger) -> list[str]:
     """Ports run_full_pipeline.sh's cross-field validation (lines ~168-259). Returns the parsed
-    --classes list and the effective use_trellis flag (derived from USE_TRELLIS, overridden per
-    the same rules bash silently applied). Calls parser.error() (exit 2) on invalid combinations,
-    matching bash's exit-1-with-message behavior closely enough for a CLI tool."""
+    --classes list. Calls parser.error() (exit 2) on invalid combinations, matching bash's
+    exit-1-with-message behavior closely enough for a CLI tool."""
     if args.video:
         if not args.image_folder.is_file():
             parser.error(f"Video file not found: {args.image_folder}")
@@ -298,13 +296,6 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace, log
 
     classes = [c.strip() for c in args.classes.split(",")] if args.classes else []
 
-    # In pick-and-place mode, Stage 0b's Qwen3-VL pass always runs and always ends up populating
-    # `classes` (conditioned on --classes if given, else freely discovered) by the time Stage 1
-    # needs them, so per-class mesh reconstruction is never skipped there. It's only skipped in
-    # full-scene mode without --classes -- but --classes is required there (checked above), so
-    # `classes` is never empty at this point either.
-    use_trellis = USE_TRELLIS
-
     if not MVSAM3D_VENDOR_DIR.is_dir():
         parser.error(f"Requires the vendored MV-SAM3D source at {MVSAM3D_VENDOR_DIR}.")
 
@@ -315,9 +306,6 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace, log
             parser.error("--pick_place_target requires --classes to include the same label.")
         if args.pick_place_target not in classes:
             parser.error(f"--pick_place_target '{args.pick_place_target}' must exactly match one of the labels passed to --classes ('{args.classes}').")
-        if not use_trellis:
-            logger.info("Note: --pick_place_target requires TRELLIS.2's per-object mesh; overriding use_trellis to on for this run.")
-            use_trellis = True
 
     if args.place_target:
         if not args.pick_place_target:
@@ -332,11 +320,8 @@ def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace, log
             parser.error("--ai-scene-agent and --pick_place_target are mutually exclusive.")
         if args.robot_target:
             parser.error("--ai-scene-agent and --robot-target are mutually exclusive.")
-        if not use_trellis:
-            logger.info("Note: --ai-scene-agent requires a per-object mesh for every --classes label; overriding use_trellis to on for this run.")
-            use_trellis = True
 
-    return classes, use_trellis
+    return classes
 
 
 def _format_duration(seconds: float) -> str:
@@ -363,7 +348,7 @@ def main(argv: list[str] | None = None) -> None:
     from genrecon.pipeline.subprocess_utils import LogMirror, stage
     from genrecon.utils.logger import logger
 
-    classes, use_trellis = validate_args(parser, args, logger)
+    classes = validate_args(parser, args, logger)
     if args.mode == "full-scene-with-robot" and not args.robot_target:
         args.robot_target = random.choice(classes)
         logger.info(f"Random robot target: '{args.robot_target}' (chosen from classes {classes})")
@@ -544,7 +529,7 @@ def main(argv: list[str] | None = None) -> None:
                 logger.info(f"Stage 1: skipped (--start-from-stage {args.start_from_stage}), assuming existing segmentation at {run_dir / 'stage_1_segmentation'}")
             check_stop_after_stage(1)
 
-            if use_trellis and args.start_from_stage <= 2:
+            if args.start_from_stage <= 2:
                 with stage(f"Stage 2: MV-SAM3D reconstruction -> {image_to_3d_output_dir}"):
                     _ensure_mvsam3d_checkpoint_link(logger)
                     stages.stage2_mvsam3d(
@@ -563,7 +548,7 @@ def main(argv: list[str] | None = None) -> None:
                         seed=args.mvsam3d_seed,
                     )
             else:
-                logger.info(f"Stage 2: skipped (use_trellis disabled, or --start-from-stage {args.start_from_stage})")
+                logger.info(f"Stage 2: skipped (--start-from-stage {args.start_from_stage})")
             check_stop_after_stage(2)
 
         # ── Stage P0 (only with --ai-scene-agent) ──
@@ -770,9 +755,7 @@ def main(argv: list[str] | None = None) -> None:
         if args.run_usd:
             if args.start_from_stage <= 7:
                 with stage(f"Stage 7: mesh_to_glb.py -> {shapes_dir}/glb"):
-                    stages.stage7_mesh_to_glb(
-                        shapes_dir, run_dir, classes, use_trellis=use_trellis
-                    )
+                    stages.stage7_mesh_to_glb(shapes_dir, run_dir, classes)
             else:
                 logger.info(f"Stage 7: skipped (--start-from-stage {args.start_from_stage})")
             check_stop_after_stage(7)

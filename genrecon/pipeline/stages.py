@@ -290,6 +290,25 @@ def stage2_mvsam3d(
     if failures:
         raise RuntimeError(f"MV-SAM3D collection failed for labels: {failures}")
 
+    if cobgs_mask_dir is not None:
+        _ensure_on_path(GENRECON_DIR / "scripts")
+        from align_meshes_to_scene import align_trellis_mesh_to_scene
+
+        for label in classes:
+            sanitized = sanitize_label(label)
+            trellis_glb = image_to_3d_output_dir / label / "mesh.glb"
+            scale_ref_ply = cobgs_mask_dir / sanitized / "point_cloud" / f"{sanitized}.ply"
+            if not trellis_glb.exists() or not scale_ref_ply.exists():
+                logger.warning(f"stage2 previews: skipping '{label}' (glb or point cloud missing)")
+                continue
+            try:
+                scene, _, _ = align_trellis_mesh_to_scene(
+                    trellis_glb, scale_ref_ply, apply_zup_correction=False
+                )
+                _write_stage2_previews(scene, image_to_3d_output_dir / label, label, scale_ref_ply)
+            except Exception as e:
+                logger.warning(f"stage2 previews: '{label}' failed: {e}")
+
 
 # ---------------------------------------------------------------------------
 # Stage P0: interactive scene agent (only with --ai-scene-agent)
@@ -410,8 +429,6 @@ def stageP1_align_meshes(
         out_glb = out_dir / "mesh.glb"
         scene.export(out_glb)
         logger.info(f"stageP1: wrote {out_glb} (scale={diagnostics['scale']:.4f})")
-
-        _write_stage2_previews(scene, trellis_glb.parent, label, scale_ref_ply)
 
 
 # ---------------------------------------------------------------------------
@@ -687,8 +704,6 @@ def stage7_mesh_to_glb(
     shapes_dir: Path,
     run_dir: Path,
     classes: list[str],
-    *,
-    use_trellis: bool,
 ) -> None:
     _ensure_on_path(GENRECON_DIR / "scripts")
     from align_meshes_to_scene import align_trellis_mesh_to_scene
@@ -697,19 +712,16 @@ def stage7_mesh_to_glb(
     glb_dir = shapes_dir / "glb"
     convert(shapes_dir, glb_dir)
 
-    if not use_trellis:
-        return
-
     apply_zup_correction = False
     for label in classes:
         sanitized_label = sanitize_label(label)
         trellis_glb = run_dir / "stage_2_mv_sam3d" / label / "mesh.glb"
         scene_crop_ply = shapes_dir / f"{sanitized_label}_mesh.ply"
         if not trellis_glb.exists():
-            logger.info(f"Stage 7: --use-trellis: no TRELLIS.2 mesh for '{label}' at {trellis_glb}, keeping scene-crop glb.")
+            logger.info(f"Stage 7: no MV-SAM3D mesh for '{label}' at {trellis_glb}, keeping scene-crop glb.")
             continue
         if not scene_crop_ply.exists():
-            logger.info(f"Stage 7: --use-trellis: no scene crop for '{label}' at {scene_crop_ply}, keeping scene-crop glb.")
+            logger.info(f"Stage 7: no scene crop for '{label}' at {scene_crop_ply}, keeping scene-crop glb.")
             continue
 
         scene, _transform, diagnostics = align_trellis_mesh_to_scene(
