@@ -22,6 +22,7 @@ import argparse
 import json
 import os
 import random
+import shlex
 import shutil
 import subprocess
 import sys
@@ -375,6 +376,8 @@ def main(argv: list[str] | None = None) -> None:
 
     pipeline_t0 = time.monotonic()
     logger.info(f"Pipeline started for scene '{args.scene_name}'")
+    logger.info(f"Command: {shlex.join([sys.executable, *sys.argv])}" if argv is None else f"Command (argv passed to main): {shlex.join(argv)}")
+    logger.info(f"Resolved args: {json.dumps(vars(args), default=str, sort_keys=True)}")
 
     video_tmp_dir: Path | None = None
     mimic_tmp_dir: Path | None = None
