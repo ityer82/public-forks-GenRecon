@@ -1,3 +1,4 @@
+from pathlib import Path
 from typing import *
 
 import torch
@@ -16,6 +17,10 @@ class DinoV3FeatureExtractor:
 
     def __init__(self, model_name: str, image_size=512):
         self.model_name = model_name
+        # prefer a local copy under <repo>/checkpoints/<name> over the HF hub
+        local_dir = Path(__file__).resolve().parents[4] / "checkpoints" / Path(model_name).name
+        if local_dir.is_dir():
+            model_name = str(local_dir)
         self.model = DINOv3ViTModel.from_pretrained(model_name)
         self.model.eval()
         self.image_size = image_size
