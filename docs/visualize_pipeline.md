@@ -41,6 +41,11 @@ Verified against `run_full_pipeline.py` (constants may change; re-check before r
 - **Stage 0b always runs in pick-and-place mode** (Qwen3-VL). `--classes` conditions it; without
   `--classes` it freely discovers objects. In full-scene modes `--classes` is required and Grounding
   DINO is used.
+- **The "Full-scene: Grounding DINO on --classes" node is a simplification.** Grounding DINO isn't a
+  separate stage: in full-scene modes it runs inside Stage 1 (every frame, best-confidence frame per
+  class as the SAM2 seed). It's drawn beside Stage 0b as the alternative box source, but the diagram's
+  downstream path (P1-P4) is pick-and-place only; full-scene continues to Stages 3-12 (not drawn). In
+  pick-and-place mode Grounding DINO is also loaded lazily for empty-mask re-detection (not drawn).
 - **Penetration handling (P3b / 9b)** is on by default: check, then fix (+z lift), then gravity
   settle. Each part has its own `--no-penetration-*` flag.
 - **`RUN_GLB = False`, so Stage 10 (chunked GLB bake) is disabled**, and `USE_TRELLIS = True`, so
